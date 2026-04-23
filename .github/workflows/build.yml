@@ -31,9 +31,10 @@ jobs:
 
       - name: Compile Sketch
         run: |
-          # Partition schemes can be tricky. Trying "app3M_fat9M_16MB" which is common for 16MB.
-          # If that fails, the debug step above will help find the right name.
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi --output-dir ./output camera_test/camera_test.ino
+          # Adding -DBOARD_HAS_PSRAM to build properties to ensure PSRAM code is compiled
+          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
+            --build-property "build.extra_flags=-DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue" \
+            --output-dir ./output camera_test/camera_test.ino
 
       - name: List Output Files
         run: ls -R ./output
