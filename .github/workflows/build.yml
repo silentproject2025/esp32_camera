@@ -25,9 +25,15 @@ jobs:
         run: |
           arduino-cli lib install LovyanGFX
 
+      - name: Debug Board Info
+        run: |
+          arduino-cli board details -b esp32:esp32:esp32s3
+
       - name: Compile Sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_16MB,PSRAM=opi --output-dir ./output camera_test/camera_test.ino
+          # Partition schemes can be tricky. Trying "app3M_fat9M_16MB" which is common for 16MB.
+          # If that fails, the debug step above will help find the right name.
+          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi --output-dir ./output camera_test/camera_test.ino
 
       - name: List Output Files
         run: ls -R ./output
