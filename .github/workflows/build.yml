@@ -27,7 +27,7 @@ jobs:
 
       - name: Compile Sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32s3 --output-dir ./output camera_test/camera_test.ino
+          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=default_16MB,PSRAM=opi --output-dir ./output camera_test/camera_test.ino
 
       - name: List Output Files
         run: ls -R ./output
