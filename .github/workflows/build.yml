@@ -24,8 +24,6 @@ jobs:
       - name: Install Libraries
         run: |
           arduino-cli lib install LovyanGFX
-          # esp32-camera is usually built-in, but just in case:
-          arduino-cli lib install esp32-camera || true
 
       - name: Compile Sketch
         run: |
