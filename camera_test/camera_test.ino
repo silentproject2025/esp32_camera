@@ -560,7 +560,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
 
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString("VIEWFINDER", DISP_W / 2 - 57, 68);
+  lcd.drawString("SANZXCAM", DISP_W / 2 - 57, 68);
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
@@ -1101,7 +1101,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Viewfinder v4 (Monochrome UI) ===");
+  Serial.println("\n=== Sanzxcam v4 (Monochrome UI) ===");
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
