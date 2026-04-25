@@ -1,14 +1,27 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4-MONOCHROME (GC2145/RHYX-M21-45 + OV3660)
+ * Version: v4.1-ILI9341
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  *
- * SCREENS:
- *  - Startup  : boot log style (SD → probe → PID → XCLK → READY)
- *  - Viewfinder: minimal inset (corner brackets + floating pills)
- *  - Video    : MJPEG recording (raw JPEG stream, FFmpeg-able)
- *  - USB mode : USB trident icon + info rows + BOOT hint
+ * DISPLAY: ILI9341 2.4" 320×240 landscape + XPT2046 resistive touch
+ * NO SOFTWARE CROP — kamera QVGA (320×240) = display size persis
+ *
+ * WIRING:
+ *  VCC       → 3.3V
+ *  GND       → GND
+ *  CS        → GPIO21
+ *  RESET     → GPIO1
+ *  D/C       → GPIO14
+ *  SDI(MOSI) → GPIO45
+ *  SCK       → GPIO47
+ *  SDO(MISO) → GPIO42
+ *  LED       → 3.3V
+ *  T_CLK     → GPIO47  (shared)
+ *  T_DIN     → GPIO45  (shared)
+ *  T_OUT     → GPIO42  (shared)
+ *  T_CS      → GPIO2
+ *  T_IRQ     → GPIO3
  *
  * SENSOR YANG DIDUKUNG:
  *  GC2145 (RHYX M21-45) — RGB565 only, no HW JPEG
@@ -20,7 +33,6 @@
  *  BOOT (di USB)       → keluar dari USB mode, kembali viewfinder
  *  Pin 41 singkat      → mulai/stop rekam video MJPEG
  *  Pin 41 tahan 2s     → toggle face detection mode
- *                         (nonaktif otomatis saat rekam mulai)
  */
 
 #include "esp_camera.h"
@@ -29,7 +41,6 @@
 #include "FS.h"
 #include "esp_task_wdt.h"
 
-// Face detection — human_face_detect bawaan ESP32 Arduino (esp-face)
 #include "human_face_detect_msr01.hpp"
 #include "human_face_detect_mnp01.hpp"
 
@@ -46,13 +57,16 @@
 #include <LovyanGFX.hpp>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LGFX Config – ST7789 1.9" 320×170
+//  LGFX Config — ILI9341 2.4" 320×240 + XPT2046 shared SPI
 // ─────────────────────────────────────────────────────────────────────────────
 class LGFX : public lgfx::LGFX_Device {
-  lgfx::Panel_ST7789  _panel_instance;
-  lgfx::Bus_SPI       _bus_instance;
+  lgfx::Panel_ILI9341  _panel_instance;
+  lgfx::Bus_SPI        _bus_instance;
+  lgfx::Touch_XPT2046  _touch_instance;
+
 public:
   LGFX() {
+    // ── SPI Bus ──────────────────────────────────────────────────────────────
     {
       auto cfg = _bus_instance.config();
       cfg.spi_host    = SPI2_HOST;
@@ -63,31 +77,55 @@ public:
       cfg.use_lock    = true;
       cfg.dma_channel = SPI_DMA_CH_AUTO;
       cfg.pin_mosi    = 45;
-      cfg.pin_miso    = -1;
+      cfg.pin_miso    = 42;
       cfg.pin_sclk    = 47;
       cfg.pin_dc      = 14;
       _bus_instance.config(cfg);
       _panel_instance.setBus(&_bus_instance);
     }
+
+    // ── Panel ILI9341 ────────────────────────────────────────────────────────
     {
       auto cfg = _panel_instance.config();
       cfg.pin_cs           = 21;
       cfg.pin_rst          = 1;
       cfg.pin_busy         = -1;
-      cfg.panel_width      = 170;
+      cfg.panel_width      = 240;
       cfg.panel_height     = 320;
-      cfg.offset_x         = 35;
+      cfg.offset_x         = 0;
       cfg.offset_y         = 0;
       cfg.offset_rotation  = 0;
       cfg.dummy_read_pixel = 8;
       cfg.dummy_read_bits  = 1;
-      cfg.readable         = false;
-      cfg.invert           = true;
+      cfg.readable         = true;
+      cfg.invert           = false;
       cfg.rgb_order        = false;
       cfg.dlen_16bit       = false;
-      cfg.bus_shared       = false;
+      cfg.bus_shared       = true;
       _panel_instance.config(cfg);
     }
+
+    // ── Touch XPT2046 ────────────────────────────────────────────────────────
+    {
+      auto cfg = _touch_instance.config();
+      // Ganti nilai ini setelah jalanin sketch kalibrasi!
+      cfg.x_min         = 75;
+      cfg.x_max         = 285;
+      cfg.y_min         = 44;
+      cfg.y_max         = 216;
+      cfg.pin_int       = 3;
+      cfg.bus_shared    = true;
+      cfg.offset_rotation = 0;
+      cfg.spi_host      = SPI2_HOST;
+      cfg.freq          = 2500000;
+      cfg.pin_sclk      = 47;
+      cfg.pin_mosi      = 45;
+      cfg.pin_miso      = 42;
+      cfg.pin_cs        = 2;
+      _touch_instance.config(cfg);
+      _panel_instance.setTouch(&_touch_instance);
+    }
+
     setPanel(&_panel_instance);
   }
 };
@@ -126,12 +164,13 @@ static LGFX lcd;
 // ─────────────────────────────────────────────────────────────────────────────
 #define LED_PIN          48
 #define BOOT_BTN_PIN      0
+#define REC_BTN_PIN      41
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Display
+//  Display — ILI9341 landscape 320×240
 // ─────────────────────────────────────────────────────────────────────────────
 #define DISP_W          320
-#define DISP_H          170
+#define DISP_H          240
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Monochrome palette (RGB565)
@@ -160,16 +199,10 @@ static LGFX lcd;
 // ─────────────────────────────────────────────────────────────────────────────
 #define DEBOUNCE_MS          400
 #define LONG_PRESS_MS       2000
-#define REC_LONG_PRESS_MS   2000   // tahan REC 2s = toggle face detect
+#define REC_LONG_PRESS_MS   2000
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Tombol rekam — pin terpisah
-// ─────────────────────────────────────────────────────────────────────────────
-#define REC_BTN_PIN      41
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Mirror & Flip Setting — ubah sesuai hasil di sensor lo
-//  1 = aktif, 0 = nonaktif
+//  Mirror & Flip Setting
 // ─────────────────────────────────────────────────────────────────────────────
 #define HMIRROR_GC2145   1
 #define VFLIP_GC2145     0
@@ -189,7 +222,7 @@ unsigned long recStartMs    = 0;
 //  Face Detection state
 // ─────────────────────────────────────────────────────────────────────────────
 bool faceDetectMode  = false;
-int  faceDetectCount = 0;    // jumlah wajah terdeteksi frame terakhir
+int  faceDetectCount = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  USB MSC
@@ -319,13 +352,10 @@ bool mountSDFull() {
   return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  remountVFSOnly — fixed: pakai FATFS object, bukan pointer null
-// ─────────────────────────────────────────────────────────────────────────────
 bool remountVFSOnly() {
   if (!sdCard || !sdmmcDriverInit) return mountSDFull();
   ff_diskio_register_sdmmc(0, sdCard);
-  static FATFS fatfs;   // objek langsung, bukan pointer null
+  static FATFS fatfs;
   char drv[3] = {'0', ':', 0};
   FRESULT fr = f_mount(&fatfs, drv, 1);
   if (fr != FR_OK) {
@@ -412,7 +442,6 @@ void drawRecIndicator() {
 void startRecording() {
   if (!sdReady) { Serial.println("[REC] Batal: SD tidak siap"); return; }
 
-  // Face detect otomatis off saat rekam
   if (faceDetectMode) {
     faceDetectMode = false;
     faceDetectCount = 0;
@@ -471,6 +500,7 @@ void stopRecording() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Record satu frame ke file MJPEG
+//  NO CROP — langsung pushImage full 320×240
 // ─────────────────────────────────────────────────────────────────────────────
 void recordFrame() {
   if (!recActive || !recFile) return;
@@ -496,9 +526,7 @@ void recordFrame() {
 
   if (recFrameCount % 3 == 0) {
     if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-      const int CROP_Y = (fb->height - DISP_H) / 2;
-      uint16_t *src = (uint16_t*)fb->buf + (CROP_Y * fb->width);
-      lcd.pushImage(0, 0, DISP_W, DISP_H, src);
+      lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
       drawCornerBrackets(COL_GRAY_E);
       drawRecIndicator();
     }
@@ -540,9 +568,9 @@ void bootLogLine(int y, const char* label, const char* status,
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString(label, 28, y);
   int lx = 28 + lcd.textWidth(label) + 3;
-  for (int dx = lx; dx < 218; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_3);
+  for (int dx = lx; dx < 268; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_3);
   lcd.setTextColor(statusCol);
-  lcd.drawString(status, 222, y);
+  lcd.drawString(status, 272, y);
 }
 
 void runBootSequence(bool sdOK, uint64_t sdMB,
@@ -556,17 +584,17 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
   lcd.setTextColor(COL_GRAY_3);
   lcd.drawString("ESP32-S3", 6, 4);
 
-  drawCameraIcon(DISP_W / 2, 42, COL_GRAY_7);
+  drawCameraIcon(DISP_W / 2, 55, COL_GRAY_7);
 
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString("SANZXCAM", DISP_W / 2 - 57, 68);
+  lcd.drawString("SANZXCAM", DISP_W / 2 - 57, 85);
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4  GC2145 + OV3660", DISP_W / 2 - 60, 86);
+  lcd.drawString("v4.1  ILI9341 + XPT2046", DISP_W / 2 - 72, 103);
 
-  lcd.drawFastHLine(20, 99, DISP_W - 40, COL_GRAY_2);
+  lcd.drawFastHLine(20, 116, DISP_W - 40, COL_GRAY_2);
 
   esp_task_wdt_reset();
   delay(200);
@@ -574,32 +602,35 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
   char buf[32];
   if (sdOK) snprintf(buf, sizeof(buf), "OK  %lluMB", sdMB);
   else      snprintf(buf, sizeof(buf), "NOT FOUND");
-  bootLogLine(104, "SD CARD", buf, sdOK ? COL_GRAY_E : COL_GRAY_5);
+  bootLogLine(122, "SD CARD", buf, sdOK ? COL_GRAY_E : COL_GRAY_5);
   delay(120); esp_task_wdt_reset();
 
-  bootLogLine(116, "CAM PROBE", "20MHz", COL_GRAY_E);
+  bootLogLine(134, "CAM PROBE", "20MHz", COL_GRAY_E);
   delay(120); esp_task_wdt_reset();
 
   if (pidOK) snprintf(buf, sizeof(buf), "0x%04X  %s", pid, sensorName);
   else       snprintf(buf, sizeof(buf), "0x%04X  ???", pid);
-  bootLogLine(128, "SENSOR PID", buf, pidOK ? COL_GRAY_E : COL_GRAY_5);
+  bootLogLine(146, "SENSOR PID", buf, pidOK ? COL_GRAY_E : COL_GRAY_5);
   delay(120); esp_task_wdt_reset();
 
   snprintf(buf, sizeof(buf), "%uMHz  OK", xclkHz / 1000000);
-  bootLogLine(140, "XCLK", buf, xclkOK ? COL_GRAY_E : COL_GRAY_5);
+  bootLogLine(158, "XCLK", buf, xclkOK ? COL_GRAY_E : COL_GRAY_5);
   delay(120); esp_task_wdt_reset();
 
-  lcd.drawRect(28, 156, DISP_W - 56, 4, COL_GRAY_3);
+  bootLogLine(170, "TOUCH", "XPT2046  OK", COL_GRAY_E);
+  delay(120); esp_task_wdt_reset();
+
+  lcd.drawRect(28, 188, DISP_W - 56, 4, COL_GRAY_3);
   int barW = DISP_W - 60;
   for (int i = 0; i <= barW; i += 4) {
-    lcd.fillRect(30, 157, i, 2, COL_GRAY_7);
+    lcd.fillRect(30, 189, i, 2, COL_GRAY_7);
     if (i % 16 == 0) esp_task_wdt_reset();
   }
-  lcd.fillRect(30, 157, barW, 2, COL_GRAY_C);
+  lcd.fillRect(30, 189, barW, 2, COL_GRAY_C);
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("READY", DISP_W / 2 - 15, 163);
+  lcd.drawString("READY", DISP_W / 2 - 15, 198);
 
   delay(800);
   esp_task_wdt_reset();
@@ -633,21 +664,21 @@ void drawUSBModeScreen() {
   lcd.drawString("USB MASS STORAGE", (DISP_W - lw) / 2, 4);
 
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("v4", DISP_W - 18, 4);
+  lcd.drawString("v4.1", DISP_W - 24, 4);
 
-  drawUSBIcon(DISP_W / 2, 70, COL_GRAY_7);
+  drawUSBIcon(DISP_W / 2, 85, COL_GRAY_7);
 
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   lcd.setTextColor(COL_GRAY_E);
   int mw = lcd.textWidth("SD CONNECTED");
-  lcd.drawString("SD CONNECTED", (DISP_W - mw) / 2, 96);
+  lcd.drawString("SD CONNECTED", (DISP_W - mw) / 2, 118);
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
   int sw = lcd.textWidth("to host via USB");
-  lcd.drawString("to host via USB", (DISP_W - sw) / 2, 113);
+  lcd.drawString("to host via USB", (DISP_W - sw) / 2, 136);
 
-  lcd.drawFastHLine(40, 126, DISP_W - 80, COL_GRAY_2);
+  lcd.drawFastHLine(40, 150, DISP_W - 80, COL_GRAY_2);
 
   auto infoRow = [&](int y, const char* key, const char* val) {
     lcd.setFont(&fonts::Font0);
@@ -659,17 +690,16 @@ void drawUSBModeScreen() {
   };
 
   char buf[32];
-  infoRow(132, "SENSOR", sensorName);
+  infoRow(156, "SENSOR", sensorName);
 
-  // SD size: tampil MB kalau < 1GB, GB kalau >= 1GB
   if (sdSizeMB < 1024)
     snprintf(buf, sizeof(buf), "%lluMB  FAT32", sdSizeMB);
   else
     snprintf(buf, sizeof(buf), "%lluGB  FAT32", sdSizeMB / 1024);
-  infoRow(144, "STORAGE", buf);
+  infoRow(170, "STORAGE", buf);
 
   snprintf(buf, sizeof(buf), "%04d files", photoCount);
-  infoRow(156, "PHOTOS", buf);
+  infoRow(184, "PHOTOS", buf);
 
   lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
   lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
@@ -747,16 +777,12 @@ void updateFPS() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Face Detection — jalankan pada framebuffer RGB565
-//  Gambar kotak + landmark di layar
-//  Pakai two-stage: MSR (cepat) + MNP (akurat) kalau ada kandidat
+//  Face Detection — NO CROP, langsung dari fb->buf
 // ─────────────────────────────────────────────────────────────────────────────
 void runFaceDetect(camera_fb_t *fb) {
   if (!fb || fb->format != PIXFORMAT_RGB565) return;
 
-  // Stage 1: MSR — deteksi kasar, cepat
   HumanFaceDetectMSR01 msr(0.1f, 0.5f, 10, 0.2f);
-  // Stage 2: MNP — refine bounding box
   HumanFaceDetectMNP01 mnp(0.5f, 0.3f, 5);
 
   std::list<dl::detect::result_t> &candidates = msr.infer(
@@ -768,49 +794,32 @@ void runFaceDetect(camera_fb_t *fb) {
 
   faceDetectCount = results.size();
 
-  // Offset crop Y — sama seperti pushImage
-  const int CROP_Y = (fb->height - DISP_H) / 2;
-
   for (auto &res : results) {
-    // box: [x1, y1, x2, y2]
-    int x1 = res.box[0];
-    int y1 = res.box[1] - CROP_Y;
-    int x2 = res.box[2];
-    int y2 = res.box[3] - CROP_Y;
-
-    // Clamp ke area display
-    x1 = constrain(x1, 0, DISP_W - 1);
-    y1 = constrain(y1, 0, DISP_H - 1);
-    x2 = constrain(x2, 0, DISP_W - 1);
-    y2 = constrain(y2, 0, DISP_H - 1);
+    int x1 = constrain(res.box[0], 0, DISP_W - 1);
+    int y1 = constrain(res.box[1], 0, DISP_H - 1);
+    int x2 = constrain(res.box[2], 0, DISP_W - 1);
+    int y2 = constrain(res.box[3], 0, DISP_H - 1);
 
     int bw = x2 - x1;
     int bh = y2 - y1;
     if (bw < 4 || bh < 4) continue;
 
-    // Kotak wajah — pakai corner style biar konsisten sama bracket UI
     int CL = min(12, min(bw, bh) / 3);
     uint16_t fc = COL_WHITE;
 
-    // Top-left
     lcd.drawFastHLine(x1, y1, CL, fc);
     lcd.drawFastVLine(x1, y1, CL, fc);
-    // Top-right
     lcd.drawFastHLine(x2 - CL, y1, CL, fc);
     lcd.drawFastVLine(x2, y1, CL, fc);
-    // Bottom-left
     lcd.drawFastHLine(x1, y2, CL, fc);
     lcd.drawFastVLine(x1, y2 - CL, CL, fc);
-    // Bottom-right
     lcd.drawFastHLine(x2 - CL, y2, CL, fc);
     lcd.drawFastVLine(x2, y2 - CL, CL, fc);
 
-    // Landmark titik (keypoints): mata, hidung, mulut
-    // keypoint: [x0,y0, x1,y1, ... x4,y4] = 5 titik
     if (res.keypoint.size() >= 10) {
       for (int k = 0; k < 10; k += 2) {
         int kx = constrain(res.keypoint[k],   0, DISP_W - 1);
-        int ky = constrain(res.keypoint[k+1] - CROP_Y, 0, DISP_H - 1);
+        int ky = constrain(res.keypoint[k+1], 0, DISP_H - 1);
         lcd.fillCircle(kx, ky, 2, COL_GRAY_C);
       }
     }
@@ -818,7 +827,7 @@ void runFaceDetect(camera_fb_t *fb) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Toggle face detect mode dengan feedback pill
+//  Toggle face detect
 // ─────────────────────────────────────────────────────────────────────────────
 void toggleFaceDetect() {
   faceDetectMode = !faceDetectMode;
@@ -839,21 +848,18 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  UI: VIEWFINDER
+//  UI: VIEWFINDER — NO CROP
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    const int CROP_Y = (fb->height - DISP_H) / 2;
-    uint16_t *src = (uint16_t*)fb->buf + (CROP_Y * fb->width);
-    lcd.pushImage(0, 0, DISP_W, DISP_H, src);
+  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
+    // Push langsung — no crop, no offset
+    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
 
-    // Corner brackets
     drawCornerBrackets(COL_GRAY_E);
 
-    // Face detection overlay — jalankan setelah pushImage
     if (faceDetectMode) {
       runFaceDetect(fb);
     }
@@ -875,17 +881,15 @@ void renderViewfinder() {
     const char* sdLabel = sdReady ? "SD  OK" : "SD  --";
     drawPill(DISP_W - 36, DISP_H - 10, sdLabel, COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
 
-    // Face detect pill — tengah bawah, tampil kalau mode aktif
+    // Face detect pill atau RSSI dots
     if (faceDetectMode) {
       char faceBuf[12];
       if (faceDetectCount > 0)
         snprintf(faceBuf, sizeof(faceBuf), "FACE  %d", faceDetectCount);
       else
         snprintf(faceBuf, sizeof(faceBuf), "FACE  --");
-      // Posisi tengah, di atas RSSI dots
       drawPill(DISP_W / 2, DISP_H - 10, faceBuf, COL_PILL_BG, COL_GRAY_C);
     } else {
-      // RSSI dots — hanya tampil kalau face detect tidak aktif (space tengah)
       drawRSSIDots(getSignalBars());
     }
 
@@ -894,7 +898,7 @@ void renderViewfinder() {
     lcd.fillScreen(COL_BLACK);
     lcd.setFont(&fonts::Font0);
     lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("format not rgb565", 10, 80);
+    lcd.drawString("format not rgb565", 10, 110);
   }
   esp_camera_fb_return(fb);
 }
@@ -925,8 +929,7 @@ void showSavedFeedback(bool saved) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Capture & Simpan ke SD — tanpa logika mirror
-//  Mirror sudah diatur lewat register sensor di applySensorSettings()
+//  Capture & Simpan ke SD — NO CROP
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   digitalWrite(LED_PIN, HIGH);
@@ -939,11 +942,9 @@ void captureAndPreview() {
   }
   digitalWrite(LED_PIN, LOW);
 
-  // Freeze frame ke display
+  // Freeze frame ke display — langsung full 320×240
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    const int CROP_Y = (fb->height - DISP_H) / 2;
-    uint16_t *src = (uint16_t*)fb->buf + (CROP_Y * fb->width);
-    lcd.pushImage(0, 0, DISP_W, DISP_H, src);
+    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
   }
 
@@ -986,7 +987,7 @@ void captureAndPreview() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Apply sensor settings — mirror via register, sesuai #define di atas
+//  Apply sensor settings
 // ─────────────────────────────────────────────────────────────────────────────
 void applySensorSettings(sensor_t *s, uint16_t pid) {
   s->set_brightness(s, 0);
@@ -1045,7 +1046,7 @@ bool initCamera() {
   cfg.pin_pwdn     = PWDN_GPIO_NUM;
   cfg.pin_reset    = RESET_GPIO_NUM;
   cfg.pixel_format = PIXFORMAT_RGB565;
-  cfg.frame_size   = FRAMESIZE_QVGA;
+  cfg.frame_size   = FRAMESIZE_QVGA;  // 320×240 persis
   cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
@@ -1101,7 +1102,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4 (Monochrome UI) ===");
+  Serial.println("\n=== Sanzxcam v4.1 (ILI9341 + XPT2046) ===");
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -1110,7 +1111,7 @@ void setup() {
   setCpuFrequencyMhz(240);
 
   lcd.init();
-  lcd.setRotation(1);
+  lcd.setRotation(1);  // landscape 320×240
   lcd.fillScreen(COL_BLACK);
 
   sdReady = mountSDFull();
@@ -1139,10 +1140,10 @@ void setup() {
     lcd.setFont(&fonts::Font0);
     lcd.setTextColor(COL_GRAY_5);
     int ew = lcd.textWidth("camera init failed");
-    lcd.drawString("camera init failed", (DISP_W - ew) / 2, 70);
+    lcd.drawString("camera init failed", (DISP_W - ew) / 2, 110);
     lcd.setTextColor(COL_GRAY_3);
     int hw = lcd.textWidth("check connection");
-    lcd.drawString("check connection", (DISP_W - hw) / 2, 88);
+    lcd.drawString("check connection", (DISP_W - hw) / 2, 128);
     while (true) { blinkLED(3, 100, 100); delay(1000); }
   }
 
@@ -1163,13 +1164,10 @@ void loop() {
     if (digitalRead(REC_BTN_PIN) == LOW) {
       unsigned long recPressStart = millis();
 
-      // Tunggu lepas sambil track durasi
-      // Kalau sedang rekam: lepas = stop (tidak perlu long press)
       while (digitalRead(REC_BTN_PIN) == LOW) {
         delay(10);
         esp_task_wdt_reset();
 
-        // Progress bar face detect (hanya kalau tidak sedang rekam)
         if (!recActive) {
           unsigned long held = millis() - recPressStart;
           if (held > 500) {
@@ -1184,16 +1182,13 @@ void loop() {
       }
 
       unsigned long recDuration = millis() - recPressStart;
-      lcd.fillRect(0, 0, DISP_W, 3, COL_BLACK);  // hapus progress bar
+      lcd.fillRect(0, 0, DISP_W, 3, COL_BLACK);
 
       if (recActive) {
-        // Sedang rekam → stop rekam (berapapun durasinya)
         stopRecording();
       } else if (recDuration >= REC_LONG_PRESS_MS) {
-        // Long press → toggle face detect
         toggleFaceDetect();
       } else {
-        // Short press → mulai rekam
         startRecording();
       }
     }
