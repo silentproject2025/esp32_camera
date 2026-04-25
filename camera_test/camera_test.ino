@@ -9,6 +9,7 @@
  *  - MJPEG Player: BACK via tap pojok kanan atas (zona touch tetap aktif, tanpa label)
  *  - Gallery Photo View: tap kiri (x < 160) → foto sebelumnya, wrap ke terakhir jika di awal
  *  - Gallery Photo View: tap kanan (x > 160) → foto berikutnya, wrap ke pertama jika di akhir
+ *  - Gallery Photo View: tap pojok kanan atas → back ke gallery (tanpa label)
  *  - Bar bawah photo view menampilkan nomor urut "< N / Total >"
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
@@ -28,6 +29,7 @@
  *  Tap pojok kanan       -> back ke viewfinder
  *
  * Touch controls (photo view):
+ *  Tap pojok kanan atas  -> back ke gallery (tanpa label)
  *  Tap kiri (x < 160)   -> foto sebelumnya (wrap ke terakhir)
  *  Tap kanan (x > 160)  -> foto berikutnya (wrap ke pertama)
  *  Tombol BOOT           -> back ke gallery
@@ -1298,9 +1300,15 @@ void loop() {
     }
 
     // ── MODE PHOTO VIEW ───────────────────────────────────────────────────
+    // Tap pojok kanan atas  -> back ke gallery (tanpa label)
     // Tap kiri (x < DISP_W/2) -> foto sebelumnya, wrap ke terakhir
     // Tap kanan (x >= DISP_W/2) -> foto berikutnya, wrap ke pertama
     else if (appMode == MODE_PHOTO_VIEW) {
+      if (inZoneTopRight(tx, ty)) {
+        appMode = MODE_GALLERY;
+        drawGallery();
+        return;
+      }
       unsigned long now = millis();
       if (now - lastTapMs > DEBOUNCE_MS) {
         lastTapMs = now;
