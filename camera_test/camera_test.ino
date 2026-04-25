@@ -1,16 +1,16 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.3-ILI9341
+ * Version: v4.3-ILI9341  [FIXED: touch zones & capture area]
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  *
  * DISPLAY: ILI9341 2.4" 320×240 landscape + XPT2046 resistive touch
  *
  * Touch controls (viewfinder):
- *  Tap pojok kiri atas  → buka Gallery
- *  Tap pojok kanan atas → toggle face detect
- *  Long tap (>1.5s)     → masuk USB mode
- *  Tap biasa            → capture foto
+ *  Tap pojok kiri atas  (0..70 x 0..70)   → buka Gallery
+ *  Tap pojok kanan atas (250..320 x 0..70) → toggle face detect
+ *  Long tap (>1.5s)                        → masuk USB mode
+ *  Tap 1/4 kanan layar  (x > 240)          → capture foto
  *
  * Touch controls (gallery):
  *  Swipe atas/bawah     → scroll list
@@ -217,12 +217,15 @@ int      galleryScroll   = 0;
 char     photoViewPath[48];
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Touch zones
+//  Touch zones  [FIXED]
+//  - TOUCH_ZONE_SZ diperbesar 50 → 70 agar lebih mudah kena tap di pojok
+//  - inZoneCapture: setengah kanan layar (x > 160), kecuali pojok kanan atas
 // ─────────────────────────────────────────────────────────────────────────────
-#define TOUCH_ZONE_SZ   50   // ukuran pojok touch zone
+#define TOUCH_ZONE_SZ   70   // ukuran pojok touch zone
 
 bool inZoneTopLeft(int32_t x, int32_t y)  { return x < TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
 bool inZoneTopRight(int32_t x, int32_t y) { return x > DISP_W - TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
+bool inZoneCapture(int32_t x, int32_t y)  { return (x > DISP_W / 2) && !(x > DISP_W - TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Video recording state
@@ -579,9 +582,6 @@ void showPhotoView(const char* filename) {
   free(buf);
 
   // Overlay: nama file + back button
-  lcd.fillRect(0, 0, DISP_W, 16, 0x0000);
-  lcd.fillRect(0, 0, DISP_W, 16, (uint16_t)(COL_BLACK | 0x0000));
-  // Semi-transparent bar simulasi: fillRect gelap
   lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_A);
@@ -1033,12 +1033,6 @@ void renderViewfinder() {
       drawRSSIDots(getSignalBars());
     }
 
-    // Touch zone hints
-    lcd.setFont(&fonts::Font0);
-    lcd.setTextColor(COL_GRAY_3);
-    lcd.drawString("GAL", 3, 3);       // pojok kiri atas
-    lcd.drawString("FACE", DISP_W - 28, 3); // pojok kanan atas
-
     updateFPS();
   } else {
     lcd.fillScreen(COL_BLACK);
@@ -1220,6 +1214,23 @@ void setup() {
   lcd.setRotation(3);
   lcd.fillScreen(COL_BLACK);
 
+  // ─── TOUCH CALIBRATION ──────────────────────────────────────────────────
+  // Jalankan sketch touch_calibrate.ino sekali untuk mendapat nilai ini.
+  // Ganti nilai di bawah dengan hasil dari Serial Monitor kalibrasi.
+  // Jika belum dikalibrasi, biarkan semua 0 → touch pakai raw mapping.
+  // ─────────────────────────────────────────────────────────────────────────
+  static uint16_t touchCalData[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  // Contoh setelah kalibrasi:
+  // static uint16_t touchCalData[8] = { 321, 3750, 3800, 3900, 3780, 320, 250, 3820 };
+  bool calValid = false;
+  for (int i = 0; i < 8; i++) if (touchCalData[i] != 0) { calValid = true; break; }
+  if (calValid) {
+    lcd.setTouchCalibrate(touchCalData);
+    Serial.println("✓ Touch calibration loaded");
+  } else {
+    Serial.println("! Touch cal not set — run touch_calibrate.ino first");
+  }
+
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(tjpgdecOutput);
@@ -1318,12 +1329,10 @@ void loop() {
         captureAndPreview();
       }
     } else if (appMode == MODE_GALLERY) {
-      // BOOT = back ke viewfinder dari gallery
       appMode = MODE_VIEWFINDER;
       lcd.fillScreen(COL_BLACK);
       fpsLastTime = millis(); fpsFrameCount = 0;
     } else if (appMode == MODE_PHOTO_VIEW) {
-      // BOOT = back ke gallery
       appMode = MODE_GALLERY;
       drawGallery();
     }
@@ -1350,7 +1359,6 @@ void loop() {
       // Long tap → USB mode
       if (touchDur >= LONG_TAP_MS) {
         if (sdReady) {
-          // Feedback
           lcd.setFont(&fonts::Font0);
           int tw = lcd.textWidth("masuk USB mode...");
           int pw = tw + 14;
@@ -1366,7 +1374,7 @@ void loop() {
 
       unsigned long now = millis();
 
-      // Pojok kiri atas → Gallery
+      // [FIXED] Cek pojok kiri atas DULU sebelum hal lain → Gallery
       if (inZoneTopLeft(tx, ty)) {
         if (sdReady) {
           scanGalleryFiles();
@@ -1383,17 +1391,21 @@ void loop() {
         return;
       }
 
-      // Pojok kanan atas → toggle face detect
+      // [FIXED] Cek pojok kanan atas DULU → toggle face detect
       if (inZoneTopRight(tx, ty)) {
         toggleFaceDetect();
         return;
       }
 
-      // Tap biasa → capture foto
-      if (now - lastBtnPress > DEBOUNCE_MS) {
-        lastBtnPress = now;
-        captureAndPreview();
+      // Capture: setengah kanan layar, kecuali pojok kanan atas (sudah dipakai face detect)
+      // Pakai lastTapMs terpisah agar tidak kena blokir debounce tombol fisik BOOT
+      if (inZoneCapture(tx, ty)) {
+        if (now - lastTapMs > DEBOUNCE_MS) {
+          lastTapMs = now;
+          captureAndPreview();
+        }
       }
+      // Tap di area kiri/tengah → tidak melakukan apa-apa
     }
 
     // ── MODE GALLERY ──────────────────────────────────────────────────────
@@ -1410,10 +1422,8 @@ void loop() {
       // Swipe vertikal → scroll
       if (abs(swipeY) > 20 && abs(swipeY) > abs(swipeX)) {
         if (swipeY < 0) {
-          // Swipe ke atas → scroll down
           galleryScroll = min(galleryScroll + 1, max(0, galleryCount - GALLERY_ITEMS_PAGE));
         } else {
-          // Swipe ke bawah → scroll up
           galleryScroll = max(galleryScroll - 1, 0);
         }
         drawGallery();
@@ -1432,7 +1442,6 @@ void loop() {
 
     // ── MODE PHOTO VIEW ───────────────────────────────────────────────────
     else if (appMode == MODE_PHOTO_VIEW) {
-      // Tap pojok kanan → back ke gallery
       if (inZoneTopRight(tx, ty)) {
         appMode = MODE_GALLERY;
         drawGallery();
@@ -1446,6 +1455,4 @@ void loop() {
   } else if (usbModeActive) {
     delay(50); esp_task_wdt_reset();
   }
-  // MODE_GALLERY dan MODE_PHOTO_VIEW tidak perlu re-render tiap loop
-  // karena sudah static — hanya di-redraw saat ada event touch
 }
