@@ -306,13 +306,12 @@ float         fpsValue      = 0.0f;
 #define MJPEG_SOI             0xFFD8         // JPEG Start Of Image marker
 #define MJPEG_EOI             0xFFD9         // JPEG End Of Image marker
 
-char     mjpegPath[48];           // path file yang sedang diputar
+char     mjpegPath[48];
 FILE*    mjpegFile    = nullptr;
-bool     mjpegPlaying = false;    // sedang play (bukan pause)
-bool     mjpegPaused  = false;    // user pause
-int      mjpegFrame   = 0;        // nomor frame saat ini
-int      mjpegTotal   = 0;        // estimasi total frame (di-scan saat open)
-uint8_t* mjpegBuf     = nullptr;  // buffer baca frame
+bool     mjpegPlaying = false;
+bool     mjpegPaused  = false;
+int      mjpegFrame   = 0;
+uint8_t* mjpegBuf     = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  TJpgDec callback — output ke lcd
@@ -657,26 +656,10 @@ void showPhotoView(const char* filename) {
 //    loopMjpegPlayer()   — dipanggil dari loop() saat mode MJPEG_PLAYER
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Hitung jumlah frame MJPEG dengan scan SOI marker
-int mjpegCountFrames(const char* path) {
-  FILE* f = fopen(path, "rb");
-  if (!f) return 0;
-  int count = 0;
-  uint8_t prev = 0, cur = 0;
-  while (fread(&cur, 1, 1, f) == 1) {
-    if (prev == 0xFF && cur == 0xD8) count++;
-    prev = cur;
-    esp_task_wdt_reset();
-  }
-  fclose(f);
-  return count;
-}
-
 bool mjpegOpen(const char* filename) {
   char path[48];
   snprintf(path, sizeof(path), "/sdcard/%s", filename);
 
-  // Tutup dulu kalau ada yang terbuka
   if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
   if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
 
@@ -698,16 +681,7 @@ bool mjpegOpen(const char* filename) {
   mjpegPlaying = true;
   mjpegPaused  = false;
 
-  // Hitung total frame (dengan progress di layar)
-  lcd.fillScreen(COL_BLACK);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("menghitung frame...", 30, DISP_H / 2 - 6);
-
-  mjpegTotal = mjpegCountFrames(path);
-  Serial.printf("✓ MJPEG: %s  %d frames\n", filename, mjpegTotal);
-
-  rewind(mjpegFile);
+  Serial.printf("✓ MJPEG open: %s\n", filename);
   lcd.fillScreen(COL_BLACK);
   return true;
 }
@@ -718,7 +692,6 @@ void mjpegClose() {
   mjpegPlaying = false;
   mjpegPaused  = false;
   mjpegFrame   = 0;
-  mjpegTotal   = 0;
 }
 
 // Baca 1 frame JPEG dari file (cari SOI, baca sampai EOI), decode ke lcd
@@ -778,37 +751,13 @@ void drawMjpegOverlay() {
   strncpy(nameShort, mjpegPath, 23); nameShort[23] = '\0';
   lcd.drawString(nameShort, 4, 3);
 
-  // Bar bawah: frame counter + progress bar + pause/play indikator
-  lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
-
-  // Progress bar
-  int barX = 4, barY = DISP_H - 12, barW = DISP_W - 8, barH = 4;
-  lcd.fillRect(barX, barY, barW, barH, COL_GRAY_3);
-  if (mjpegTotal > 0) {
-    int filled = (int)((long)barW * mjpegFrame / mjpegTotal);
-    filled = constrain(filled, 0, barW);
-    lcd.fillRect(barX, barY, filled, barH, COL_GRAY_C);
-  }
-
-  // Frame counter
-  char frameBuf[24];
-  if (mjpegTotal > 0)
-    snprintf(frameBuf, sizeof(frameBuf), "%d/%d", mjpegFrame, mjpegTotal);
-  else
-    snprintf(frameBuf, sizeof(frameBuf), "fr %d", mjpegFrame);
-  lcd.setTextColor(COL_GRAY_5);
-  int fw = lcd.textWidth(frameBuf);
-  lcd.drawString(frameBuf, (DISP_W - fw) / 2, DISP_H - 16);
-
-  // Pause/Play indikator di kiri
+  // Pause/Play indikator pojok kiri atas (di dalam bar)
   if (mjpegPaused) {
-    // ▐▌ dua batang
-    lcd.fillRect(4, DISP_H - 17, 3, 10, COL_GRAY_7);
-    lcd.fillRect(9, DISP_H - 17, 3, 10, COL_GRAY_7);
+    lcd.fillRect(4, 3, 3, 10, COL_GRAY_7);
+    lcd.fillRect(9, 3, 3, 10, COL_GRAY_7);
   } else {
-    // ► segitiga kecil
     for (int py = 0; py < 8; py++)
-      lcd.drawFastHLine(4, DISP_H - 17 + py, 8 - py, COL_GRAY_7);
+      lcd.drawFastHLine(4, 3 + py, 8 - py, COL_GRAY_7);
   }
 }
 
