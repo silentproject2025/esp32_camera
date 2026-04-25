@@ -1219,7 +1219,7 @@ void setup() {
   // Ganti nilai di bawah dengan hasil dari Serial Monitor kalibrasi.
   // Jika belum dikalibrasi, biarkan semua 0 → touch pakai raw mapping.
   // ─────────────────────────────────────────────────────────────────────────
-  static uint16_t touchCalData[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+  static uint16_t touchCalData[8] = { 3822, 3653, 501, 3456, 3835, 291, 550, 267 };
   // Contoh setelah kalibrasi:
   // static uint16_t touchCalData[8] = { 321, 3750, 3800, 3900, 3780, 320, 250, 3820 };
   bool calValid = false;
