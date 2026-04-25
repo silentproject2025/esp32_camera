@@ -35,6 +35,7 @@ jobs:
       - name: Install Libraries
         run: |
           arduino-cli lib install LovyanGFX
+          arduino-cli lib install "TJpg_Decoder"
 
       - name: Install esptool
         run: pip install esptool
