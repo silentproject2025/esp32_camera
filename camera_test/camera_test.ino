@@ -1555,8 +1555,8 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
 
-  // ── Tombol REC fisik (pin 41) ─────────────────────────────────────────────
-  if (appMode == MODE_VIEWFINDER && digitalRead(REC_BTN_PIN) == LOW) {
+  // ── Tombol REC fisik (pin 41) — hanya saat TIDAK sedang record ──────────
+  if (appMode == MODE_VIEWFINDER && !recActive && digitalRead(REC_BTN_PIN) == LOW) {
     delay(50);
     if (digitalRead(REC_BTN_PIN) == LOW) {
       unsigned long recPressStart = millis();
@@ -1575,13 +1575,48 @@ void loop() {
       }
       unsigned long recDuration = millis() - recPressStart;
       lcd.fillRect(0, 0, DISP_W, 3, COL_BLACK);
-      if (recActive)                             stopRecording();
-      else if (recDuration >= REC_LONG_PRESS_MS) toggleFaceDetect();
-      else                                       startRecording();
+      if (recDuration >= REC_LONG_PRESS_MS) toggleFaceDetect();
+      else                                  startRecording();
     }
   }
 
-  if (recActive) { recordFrame(); return; }
+  // ── Saat recording: cek input stop DULU, baru record frame ──────────────
+  if (recActive) {
+
+    // Tombol BOOT → stop record
+    if (digitalRead(BOOT_BTN_PIN) == LOW) {
+      delay(40);
+      if (digitalRead(BOOT_BTN_PIN) == LOW) {
+        while (digitalRead(BOOT_BTN_PIN) == LOW) { delay(10); esp_task_wdt_reset(); }
+        stopRecording();
+        return;
+      }
+    }
+
+    // Tombol REC fisik (pin 41) → stop record
+    if (digitalRead(REC_BTN_PIN) == LOW) {
+      delay(40);
+      if (digitalRead(REC_BTN_PIN) == LOW) {
+        while (digitalRead(REC_BTN_PIN) == LOW) { delay(10); esp_task_wdt_reset(); }
+        stopRecording();
+        return;
+      }
+    }
+
+    // Touch pojok kiri bawah → stop record
+    int32_t rtx, rty;
+    if (lcd.getTouch(&rtx, &rty)) {
+      // tunggu lepas
+      while (lcd.getTouch(&rtx, &rty)) { delay(10); esp_task_wdt_reset(); }
+      if (inZoneBottomLeft(rtx, rty) || inZoneTopLeft(rtx, rty)) {
+        stopRecording();
+        return;
+      }
+    }
+
+    recordFrame();
+    return;
+  }
 
   // ── Tombol BOOT ───────────────────────────────────────────────────────────
   if (digitalRead(BOOT_BTN_PIN) == LOW) {
