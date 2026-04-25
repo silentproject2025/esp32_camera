@@ -1111,7 +1111,7 @@ void setup() {
   setCpuFrequencyMhz(240);
 
   lcd.init();
-  lcd.setRotation(1);  // landscape 320×240
+  lcd.setRotation(3);  // landscape 320×240
   lcd.fillScreen(COL_BLACK);
 
   sdReady = mountSDFull();
