@@ -1,36 +1,29 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.1-ILI9341
+ * Version: v4.3-ILI9341
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  *
  * DISPLAY: ILI9341 2.4" 320×240 landscape + XPT2046 resistive touch
- * NO SOFTWARE CROP — kamera QVGA (320×240) = display size persis
  *
- * WIRING:
- *  VCC       → 3.3V
- *  GND       → GND
- *  CS        → GPIO21
- *  RESET     → GPIO1
- *  D/C       → GPIO14
- *  SDI(MOSI) → GPIO45
- *  SCK       → GPIO47
- *  SDO(MISO) → GPIO42
- *  LED       → 3.3V
- *  T_CLK     → GPIO47  (shared)
- *  T_DIN     → GPIO45  (shared)
- *  T_OUT     → GPIO42  (shared)
- *  T_CS      → GPIO2
- *  T_IRQ     → GPIO3
+ * Touch controls (viewfinder):
+ *  Tap pojok kiri atas  → buka Gallery
+ *  Tap pojok kanan atas → toggle face detect
+ *  Long tap (>1.5s)     → masuk USB mode
+ *  Tap biasa            → capture foto
  *
- * SENSOR YANG DIDUKUNG:
- *  GC2145 (RHYX M21-45) — RGB565 only, no HW JPEG
- *  OV3660               — RGB565 mode, HW JPEG tersedia
+ * Touch controls (gallery):
+ *  Swipe atas/bawah     → scroll list
+ *  Tap nama file        → lihat foto full screen
+ *  Tap pojok kanan      → back ke viewfinder
  *
- * Kontrol:
+ * Touch controls (photo view):
+ *  Tap pojok kanan      → back ke gallery
+ *
+ * Tombol fisik:
  *  BOOT singkat        → capture foto ke SD
  *  BOOT tahan 2s       → masuk USB Mass Storage mode
- *  BOOT (di USB)       → keluar dari USB mode, kembali viewfinder
+ *  BOOT (di USB)       → keluar dari USB mode
  *  Pin 41 singkat      → mulai/stop rekam video MJPEG
  *  Pin 41 tahan 2s     → toggle face detection mode
  */
@@ -53,11 +46,13 @@
 #include "USB.h"
 #include "USBMSC.h"
 
+#include <TJpg_Decoder.h>
+
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LGFX Config — ILI9341 2.4" 320×240 + XPT2046 shared SPI
+//  LGFX Config
 // ─────────────────────────────────────────────────────────────────────────────
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9341  _panel_instance;
@@ -66,7 +61,6 @@ class LGFX : public lgfx::LGFX_Device {
 
 public:
   LGFX() {
-    // ── SPI Bus ──────────────────────────────────────────────────────────────
     {
       auto cfg = _bus_instance.config();
       cfg.spi_host    = SPI2_HOST;
@@ -83,8 +77,6 @@ public:
       _bus_instance.config(cfg);
       _panel_instance.setBus(&_bus_instance);
     }
-
-    // ── Panel ILI9341 ────────────────────────────────────────────────────────
     {
       auto cfg = _panel_instance.config();
       cfg.pin_cs           = 21;
@@ -104,28 +96,24 @@ public:
       cfg.bus_shared       = true;
       _panel_instance.config(cfg);
     }
-
-    // ── Touch XPT2046 ────────────────────────────────────────────────────────
     {
       auto cfg = _touch_instance.config();
-      // Ganti nilai ini setelah jalanin sketch kalibrasi!
-      cfg.x_min         = 75;
-      cfg.x_max         = 285;
-      cfg.y_min         = 44;
-      cfg.y_max         = 216;
-      cfg.pin_int       = 3;
-      cfg.bus_shared    = true;
+      cfg.x_min           = 75;
+      cfg.x_max           = 285;
+      cfg.y_min           = 44;
+      cfg.y_max           = 216;
+      cfg.pin_int         = 3;
+      cfg.bus_shared      = true;
       cfg.offset_rotation = 0;
-      cfg.spi_host      = SPI2_HOST;
-      cfg.freq          = 2500000;
-      cfg.pin_sclk      = 47;
-      cfg.pin_mosi      = 45;
-      cfg.pin_miso      = 42;
-      cfg.pin_cs        = 2;
+      cfg.spi_host        = SPI2_HOST;
+      cfg.freq            = 2500000;
+      cfg.pin_sclk        = 47;
+      cfg.pin_mosi        = 45;
+      cfg.pin_miso        = 42;
+      cfg.pin_cs          = 2;
       _touch_instance.config(cfg);
       _panel_instance.setTouch(&_touch_instance);
     }
-
     setPanel(&_panel_instance);
   }
 };
@@ -167,7 +155,7 @@ static LGFX lcd;
 #define REC_BTN_PIN      41
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Display — ILI9341 landscape 320×240
+//  Display
 // ─────────────────────────────────────────────────────────────────────────────
 #define DISP_W          320
 #define DISP_H          240
@@ -195,19 +183,46 @@ static LGFX lcd;
 #define PID_OV3660  0x3660
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Konstanta tombol
+//  Konstanta
 // ─────────────────────────────────────────────────────────────────────────────
-#define DEBOUNCE_MS          400
-#define LONG_PRESS_MS       2000
-#define REC_LONG_PRESS_MS   2000
+#define DEBOUNCE_MS         400
+#define LONG_PRESS_MS      2000
+#define REC_LONG_PRESS_MS  2000
+#define LONG_TAP_MS        1500
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Mirror & Flip Setting
+//  Mirror & Flip
 // ─────────────────────────────────────────────────────────────────────────────
 #define HMIRROR_GC2145   1
 #define VFLIP_GC2145     0
 #define HMIRROR_OV3660   0
 #define VFLIP_OV3660     1
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  App mode
+// ─────────────────────────────────────────────────────────────────────────────
+enum AppMode { MODE_VIEWFINDER, MODE_GALLERY, MODE_PHOTO_VIEW };
+AppMode appMode = MODE_VIEWFINDER;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Gallery state
+// ─────────────────────────────────────────────────────────────────────────────
+#define GALLERY_MAX_FILES  200
+#define GALLERY_ITEMS_PAGE   8
+#define GALLERY_ITEM_H      26
+
+char     galleryFiles[GALLERY_MAX_FILES][32];
+int      galleryCount    = 0;
+int      galleryScroll   = 0;
+char     photoViewPath[48];
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Touch zones
+// ─────────────────────────────────────────────────────────────────────────────
+#define TOUCH_ZONE_SZ   50   // ukuran pojok touch zone
+
+bool inZoneTopLeft(int32_t x, int32_t y)  { return x < TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
+bool inZoneTopRight(int32_t x, int32_t y) { return x > DISP_W - TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Video recording state
@@ -244,6 +259,7 @@ uint64_t      sdSizeMB        = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 int           photoCount     = 0;
 unsigned long lastBtnPress   = 0;
+unsigned long lastTapMs      = 0;
 uint16_t      detectedSensor = 0;
 char          sensorName[16] = "UNKNOWN";
 
@@ -262,6 +278,14 @@ float         fpsValue      = 0.0f;
 #define PILL_H          13
 #define PILL_R           6
 #define PILL_PAD_X       5
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  TJpgDec callback — output ke lcd
+// ─────────────────────────────────────────────────────────────────────────────
+bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  lcd.pushImage(x, y, w, h, bitmap);
+  return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helper: corner brackets
@@ -301,7 +325,7 @@ void drawPill(int cx, int cy, const char* text,
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRSSIDots(int rssi) {
   uint16_t cols[4] = { COL_GRAY_5, COL_GRAY_7, COL_GRAY_A, COL_GRAY_C };
-  int dotY = DISP_H - 7;
+  int dotY   = DISP_H - 7;
   int startX = DISP_W / 2 - 14;
   for (int i = 0; i < 4; i++) {
     uint16_t c = (i < rssi) ? cols[i] : COL_GRAY_2;
@@ -411,6 +435,168 @@ void scanVideoCount() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  Gallery: scan file foto dari SD
+// ─────────────────────────────────────────────────────────────────────────────
+void scanGalleryFiles() {
+  galleryCount  = 0;
+  galleryScroll = 0;
+  DIR* dir = opendir("/sdcard");
+  if (!dir) return;
+  struct dirent* entry;
+  while ((entry = readdir(dir)) != nullptr && galleryCount < GALLERY_MAX_FILES) {
+    String name = entry->d_name;
+    if (name.endsWith(".jpg") || name.endsWith(".JPG")) {
+      strncpy(galleryFiles[galleryCount], entry->d_name, 31);
+      galleryFiles[galleryCount][31] = '\0';
+      galleryCount++;
+    }
+  }
+  closedir(dir);
+  // Sort sederhana (bubble sort by name)
+  for (int i = 0; i < galleryCount - 1; i++) {
+    for (int j = 0; j < galleryCount - i - 1; j++) {
+      if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
+        char tmp[32];
+        strncpy(tmp, galleryFiles[j], 31);
+        strncpy(galleryFiles[j], galleryFiles[j+1], 31);
+        strncpy(galleryFiles[j+1], tmp, 31);
+      }
+    }
+    esp_task_wdt_reset();
+  }
+  Serial.printf("✓ Gallery: %d foto ditemukan\n", galleryCount);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Gallery: render list
+// ─────────────────────────────────────────────────────────────────────────────
+void drawGallery() {
+  lcd.fillScreen(COL_BLACK);
+
+  // Header
+  lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
+  lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(COL_GRAY_E);
+  char hdr[32];
+  snprintf(hdr, sizeof(hdr), "GALLERY  %d foto", galleryCount);
+  int hw = lcd.textWidth(hdr);
+  lcd.drawString(hdr, (DISP_W - hw) / 2, 6);
+
+  // Back button pojok kanan atas
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("BACK >", DISP_W - 44, 6);
+
+  if (galleryCount == 0) {
+    lcd.setTextColor(COL_GRAY_5);
+    int ew = lcd.textWidth("SD kosong / tidak ada foto");
+    lcd.drawString("SD kosong / tidak ada foto", (DISP_W - ew) / 2, DISP_H / 2);
+    return;
+  }
+
+  // List item
+  int visibleEnd = min(galleryScroll + GALLERY_ITEMS_PAGE, galleryCount);
+  for (int i = galleryScroll; i < visibleEnd; i++) {
+    int rowY = 24 + (i - galleryScroll) * GALLERY_ITEM_H;
+    bool isEven = (i % 2 == 0);
+    lcd.fillRect(0, rowY, DISP_W, GALLERY_ITEM_H - 1, isEven ? COL_GRAY_D : COL_BLACK);
+    lcd.drawFastHLine(0, rowY + GALLERY_ITEM_H - 1, DISP_W, COL_GRAY_2);
+
+    // Nomor
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextColor(COL_GRAY_5);
+    char num[6];
+    snprintf(num, sizeof(num), "%3d", i + 1);
+    lcd.drawString(num, 6, rowY + 8);
+
+    // Nama file
+    lcd.setTextColor(COL_GRAY_C);
+    lcd.drawString(galleryFiles[i], 30, rowY + 8);
+
+    // Panah
+    lcd.setTextColor(COL_GRAY_3);
+    lcd.drawString(">", DISP_W - 12, rowY + 8);
+  }
+
+  // Scroll indicator
+  if (galleryCount > GALLERY_ITEMS_PAGE) {
+    int barH = DISP_H - 22;
+    int indH = max(10, barH * GALLERY_ITEMS_PAGE / galleryCount);
+    int indY = 22 + (barH - indH) * galleryScroll / max(1, galleryCount - GALLERY_ITEMS_PAGE);
+    lcd.fillRect(DISP_W - 4, 22, 4, barH, COL_GRAY_2);
+    lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Photo view: decode & tampil JPEG dari SD
+// ─────────────────────────────────────────────────────────────────────────────
+void showPhotoView(const char* filename) {
+  lcd.fillScreen(COL_BLACK);
+
+  char path[48];
+  snprintf(path, sizeof(path), "/sdcard/%s", filename);
+
+  // Baca file ke buffer
+  FILE* f = fopen(path, "rb");
+  if (!f) {
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("file tidak bisa dibuka", 20, DISP_H / 2);
+    delay(1500);
+    return;
+  }
+
+  fseek(f, 0, SEEK_END);
+  size_t fsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+
+  uint8_t* buf = (uint8_t*)malloc(fsize);
+  if (!buf) {
+    fclose(f);
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("out of memory", 20, DISP_H / 2);
+    delay(1500);
+    return;
+  }
+
+  fread(buf, 1, fsize, f);
+  fclose(f);
+
+  // Decode & render
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tjpgdecOutput);
+  uint16_t w = 0, h = 0;
+  TJpgDec.getJpgSize(&w, &h, buf, fsize);
+
+  // Center jika lebih kecil dari layar
+  int ox = (DISP_W - min((int)w, DISP_W)) / 2;
+  int oy = (DISP_H - min((int)h, DISP_H)) / 2;
+  TJpgDec.drawJpg(ox, oy, buf, fsize);
+
+  free(buf);
+
+  // Overlay: nama file + back button
+  lcd.fillRect(0, 0, DISP_W, 16, 0x0000);
+  lcd.fillRect(0, 0, DISP_W, 16, (uint16_t)(COL_BLACK | 0x0000));
+  // Semi-transparent bar simulasi: fillRect gelap
+  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(COL_GRAY_A);
+  int nw = lcd.textWidth(filename);
+  lcd.drawString(filename, (DISP_W - nw) / 2, DISP_H - 13);
+
+  // Back button pojok kanan atas
+  lcd.fillRect(DISP_W - 50, 0, 50, 16, COL_GRAY_D);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("BACK >", DISP_W - 44, 3);
+
+  strncpy(photoViewPath, filename, sizeof(photoViewPath) - 1);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  UI: REC indicator overlay
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRecIndicator() {
@@ -432,7 +618,6 @@ void drawRecIndicator() {
   char fBuf[12];
   snprintf(fBuf, sizeof(fBuf), "%df", recFrameCount);
   lcd.setTextColor(COL_GRAY_7);
-  int fw = lcd.textWidth(fBuf);
   lcd.drawString(fBuf, DISP_W / 2 + 24, 6);
 }
 
@@ -441,21 +626,13 @@ void drawRecIndicator() {
 // ─────────────────────────────────────────────────────────────────────────────
 void startRecording() {
   if (!sdReady) { Serial.println("[REC] Batal: SD tidak siap"); return; }
+  if (faceDetectMode) { faceDetectMode = false; faceDetectCount = 0; }
 
-  if (faceDetectMode) {
-    faceDetectMode = false;
-    faceDetectCount = 0;
-    Serial.println("[REC] Face detect dimatikan");
-  }
   recVideoCount++;
   char path[48];
   snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
   recFile = fopen(path, "wb");
-  if (!recFile) {
-    Serial.printf("✗ Gagal buka file rekam: %s\n", path);
-    recVideoCount--;
-    return;
-  }
+  if (!recFile) { recVideoCount--; return; }
   recFrameCount = 0;
   recStartMs    = millis();
   recActive     = true;
@@ -478,14 +655,12 @@ void stopRecording() {
   fclose(recFile);
   recFile   = nullptr;
   recActive = false;
-
   unsigned long dur = (millis() - recStartMs) / 1000;
   Serial.printf("■ REC STOP: %d frames, %lus\n", recFrameCount, dur);
 
   lcd.setFont(&fonts::Font0);
   char buf[28];
-  snprintf(buf, sizeof(buf), "SAVED  %df  %02lu:%02lu",
-           recFrameCount, dur / 60, dur % 60);
+  snprintf(buf, sizeof(buf), "SAVED  %df  %02lu:%02lu", recFrameCount, dur / 60, dur % 60);
   int tw = lcd.textWidth(buf);
   int pw = tw + 14;
   int px = (DISP_W - pw) / 2;
@@ -499,12 +674,10 @@ void stopRecording() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Record satu frame ke file MJPEG
-//  NO CROP — langsung pushImage full 320×240
+//  Record satu frame
 // ─────────────────────────────────────────────────────────────────────────────
 void recordFrame() {
   if (!recActive || !recFile) return;
-
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) { esp_task_wdt_reset(); return; }
 
@@ -592,7 +765,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.1  ILI9341 + XPT2046", DISP_W / 2 - 72, 103);
+  lcd.drawString("v4.3  ILI9341 + XPT2046", DISP_W / 2 - 72, 103);
 
   lcd.drawFastHLine(20, 116, DISP_W - 40, COL_GRAY_2);
 
@@ -651,20 +824,17 @@ void drawUSBIcon(int cx, int cy, uint16_t col) {
 
 void drawUSBModeScreen() {
   lcd.fillScreen(COL_BLACK);
-
   lcd.fillRect(0, 0, DISP_W, 18, COL_GRAY_D);
   lcd.drawFastHLine(0, 18, DISP_W, COL_GRAY_3);
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_3);
   lcd.drawString("ESP32-S3", 6, 4);
-
   lcd.setTextColor(COL_GRAY_5);
   int lw = lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE", (DISP_W - lw) / 2, 4);
-
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("v4.1", DISP_W - 24, 4);
+  lcd.drawString("v4.3", DISP_W - 24, 4);
 
   drawUSBIcon(DISP_W / 2, 85, COL_GRAY_7);
 
@@ -677,7 +847,6 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int sw = lcd.textWidth("to host via USB");
   lcd.drawString("to host via USB", (DISP_W - sw) / 2, 136);
-
   lcd.drawFastHLine(40, 150, DISP_W - 80, COL_GRAY_2);
 
   auto infoRow = [&](int y, const char* key, const char* val) {
@@ -691,26 +860,19 @@ void drawUSBModeScreen() {
 
   char buf[32];
   infoRow(156, "SENSOR", sensorName);
-
-  if (sdSizeMB < 1024)
-    snprintf(buf, sizeof(buf), "%lluMB  FAT32", sdSizeMB);
-  else
-    snprintf(buf, sizeof(buf), "%lluGB  FAT32", sdSizeMB / 1024);
+  if (sdSizeMB < 1024) snprintf(buf, sizeof(buf), "%lluMB  FAT32", sdSizeMB);
+  else                  snprintf(buf, sizeof(buf), "%lluGB  FAT32", sdSizeMB / 1024);
   infoRow(170, "STORAGE", buf);
-
   snprintf(buf, sizeof(buf), "%04d files", photoCount);
   infoRow(184, "PHOTOS", buf);
 
   lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
   lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
-
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
   int ew = lcd.textWidth("eject from host first");
   lcd.drawString("eject from host first", (DISP_W - ew) / 2, DISP_H - 15);
-
   lcd.drawRoundRect((DISP_W / 2) - 68, DISP_H - 32, 136, 13, 2, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_5);
   int hw = lcd.textWidth("[ BOOT ]  exit usb mode");
   lcd.drawString("[ BOOT ]  exit usb mode", (DISP_W - hw) / 2, DISP_H - 30);
 }
@@ -761,6 +923,7 @@ void exitUSBMode() {
   blinkLED(2, 150, 100);
   delay(1000);
   lcd.fillScreen(COL_BLACK);
+  appMode = MODE_VIEWFINDER;
   fpsLastTime = millis(); fpsFrameCount = 0; fpsValue = 0.0f;
 }
 
@@ -777,7 +940,7 @@ void updateFPS() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Face Detection — NO CROP, langsung dari fb->buf
+//  Face Detection
 // ─────────────────────────────────────────────────────────────────────────────
 void runFaceDetect(camera_fb_t *fb) {
   if (!fb || fb->format != PIXFORMAT_RGB565) return;
@@ -799,23 +962,14 @@ void runFaceDetect(camera_fb_t *fb) {
     int y1 = constrain(res.box[1], 0, DISP_H - 1);
     int x2 = constrain(res.box[2], 0, DISP_W - 1);
     int y2 = constrain(res.box[3], 0, DISP_H - 1);
-
-    int bw = x2 - x1;
-    int bh = y2 - y1;
+    int bw = x2 - x1, bh = y2 - y1;
     if (bw < 4 || bh < 4) continue;
-
     int CL = min(12, min(bw, bh) / 3);
     uint16_t fc = COL_WHITE;
-
-    lcd.drawFastHLine(x1, y1, CL, fc);
-    lcd.drawFastVLine(x1, y1, CL, fc);
-    lcd.drawFastHLine(x2 - CL, y1, CL, fc);
-    lcd.drawFastVLine(x2, y1, CL, fc);
-    lcd.drawFastHLine(x1, y2, CL, fc);
-    lcd.drawFastVLine(x1, y2 - CL, CL, fc);
-    lcd.drawFastHLine(x2 - CL, y2, CL, fc);
-    lcd.drawFastVLine(x2, y2 - CL, CL, fc);
-
+    lcd.drawFastHLine(x1, y1, CL, fc); lcd.drawFastVLine(x1, y1, CL, fc);
+    lcd.drawFastHLine(x2 - CL, y1, CL, fc); lcd.drawFastVLine(x2, y1, CL, fc);
+    lcd.drawFastHLine(x1, y2, CL, fc); lcd.drawFastVLine(x1, y2 - CL, CL, fc);
+    lcd.drawFastHLine(x2 - CL, y2, CL, fc); lcd.drawFastVLine(x2, y2 - CL, CL, fc);
     if (res.keypoint.size() >= 10) {
       for (int k = 0; k < 10; k += 2) {
         int kx = constrain(res.keypoint[k],   0, DISP_W - 1);
@@ -826,9 +980,6 @@ void runFaceDetect(camera_fb_t *fb) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Toggle face detect
-// ─────────────────────────────────────────────────────────────────────────────
 void toggleFaceDetect() {
   faceDetectMode = !faceDetectMode;
   faceDetectCount = 0;
@@ -848,50 +999,45 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  UI: VIEWFINDER — NO CROP
+//  UI: VIEWFINDER
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
-    // Push langsung — no crop, no offset
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-
     drawCornerBrackets(COL_GRAY_E);
 
-    if (faceDetectMode) {
-      runFaceDetect(fb);
-    }
+    if (faceDetectMode) runFaceDetect(fb);
 
-    // FPS pill — top-left
     char fpsBuf[12];
     snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
     drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
-
-    // Sensor pill — top-right
     drawPill(DISP_W - 35, 10, sensorName, COL_PILL_BG, COL_GRAY_A);
 
-    // Shot counter pill — bottom-left
     char shotBuf[10];
     snprintf(shotBuf, sizeof(shotBuf), "#%04d", photoCount + 1);
     drawPill(30, DISP_H - 10, shotBuf, COL_PILL_BG, COL_GRAY_8);
 
-    // SD pill — bottom-right
     const char* sdLabel = sdReady ? "SD  OK" : "SD  --";
-    drawPill(DISP_W - 36, DISP_H - 10, sdLabel, COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
+    drawPill(DISP_W - 36, DISP_H - 10, sdLabel, COL_PILL_BG,
+             sdReady ? COL_GRAY_8 : COL_GRAY_5);
 
-    // Face detect pill atau RSSI dots
     if (faceDetectMode) {
       char faceBuf[12];
-      if (faceDetectCount > 0)
-        snprintf(faceBuf, sizeof(faceBuf), "FACE  %d", faceDetectCount);
-      else
-        snprintf(faceBuf, sizeof(faceBuf), "FACE  --");
+      snprintf(faceBuf, sizeof(faceBuf),
+               faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
       drawPill(DISP_W / 2, DISP_H - 10, faceBuf, COL_PILL_BG, COL_GRAY_C);
     } else {
       drawRSSIDots(getSignalBars());
     }
+
+    // Touch zone hints
+    lcd.setFont(&fonts::Font0);
+    lcd.setTextColor(COL_GRAY_3);
+    lcd.drawString("GAL", 3, 3);       // pojok kiri atas
+    lcd.drawString("FACE", DISP_W - 28, 3); // pojok kanan atas
 
     updateFPS();
   } else {
@@ -929,7 +1075,7 @@ void showSavedFeedback(bool saved) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Capture & Simpan ke SD — NO CROP
+//  Capture & Simpan ke SD
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   digitalWrite(LED_PIN, HIGH);
@@ -942,7 +1088,6 @@ void captureAndPreview() {
   }
   digitalWrite(LED_PIN, LOW);
 
-  // Freeze frame ke display — langsung full 320×240
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -977,11 +1122,9 @@ void captureAndPreview() {
   }
 
   esp_camera_fb_return(fb);
-
   showSavedFeedback(saved);
   if (saved) blinkLED(2, 150, 80);
   else       blinkLED(5, 50, 50);
-
   delay(2000);
   fpsLastTime = millis(); fpsFrameCount = 0;
 }
@@ -990,39 +1133,20 @@ void captureAndPreview() {
 //  Apply sensor settings
 // ─────────────────────────────────────────────────────────────────────────────
 void applySensorSettings(sensor_t *s, uint16_t pid) {
-  s->set_brightness(s, 0);
-  s->set_contrast(s, 0);
-  s->set_saturation(s, 0);
-  s->set_special_effect(s, 0);
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 0);
-  s->set_exposure_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  s->set_ae_level(s, 0);
-  s->set_gain_ctrl(s, 1);
-  s->set_agc_gain(s, 0);
+  s->set_brightness(s, 0); s->set_contrast(s, 0); s->set_saturation(s, 0);
+  s->set_special_effect(s, 0); s->set_whitebal(s, 1); s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0); s->set_exposure_ctrl(s, 1); s->set_aec2(s, 1);
+  s->set_ae_level(s, 0); s->set_gain_ctrl(s, 1); s->set_agc_gain(s, 0);
 
   if (pid == PID_GC2145) {
-    s->set_aec_value(s, 300);
-    s->set_gainceiling(s, GAINCEILING_4X);
-    s->set_hmirror(s, HMIRROR_GC2145);
-    s->set_vflip(s, VFLIP_GC2145);
-    Serial.printf("✓ GC2145 settings applied (hmirror=%d vflip=%d)\n",
-                  HMIRROR_GC2145, VFLIP_GC2145);
+    s->set_aec_value(s, 300); s->set_gainceiling(s, GAINCEILING_4X);
+    s->set_hmirror(s, HMIRROR_GC2145); s->set_vflip(s, VFLIP_GC2145);
   } else if (pid == PID_OV3660) {
-    s->set_aec_value(s, 400);
-    s->set_gainceiling(s, GAINCEILING_4X);
-    s->set_hmirror(s, HMIRROR_OV3660);
-    s->set_vflip(s, VFLIP_OV3660);
-    Serial.printf("✓ OV3660 settings applied (hmirror=%d vflip=%d)\n",
-                  HMIRROR_OV3660, VFLIP_OV3660);
+    s->set_aec_value(s, 400); s->set_gainceiling(s, GAINCEILING_4X);
+    s->set_hmirror(s, HMIRROR_OV3660); s->set_vflip(s, VFLIP_OV3660);
   } else {
-    s->set_aec_value(s, 300);
-    s->set_gainceiling(s, GAINCEILING_2X);
-    s->set_hmirror(s, 0);
-    s->set_vflip(s, 0);
-    Serial.println("⚠ Unknown sensor — fallback settings");
+    s->set_aec_value(s, 300); s->set_gainceiling(s, GAINCEILING_2X);
+    s->set_hmirror(s, 0); s->set_vflip(s, 0);
   }
 }
 
@@ -1031,52 +1155,36 @@ void applySensorSettings(sensor_t *s, uint16_t pid) {
 // ─────────────────────────────────────────────────────────────────────────────
 bool initCamera() {
   camera_config_t cfg;
-  cfg.ledc_channel = LEDC_CHANNEL_0;
-  cfg.ledc_timer   = LEDC_TIMER_0;
-  cfg.pin_d0  = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
-  cfg.pin_d2  = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
-  cfg.pin_d4  = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
-  cfg.pin_d6  = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
-  cfg.pin_xclk     = XCLK_GPIO_NUM;
-  cfg.pin_pclk     = PCLK_GPIO_NUM;
-  cfg.pin_vsync    = VSYNC_GPIO_NUM;
-  cfg.pin_href     = HREF_GPIO_NUM;
-  cfg.pin_sccb_sda = SIOD_GPIO_NUM;
-  cfg.pin_sccb_scl = SIOC_GPIO_NUM;
-  cfg.pin_pwdn     = PWDN_GPIO_NUM;
-  cfg.pin_reset    = RESET_GPIO_NUM;
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
+  cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
+  cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk = XCLK_GPIO_NUM; cfg.pin_pclk = PCLK_GPIO_NUM;
+  cfg.pin_vsync = VSYNC_GPIO_NUM; cfg.pin_href = HREF_GPIO_NUM;
+  cfg.pin_sccb_sda = SIOD_GPIO_NUM; cfg.pin_sccb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn = PWDN_GPIO_NUM; cfg.pin_reset = RESET_GPIO_NUM;
   cfg.pixel_format = PIXFORMAT_RGB565;
-  cfg.frame_size   = FRAMESIZE_QVGA;  // 320×240 persis
+  cfg.frame_size   = FRAMESIZE_QVGA;
   cfg.grab_mode    = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
-    cfg.jpeg_quality = 7;
-    cfg.fb_count     = 2;
-    cfg.fb_location  = CAMERA_FB_IN_PSRAM;
-    Serial.println("✓ PSRAM Found");
+    cfg.jpeg_quality = 7; cfg.fb_count = 2;
+    cfg.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    cfg.jpeg_quality = 12;
-    cfg.fb_count     = 1;
-    cfg.fb_location  = CAMERA_FB_IN_DRAM;
-    Serial.println("⚠ No PSRAM");
+    cfg.jpeg_quality = 12; cfg.fb_count = 1;
+    cfg.fb_location = CAMERA_FB_IN_DRAM;
   }
 
   cfg.xclk_freq_hz = 20000000;
-  Serial.println("Camera: probing 20MHz...");
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    Serial.println("✗ Camera Init Failed");
-    return false;
-  }
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
 
   sensor_t *s = esp_camera_sensor_get();
-  if (!s) { Serial.println("✗ Gagal baca sensor"); return false; }
+  if (!s) return false;
   detectedSensor = s->id.PID;
-  Serial.printf("Sensor PID: 0x%04X\n", detectedSensor);
 
   if (detectedSensor == PID_OV3660) {
-    Serial.println("OV3660 → re-init 24MHz...");
-    esp_camera_deinit();
-    delay(100);
+    esp_camera_deinit(); delay(100);
     cfg.xclk_freq_hz = 24000000;
     if (esp_camera_init(&cfg) != ESP_OK) {
       cfg.xclk_freq_hz = 20000000;
@@ -1093,7 +1201,6 @@ bool initCamera() {
   }
 
   applySensorSettings(s, detectedSensor);
-  Serial.printf("✓ Camera Ready — %s\n", sensorName);
   return true;
 }
 
@@ -1102,35 +1209,31 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.1 (ILI9341 + XPT2046) ===");
+  Serial.println("\n=== Sanzxcam v4.3 ===");
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   pinMode(REC_BTN_PIN, INPUT_PULLUP);
   setCpuFrequencyMhz(240);
 
   lcd.init();
-  lcd.setRotation(3);  // landscape 320×240
+  lcd.setRotation(3);
   lcd.fillScreen(COL_BLACK);
 
-  sdReady = mountSDFull();
-  if (sdReady) {
-    scanPhotoCount();
-    scanVideoCount();
-  }
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tjpgdecOutput);
 
-  msc.vendorID("ESP32S3");
-  msc.productID("SD Card");
-  msc.productRevision("1.0");
-  msc.onRead(onRead);
-  msc.onWrite(onWrite);
+  sdReady = mountSDFull();
+  if (sdReady) { scanPhotoCount(); scanVideoCount(); }
+
+  msc.vendorID("ESP32S3"); msc.productID("SD Card"); msc.productRevision("1.0");
+  msc.onRead(onRead); msc.onWrite(onWrite);
   msc.begin(sdTotalSectors > 0 ? sdTotalSectors : 0, 512);
   msc.mediaPresent(false);
   USB.begin();
 
   bool camOK = initCamera();
-
   bool pidOK = (detectedSensor == PID_GC2145 || detectedSensor == PID_OV3660);
   uint32_t xclkHz = (detectedSensor == PID_OV3660) ? 24000000 : 20000000;
   runBootSequence(sdReady, sdSizeMB, pidOK, detectedSensor, camOK, xclkHz);
@@ -1141,16 +1244,12 @@ void setup() {
     lcd.setTextColor(COL_GRAY_5);
     int ew = lcd.textWidth("camera init failed");
     lcd.drawString("camera init failed", (DISP_W - ew) / 2, 110);
-    lcd.setTextColor(COL_GRAY_3);
-    int hw = lcd.textWidth("check connection");
-    lcd.drawString("check connection", (DISP_W - hw) / 2, 128);
     while (true) { blinkLED(3, 100, 100); delay(1000); }
   }
 
   lcd.fillScreen(COL_BLACK);
   fpsLastTime = millis(); fpsFrameCount = 0;
   blinkLED(3, 120, 120);
-  Serial.printf("Ready. Sensor: %s | Next: #%04d\n", sensorName, photoCount + 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1159,106 +1258,194 @@ void setup() {
 void loop() {
 
   // ── Tombol REC (pin 41) ───────────────────────────────────────────────────
-  if (digitalRead(REC_BTN_PIN) == LOW) {
+  if (appMode == MODE_VIEWFINDER && digitalRead(REC_BTN_PIN) == LOW) {
     delay(50);
     if (digitalRead(REC_BTN_PIN) == LOW) {
       unsigned long recPressStart = millis();
-
       while (digitalRead(REC_BTN_PIN) == LOW) {
-        delay(10);
-        esp_task_wdt_reset();
-
+        delay(10); esp_task_wdt_reset();
         if (!recActive) {
           unsigned long held = millis() - recPressStart;
           if (held > 500) {
             int barW = constrain(
               (int)map((long)held, 500L, (long)REC_LONG_PRESS_MS, 0L, (long)DISP_W),
-              0, DISP_W
-            );
+              0, DISP_W);
             lcd.fillRect(0, 0, barW, 3, COL_GRAY_5);
             lcd.fillRect(barW, 0, DISP_W - barW, 3, COL_BLACK);
           }
         }
       }
-
       unsigned long recDuration = millis() - recPressStart;
       lcd.fillRect(0, 0, DISP_W, 3, COL_BLACK);
-
-      if (recActive) {
-        stopRecording();
-      } else if (recDuration >= REC_LONG_PRESS_MS) {
-        toggleFaceDetect();
-      } else {
-        startRecording();
-      }
+      if (recActive)                        stopRecording();
+      else if (recDuration >= REC_LONG_PRESS_MS) toggleFaceDetect();
+      else                                   startRecording();
     }
   }
 
-  // ── Kalau sedang rekam: prioritas recordFrame ─────────────────────────────
-  if (recActive) {
-    recordFrame();
-    return;
-  }
+  if (recActive) { recordFrame(); return; }
 
-  // ── Tombol BOOT ──────────────────────────────────────────────────────────
+  // ── Tombol BOOT ───────────────────────────────────────────────────────────
   if (digitalRead(BOOT_BTN_PIN) == LOW) {
     unsigned long pressStart = millis();
-
     while (digitalRead(BOOT_BTN_PIN) == LOW) {
-      delay(10);
-      esp_task_wdt_reset();
-      if (!usbModeActive) {
+      delay(10); esp_task_wdt_reset();
+      if (!usbModeActive && appMode == MODE_VIEWFINDER) {
         unsigned long held = millis() - pressStart;
         if (held > 1000) {
-          int barW = constrain((int)map((long)held, 1000L, (long)LONG_PRESS_MS, 0L, (long)DISP_W), 0, DISP_W);
+          int barW = constrain(
+            (int)map((long)held, 1000L, (long)LONG_PRESS_MS, 0L, (long)DISP_W), 0, DISP_W);
           lcd.fillRect(0, DISP_H - 3, barW, 3, COL_GRAY_7);
           lcd.fillRect(barW, DISP_H - 3, DISP_W - barW, 3, COL_BLACK);
         }
       }
     }
-
     unsigned long duration = millis() - pressStart;
     if (duration < 50) return;
     unsigned long now = millis();
 
     if (usbModeActive) {
       exitUSBMode();
-    } else if (duration >= LONG_PRESS_MS) {
+    } else if (appMode == MODE_VIEWFINDER && duration >= LONG_PRESS_MS) {
       lcd.fillRect(0, DISP_H - 3, DISP_W, 3, COL_BLACK);
       if (now - lastBtnPress > DEBOUNCE_MS) {
         lastBtnPress = now;
         if (sdReady) enterUSBMode();
-        else {
-          lcd.setFont(&fonts::Font0);
-          int tw = lcd.textWidth("usb: no sd card");
-          int pw = tw + 14;
-          int px = (DISP_W - pw) / 2;
-          lcd.fillRoundRect(px, DISP_H / 2 - 8, pw, 15, 7, COL_GRAY_3);
-          lcd.setTextColor(COL_GRAY_5);
-          lcd.drawString("usb: no sd card", px + 7, DISP_H / 2 - 5);
-          delay(1500);
-          lcd.fillRect(0, DISP_H / 2 - 12, DISP_W, 22, COL_BLACK);
-        }
       }
-    } else {
+    } else if (appMode == MODE_VIEWFINDER) {
       if (now - lastBtnPress > DEBOUNCE_MS) {
         lastBtnPress = now;
         captureAndPreview();
       }
+    } else if (appMode == MODE_GALLERY) {
+      // BOOT = back ke viewfinder dari gallery
+      appMode = MODE_VIEWFINDER;
+      lcd.fillScreen(COL_BLACK);
+      fpsLastTime = millis(); fpsFrameCount = 0;
+    } else if (appMode == MODE_PHOTO_VIEW) {
+      // BOOT = back ke gallery
+      appMode = MODE_GALLERY;
+      drawGallery();
     }
     return;
   }
 
-if (!usbModeActive) {
-    int32_t tx, ty;
-    if (lcd.getTouch(&tx, &ty)) {
+  // ── Touch handling ────────────────────────────────────────────────────────
+  int32_t tx, ty;
+  if (lcd.getTouch(&tx, &ty)) {
+    unsigned long touchStart = millis();
+
+    // Tunggu lepas, hitung durasi & deteksi swipe
+    int32_t tx2 = tx, ty2 = ty;
+    while (lcd.getTouch(&tx2, &ty2)) {
+      delay(10); esp_task_wdt_reset();
+    }
+    unsigned long touchDur = millis() - touchStart;
+    int32_t swipeX = tx2 - tx;
+    int32_t swipeY = ty2 - ty;
+
+    // ── MODE VIEWFINDER ───────────────────────────────────────────────────
+    if (appMode == MODE_VIEWFINDER && !usbModeActive) {
+
+      // Long tap → USB mode
+      if (touchDur >= LONG_TAP_MS) {
+        if (sdReady) {
+          // Feedback
+          lcd.setFont(&fonts::Font0);
+          int tw = lcd.textWidth("masuk USB mode...");
+          int pw = tw + 14;
+          int px = (DISP_W - pw) / 2;
+          lcd.fillRoundRect(px, DISP_H / 2 - 8, pw, 15, 7, COL_GRAY_3);
+          lcd.setTextColor(COL_GRAY_5);
+          lcd.drawString("masuk USB mode...", px + 7, DISP_H / 2 - 5);
+          delay(500);
+          enterUSBMode();
+        }
+        return;
+      }
+
       unsigned long now = millis();
+
+      // Pojok kiri atas → Gallery
+      if (inZoneTopLeft(tx, ty)) {
+        if (sdReady) {
+          scanGalleryFiles();
+          appMode = MODE_GALLERY;
+          drawGallery();
+        } else {
+          lcd.setFont(&fonts::Font0);
+          int tw = lcd.textWidth("SD tidak siap");
+          lcd.fillRoundRect((DISP_W - tw - 14) / 2, DISP_H/2 - 8, tw + 14, 15, 7, COL_GRAY_3);
+          lcd.setTextColor(COL_GRAY_5);
+          lcd.drawString("SD tidak siap", (DISP_W - tw) / 2, DISP_H/2 - 5);
+          delay(1000);
+        }
+        return;
+      }
+
+      // Pojok kanan atas → toggle face detect
+      if (inZoneTopRight(tx, ty)) {
+        toggleFaceDetect();
+        return;
+      }
+
+      // Tap biasa → capture foto
       if (now - lastBtnPress > DEBOUNCE_MS) {
         lastBtnPress = now;
         captureAndPreview();
       }
     }
-    renderViewfinder();
+
+    // ── MODE GALLERY ──────────────────────────────────────────────────────
+    else if (appMode == MODE_GALLERY) {
+
+      // Pojok kanan (back)
+      if (inZoneTopRight(tx, ty)) {
+        appMode = MODE_VIEWFINDER;
+        lcd.fillScreen(COL_BLACK);
+        fpsLastTime = millis(); fpsFrameCount = 0;
+        return;
+      }
+
+      // Swipe vertikal → scroll
+      if (abs(swipeY) > 20 && abs(swipeY) > abs(swipeX)) {
+        if (swipeY < 0) {
+          // Swipe ke atas → scroll down
+          galleryScroll = min(galleryScroll + 1, max(0, galleryCount - GALLERY_ITEMS_PAGE));
+        } else {
+          // Swipe ke bawah → scroll up
+          galleryScroll = max(galleryScroll - 1, 0);
+        }
+        drawGallery();
+        return;
+      }
+
+      // Tap item → buka foto
+      if (ty > 20 && galleryCount > 0) {
+        int idx = galleryScroll + (ty - 24) / GALLERY_ITEM_H;
+        if (idx >= 0 && idx < galleryCount) {
+          appMode = MODE_PHOTO_VIEW;
+          showPhotoView(galleryFiles[idx]);
+        }
+      }
+    }
+
+    // ── MODE PHOTO VIEW ───────────────────────────────────────────────────
+    else if (appMode == MODE_PHOTO_VIEW) {
+      // Tap pojok kanan → back ke gallery
+      if (inZoneTopRight(tx, ty)) {
+        appMode = MODE_GALLERY;
+        drawGallery();
+      }
+    }
   }
-  else { delay(50); esp_task_wdt_reset(); }
+
+  // ── Render mode aktif ─────────────────────────────────────────────────────
+  if (appMode == MODE_VIEWFINDER && !usbModeActive) {
+    renderViewfinder();
+  } else if (usbModeActive) {
+    delay(50); esp_task_wdt_reset();
+  }
+  // MODE_GALLERY dan MODE_PHOTO_VIEW tidak perlu re-render tiap loop
+  // karena sudah static — hanya di-redraw saat ada event touch
 }
