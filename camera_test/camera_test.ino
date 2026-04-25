@@ -1249,6 +1249,16 @@ void loop() {
     return;
   }
 
-  if (!usbModeActive) renderViewfinder();
+if (!usbModeActive) {
+    int32_t tx, ty;
+    if (lcd.getTouch(&tx, &ty)) {
+      unsigned long now = millis();
+      if (now - lastBtnPress > DEBOUNCE_MS) {
+        lastBtnPress = now;
+        captureAndPreview();
+      }
+    }
+    renderViewfinder();
+  }
   else { delay(50); esp_task_wdt_reset(); }
 }
