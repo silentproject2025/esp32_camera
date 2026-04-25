@@ -1,6 +1,6 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.4-ILI9341  [NEW: touch record pojok kiri bawah + MJPEG player]
+ * Version: v4.5-ILI9341  [UPDATED: MJPEG player pakai MjpegClass + JPEGDEC]
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  *
@@ -9,20 +9,20 @@
  * Touch controls (viewfinder):
  *  Tap pojok kiri atas   (0..70  x 0..70)   → buka Gallery
  *  Tap pojok kanan atas  (250..320 x 0..70)  → toggle face detect
- *  Tap pojok kiri bawah  (0..70  x 170..240) → mulai / stop record MJPEG  ← NEW
+ *  Tap pojok kiri bawah  (0..70  x 170..240) → mulai / stop record MJPEG
  *  Long tap (>1.5s)                          → masuk USB mode
  *  Tap 1/2 kanan layar   (x > 160)           → capture foto
  *
  * Touch controls (gallery):
  *  Swipe atas/bawah      → scroll list (foto & video)
  *  Tap nama file .jpg    → lihat foto full screen
- *  Tap nama file .mjpeg  → putar MJPEG player                              ← NEW
+ *  Tap nama file .mjpeg  → putar MJPEG player
  *  Tap pojok kanan       → back ke viewfinder
  *
  * Touch controls (photo view):
  *  Tap pojok kanan       → back ke gallery
  *
- * Touch controls (MJPEG player):                                            ← NEW
+ * Touch controls (MJPEG player):
  *  Tap pojok kanan atas  → stop & back ke gallery
  *  Tap tengah layar      → pause / resume
  *
@@ -52,7 +52,9 @@
 #include "USB.h"
 #include "USBMSC.h"
 
-#include <TJpg_Decoder.h>
+// ── JPEGDEC + MjpegClass (gantikan TJpgDec untuk player) ─────────────────────
+#include <JPEGDEC.h>
+#include "MjpegClass.h"
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
@@ -181,7 +183,7 @@ static LGFX lcd;
 #define COL_GRAY_E      0xEF5D
 #define COL_WHITE       0xFFFF
 #define COL_PILL_BG     0x18C3
-#define COL_RED_DIM     0x6000   // merah redup untuk indikator REC
+#define COL_RED_DIM     0x6000
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Sensor PID
@@ -206,40 +208,38 @@ static LGFX lcd;
 #define VFLIP_OV3660     1
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  App mode  [NEW: MODE_MJPEG_PLAYER]
+//  App mode
 // ─────────────────────────────────────────────────────────────────────────────
 enum AppMode {
   MODE_VIEWFINDER,
   MODE_GALLERY,
   MODE_PHOTO_VIEW,
-  MODE_MJPEG_PLAYER   // ← NEW
+  MODE_MJPEG_PLAYER
 };
 AppMode appMode = MODE_VIEWFINDER;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery state — sekarang tampilkan .jpg DAN .mjpeg
+//  Gallery state
 // ─────────────────────────────────────────────────────────────────────────────
 #define GALLERY_MAX_FILES  200
 #define GALLERY_ITEMS_PAGE   8
 #define GALLERY_ITEM_H      26
 
 char     galleryFiles[GALLERY_MAX_FILES][32];
-bool     galleryIsVideo[GALLERY_MAX_FILES];   // true = .mjpeg, false = .jpg
+bool     galleryIsVideo[GALLERY_MAX_FILES];
 int      galleryCount    = 0;
 int      galleryScroll   = 0;
 char     photoViewPath[48];
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Touch zones
-//  TOUCH_ZONE_SZ = 70px di setiap pojok
 // ─────────────────────────────────────────────────────────────────────────────
 #define TOUCH_ZONE_SZ   70
 
 bool inZoneTopLeft(int32_t x, int32_t y)    { return x < TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
 bool inZoneTopRight(int32_t x, int32_t y)   { return x > DISP_W - TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ; }
-bool inZoneBottomLeft(int32_t x, int32_t y) { return x < TOUCH_ZONE_SZ && y > DISP_H - TOUCH_ZONE_SZ; }   // ← NEW
+bool inZoneBottomLeft(int32_t x, int32_t y) { return x < TOUCH_ZONE_SZ && y > DISP_H - TOUCH_ZONE_SZ; }
 bool inZoneCapture(int32_t x, int32_t y)    {
-  // Setengah kanan layar, kecuali pojok kanan atas (face detect) & pojok kanan bawah
   return (x > DISP_W / 2)
       && !(x > DISP_W - TOUCH_ZONE_SZ && y < TOUCH_ZONE_SZ);
 }
@@ -300,25 +300,61 @@ float         fpsValue      = 0.0f;
 #define PILL_PAD_X       5
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MJPEG Player state  ← NEW
+//  MJPEG Player state — pakai MjpegClass + JPEGDEC
 // ─────────────────────────────────────────────────────────────────────────────
-#define MJPEG_FRAME_BUF_SIZE  (60 * 1024)   // 60KB buffer per frame JPEG
-#define MJPEG_SOI             0xFFD8         // JPEG Start Of Image marker
-#define MJPEG_EOI             0xFFD9         // JPEG End Of Image marker
+#define MJPEG_BUF_SIZE   (150 * 1024)  // buffer frame — naikan kalau frame besar
+#define MJPEG_FRAME_RATE  15            // sesuaikan dengan FPS saat rekam
 
-char     mjpegPath[48];
-FILE*    mjpegFile    = nullptr;
-bool     mjpegPlaying = false;
-bool     mjpegPaused  = false;
-int      mjpegFrame   = 0;
-uint8_t* mjpegBuf     = nullptr;
+// Stream wrapper: jembatan antara FILE* (POSIX fopen) dan Stream (Arduino)
+// MjpegClass butuh Stream*, tapi SD di sini pakai POSIX API
+class FileStream : public Stream {
+public:
+  FILE* f = nullptr;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  TJpgDec callback — output ke lcd
-// ─────────────────────────────────────────────────────────────────────────────
-bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  lcd.pushImage(x, y, w, h, bitmap);
-  return true;
+  size_t write(uint8_t) override { return 0; }
+
+  int available() override {
+    if (!f) return 0;
+    long cur = ftell(f);
+    fseek(f, 0, SEEK_END);
+    long end = ftell(f);
+    fseek(f, cur, SEEK_SET);
+    return (int)(end - cur);
+  }
+
+  int read() override {
+    if (!f) return -1;
+    uint8_t b;
+    return (fread(&b, 1, 1, f) == 1) ? b : -1;
+  }
+
+  int peek() override {
+    if (!f) return -1;
+    int c = fgetc(f);
+    if (c != EOF) ungetc(c, f);
+    return c;
+  }
+
+  size_t readBytes(uint8_t* buf, size_t len) override {
+    if (!f) return 0;
+    return fread(buf, 1, len, f);
+  }
+} fileStream;
+
+FILE*      mjpegFile   = nullptr;
+MjpegClass mjpeg;
+uint8_t*   mjpegBuf    = nullptr;
+
+char  mjpegPath[48];
+bool  mjpegPlaying = false;
+bool  mjpegPaused  = false;
+int   mjpegFrame   = 0;
+
+// JPEGDEC draw callback → LovyanGFX pushImage
+// MjpegClass panggil ini tiap strip MCU (16px height)
+int jpegDrawCallback(JPEGDRAW *pDraw) {
+  lcd.pushImage(pDraw->x, pDraw->y, pDraw->iWidth, pDraw->iHeight, pDraw->pPixels);
+  return 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -469,7 +505,7 @@ void scanVideoCount() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery: scan file .jpg DAN .mjpeg dari SD  ← UPDATED
+//  Gallery: scan file .jpg DAN .mjpeg dari SD
 // ─────────────────────────────────────────────────────────────────────────────
 void scanGalleryFiles() {
   galleryCount  = 0;
@@ -489,7 +525,6 @@ void scanGalleryFiles() {
     }
   }
   closedir(dir);
-  // Sort sederhana (bubble sort by name)
   for (int i = 0; i < galleryCount - 1; i++) {
     for (int j = 0; j < galleryCount - i - 1; j++) {
       if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
@@ -504,17 +539,15 @@ void scanGalleryFiles() {
     }
     esp_task_wdt_reset();
   }
-  Serial.printf("✓ Gallery: %d item (%d video)\n", galleryCount,
-    [&]() { int c=0; for(int i=0;i<galleryCount;i++) if(galleryIsVideo[i]) c++; return c; }());
+  Serial.printf("✓ Gallery: %d item\n", galleryCount);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery: render list  ← UPDATED (tampilkan ikon video)
+//  Gallery: render list
 // ─────────────────────────────────────────────────────────────────────────────
 void drawGallery() {
   lcd.fillScreen(COL_BLACK);
 
-  // Header
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0);
@@ -524,7 +557,6 @@ void drawGallery() {
   int hw = lcd.textWidth(hdr);
   lcd.drawString(hdr, (DISP_W - hw) / 2, 6);
 
-  // Back button pojok kanan atas
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("BACK >", DISP_W - 44, 6);
 
@@ -535,7 +567,6 @@ void drawGallery() {
     return;
   }
 
-  // List item
   int visibleEnd = min(galleryScroll + GALLERY_ITEMS_PAGE, galleryCount);
   for (int i = galleryScroll; i < visibleEnd; i++) {
     int rowY = 24 + (i - galleryScroll) * GALLERY_ITEM_H;
@@ -543,32 +574,27 @@ void drawGallery() {
     lcd.fillRect(0, rowY, DISP_W, GALLERY_ITEM_H - 1, isEven ? COL_GRAY_D : COL_BLACK);
     lcd.drawFastHLine(0, rowY + GALLERY_ITEM_H - 1, DISP_W, COL_GRAY_2);
 
-    // Nomor
     lcd.setFont(&fonts::Font0);
     lcd.setTextColor(COL_GRAY_5);
     char num[6];
     snprintf(num, sizeof(num), "%3d", i + 1);
     lcd.drawString(num, 6, rowY + 8);
 
-    // Ikon: ► untuk video, □ untuk foto
     if (galleryIsVideo[i]) {
       lcd.setTextColor(COL_GRAY_7);
-      lcd.drawString("\x10", 26, rowY + 8);   // karakter ► (ASCII 16)
+      lcd.drawString("\x10", 26, rowY + 8);
     } else {
       lcd.setTextColor(COL_GRAY_3);
       lcd.drawRect(26, rowY + 6, 7, 7, COL_GRAY_5);
     }
 
-    // Nama file
     lcd.setTextColor(galleryIsVideo[i] ? COL_GRAY_A : COL_GRAY_C);
     lcd.drawString(galleryFiles[i], 36, rowY + 8);
 
-    // Panah
     lcd.setTextColor(COL_GRAY_3);
     lcd.drawString(">", DISP_W - 12, rowY + 8);
   }
 
-  // Scroll indicator
   if (galleryCount > GALLERY_ITEMS_PAGE) {
     int barH = DISP_H - 22;
     int indH = max(10, barH * GALLERY_ITEMS_PAGE / galleryCount);
@@ -579,8 +605,17 @@ void drawGallery() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo view: decode & tampil JPEG dari SD
+//  Photo view: decode & tampil JPEG dari SD (tetap pakai TJpgDec)
+//  Catatan: TJpgDec masih dipakai khusus untuk foto saja.
+//           Player MJPEG sudah pakai JPEGDEC via MjpegClass.
 // ─────────────────────────────────────────────────────────────────────────────
+#include <TJpg_Decoder.h>
+
+bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  lcd.pushImage(x, y, w, h, bitmap);
+  return true;
+}
+
 void showPhotoView(const char* filename) {
   lcd.fillScreen(COL_BLACK);
 
@@ -625,7 +660,6 @@ void showPhotoView(const char* filename) {
 
   free(buf);
 
-  // Overlay: nama file + back button
   lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_A);
@@ -640,30 +674,18 @@ void showPhotoView(const char* filename) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ══════════════════════ MJPEG PLAYER ══════════════════════  ← NEW
-//
-//  Format MJPEG di sini adalah raw concatenated JPEG:
-//    [JPEG frame 1][JPEG frame 2][JPEG frame 3]...
-//  Setiap frame dimulai dengan 0xFF 0xD8 dan diakhiri 0xFF 0xD9.
-//
-//  Fungsi-fungsi:
-//    mjpegCountFrames()  — scan file hitung jumlah frame
-//    mjpegOpen()         — buka file, alokasi buffer, mulai play
-//    mjpegClose()        — tutup file, bebaskan buffer
-//    mjpegDecodeNext()   — baca + decode 1 frame berikutnya → lcd
-//    drawMjpegOverlay()  — HUD: back / pause / frame counter / progress bar
-//    mjpegHandleTouch()  — routing touch di mode player
-//    loopMjpegPlayer()   — dipanggil dari loop() saat mode MJPEG_PLAYER
+//  MJPEG Player — MjpegClass + JPEGDEC + FileStream
 // ─────────────────────────────────────────────────────────────────────────────
 
 bool mjpegOpen(const char* filename) {
   char path[48];
   snprintf(path, sizeof(path), "/sdcard/%s", filename);
 
+  // Bersihkan state lama
   if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
   if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
 
-  mjpegBuf = (uint8_t*)malloc(MJPEG_FRAME_BUF_SIZE);
+  mjpegBuf = (uint8_t*)malloc(MJPEG_BUF_SIZE);
   if (!mjpegBuf) {
     Serial.println("✗ MJPEG: alokasi buffer gagal");
     return false;
@@ -675,6 +697,19 @@ bool mjpegOpen(const char* filename) {
     Serial.println("✗ MJPEG: file tidak bisa dibuka");
     return false;
   }
+
+  // Hubungkan FILE* ke FileStream wrapper
+  fileStream.f = mjpegFile;
+
+  // Setup MjpegClass — pakai jpegDrawCallback yang forward ke lcd.pushImage
+  mjpeg.setup(
+    &fileStream,
+    mjpegBuf,
+    jpegDrawCallback,
+    true,         // useBigEndian: RGB565 big endian untuk LovyanGFX
+    0, 0,
+    DISP_W, DISP_H
+  );
 
   strncpy(mjpegPath, filename, sizeof(mjpegPath) - 1);
   mjpegFrame   = 0;
@@ -689,82 +724,49 @@ bool mjpegOpen(const char* filename) {
 void mjpegClose() {
   if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
   if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
+  fileStream.f = nullptr;
   mjpegPlaying = false;
   mjpegPaused  = false;
   mjpegFrame   = 0;
 }
 
-// Baca 1 frame JPEG dari file (cari SOI, baca sampai EOI), decode ke lcd
-// Return: true = berhasil, false = EOF / error
-bool mjpegDecodeNext() {
-  if (!mjpegFile || !mjpegBuf) return false;
-
-  // Cari SOI (FF D8)
-  uint8_t b0 = 0, b1 = 0;
-  bool foundSOI = false;
-  while (fread(&b1, 1, 1, mjpegFile) == 1) {
-    if (b0 == 0xFF && b1 == 0xD8) { foundSOI = true; break; }
-    b0 = b1;
-  }
-  if (!foundSOI) return false;   // EOF
-
-  // Taruh SOI di buffer
-  mjpegBuf[0] = 0xFF;
-  mjpegBuf[1] = 0xD8;
-  size_t len  = 2;
-
-  // Baca byte per byte sampai EOI (FF D9)
-  uint8_t prev = 0, cur = 0;
-  bool foundEOI = false;
-  while (len < MJPEG_FRAME_BUF_SIZE - 1 && fread(&cur, 1, 1, mjpegFile) == 1) {
-    mjpegBuf[len++] = cur;
-    if (prev == 0xFF && cur == 0xD9) { foundEOI = true; break; }
-    prev = cur;
-    if (len % 4096 == 0) esp_task_wdt_reset();
-  }
-  if (!foundEOI || len < 4) return false;
-
-  // Decode & render
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setSwapBytes(true);
-  TJpgDec.setCallback(tjpgdecOutput);
-  uint16_t w = 0, h = 0;
-  TJpgDec.getJpgSize(&w, &h, mjpegBuf, len);
-  int ox = (DISP_W - min((int)w, DISP_W)) / 2;
-  int oy = (DISP_H - min((int)h, DISP_H)) / 2;
-  TJpgDec.drawJpg(ox, oy, mjpegBuf, len);
-
-  mjpegFrame++;
-  return true;
-}
-
-// HUD overlay di atas frame MJPEG
+// HUD overlay di atas frame — dipanggil setiap frame
 void drawMjpegOverlay() {
-  // Bar atas: nama file + BACK
+  // Bar atas tipis
   lcd.fillRect(0, 0, DISP_W, 16, COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("BACK >", DISP_W - 44, 3);
 
+  // Nama file
   lcd.setTextColor(COL_GRAY_A);
   char nameShort[24];
   strncpy(nameShort, mjpegPath, 23); nameShort[23] = '\0';
-  lcd.drawString(nameShort, 4, 3);
+  lcd.drawString(nameShort, 20, 4);
 
-  // Pause/Play indikator pojok kiri atas (di dalam bar)
+  // BACK
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("BACK >", DISP_W - 44, 4);
+
+  // Pause / Play indicator (kiri bar)
   if (mjpegPaused) {
+    // Dua garis vertikal = pause
     lcd.fillRect(4, 3, 3, 10, COL_GRAY_7);
     lcd.fillRect(9, 3, 3, 10, COL_GRAY_7);
   } else {
+    // Segitiga = play
     for (int py = 0; py < 8; py++)
       lcd.drawFastHLine(4, 3 + py, 8 - py, COL_GRAY_7);
   }
+
+  // Frame counter pojok kanan bar
+  char fbuf[12];
+  snprintf(fbuf, sizeof(fbuf), "%d", mjpegFrame);
+  lcd.setTextColor(COL_GRAY_5);
+  int fw = lcd.textWidth(fbuf);
+  lcd.drawString(fbuf, DISP_W - 44 - fw - 4, 4);
 }
 
-// Buka MJPEG player dari gallery
 void openMjpegPlayer(const char* filename) {
   if (!mjpegOpen(filename)) {
-    // Gagal buka — kembali ke gallery
     lcd.fillScreen(COL_BLACK);
     lcd.setFont(&fonts::Font0);
     lcd.setTextColor(COL_GRAY_5);
@@ -777,40 +779,60 @@ void openMjpegPlayer(const char* filename) {
   appMode = MODE_MJPEG_PLAYER;
 }
 
-// Touch handler khusus MJPEG player
 void mjpegHandleTouch(int32_t tx, int32_t ty) {
-  // Pojok kanan atas → stop & back ke gallery
+  // Pojok kanan atas → stop & kembali gallery
   if (inZoneTopRight(tx, ty)) {
     mjpegClose();
     appMode = MODE_GALLERY;
     drawGallery();
     return;
   }
-  // Tap tengah layar → pause / resume
-  // (area di luar pojok kanan atas dan bukan bar bawah)
+  // Tap area tengah → pause / resume
   if (ty > 18 && ty < DISP_H - 18) {
     mjpegPaused = !mjpegPaused;
-    drawMjpegOverlay();   // refresh indikator segera
+    drawMjpegOverlay();
   }
 }
 
-// Dipanggil dari loop() saat mode MJPEG_PLAYER
+// Dipanggil dari loop() saat MODE_MJPEG_PLAYER
 void loopMjpegPlayer() {
   if (!mjpegPlaying) return;
 
   if (!mjpegPaused) {
-    bool ok = mjpegDecodeNext();
+    int64_t frameStart = esp_timer_get_time();
+
+    // Baca satu frame dari file ke mjpegBuf
+    bool ok = mjpeg.readMjpegBuf();
     if (!ok) {
-      // EOF — stop otomatis, kembali ke gallery
+      // EOF — selesai
       Serial.printf("■ MJPEG selesai: %d frames\n", mjpegFrame);
       mjpegClose();
       appMode = MODE_GALLERY;
       drawGallery();
       return;
     }
+
+    // Decode & render ke display via jpegDrawCallback → lcd.pushImage
+    mjpeg.drawJpg();
+    mjpegFrame++;
+
+    // HUD di atas frame
     drawMjpegOverlay();
+
+    // Frame deadline: tunggu sisa waktu agar FPS stabil
+    int64_t elapsed  = esp_timer_get_time() - frameStart;
+    int64_t targetUs = 1000000LL / MJPEG_FRAME_RATE;
+    int64_t remain   = targetUs - elapsed;
+    if (remain > 1000) {
+      // Pecah delay supaya bisa cek touch saat nunggu
+      int64_t waitEnd = esp_timer_get_time() + remain;
+      while (esp_timer_get_time() < waitEnd) {
+        delayMicroseconds(500);
+        esp_task_wdt_reset();
+      }
+    }
   } else {
-    // Saat pause, tunjukkan HUD & tunggu touch
+    // Pause: refresh HUD saja, hemat CPU
     drawMjpegOverlay();
     delay(80);
   }
@@ -844,10 +866,9 @@ void drawRecIndicator() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Ikon REC di pojok kiri bawah (tombol touch record)  ← NEW
+//  Ikon REC di pojok kiri bawah
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRecTouchHint() {
-  // Lingkaran REC kecil di pojok kiri bawah
   bool blink = recActive && ((millis() / 600) % 2);
   uint16_t c = recActive ? (blink ? COL_WHITE : COL_GRAY_5) : COL_GRAY_3;
   lcd.fillCircle(12, DISP_H - 12, 6, c);
@@ -937,7 +958,7 @@ void recordFrame() {
       lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
       drawCornerBrackets(COL_GRAY_E);
       drawRecIndicator();
-      drawRecTouchHint();   // ← tampilkan hint STOP di pojok kiri bawah
+      drawRecTouchHint();
     }
   }
 
@@ -1001,7 +1022,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
 
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.4  ILI9341 + XPT2046", DISP_W / 2 - 72, 103);
+  lcd.drawString("v4.5  ILI9341 + XPT2046", DISP_W / 2 - 72, 103);
 
   lcd.drawFastHLine(20, 116, DISP_W - 40, COL_GRAY_2);
 
@@ -1029,8 +1050,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB,
   bootLogLine(170, "TOUCH", "XPT2046  OK", COL_GRAY_E);
   delay(120); esp_task_wdt_reset();
 
-  // ← NEW: tampilkan info MJPEG player di boot log
-  bootLogLine(182, "MJPEG PLAY", "ENABLED", COL_GRAY_E);
+  bootLogLine(182, "MJPEG PLAY", "MjpegClass+JPEGDEC", COL_GRAY_E);
   delay(120); esp_task_wdt_reset();
 
   lcd.drawRect(28, 196, DISP_W - 56, 4, COL_GRAY_3);
@@ -1074,7 +1094,7 @@ void drawUSBModeScreen() {
   int lw = lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE", (DISP_W - lw) / 2, 4);
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("v4.4", DISP_W - 24, 4);
+  lcd.drawString("v4.5", DISP_W - 24, 4);
 
   drawUSBIcon(DISP_W / 2, 85, COL_GRAY_7);
 
@@ -1273,9 +1293,7 @@ void renderViewfinder() {
       drawRSSIDots(getSignalBars());
     }
 
-    // ← NEW: tampilkan hint REC di pojok kiri bawah
     drawRecTouchHint();
-
     updateFPS();
   } else {
     lcd.fillScreen(COL_BLACK);
@@ -1446,7 +1464,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.4 ===");
+  Serial.println("\n=== Sanzxcam v4.5 ===");
 
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
@@ -1463,10 +1481,9 @@ void setup() {
   if (calValid) {
     lcd.setTouchCalibrate(touchCalData);
     Serial.println("✓ Touch calibration loaded");
-  } else {
-    Serial.println("! Touch cal not set — run touch_calibrate.ino first");
   }
 
+  // TJpgDec masih dipakai untuk photo view
   TJpgDec.setJpgScale(1);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(tjpgdecOutput);
@@ -1504,7 +1521,7 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
 
-  // ── Tombol REC fisik (pin 41) — hanya saat TIDAK sedang record ──────────
+  // ── Tombol REC fisik (pin 41) ─────────────────────────────────────────────
   if (appMode == MODE_VIEWFINDER && !recActive && digitalRead(REC_BTN_PIN) == LOW) {
     delay(50);
     if (digitalRead(REC_BTN_PIN) == LOW) {
@@ -1529,10 +1546,8 @@ void loop() {
     }
   }
 
-  // ── Saat recording: cek input stop DULU, baru record frame ──────────────
+  // ── Saat recording ────────────────────────────────────────────────────────
   if (recActive) {
-
-    // Tombol BOOT → stop record
     if (digitalRead(BOOT_BTN_PIN) == LOW) {
       delay(40);
       if (digitalRead(BOOT_BTN_PIN) == LOW) {
@@ -1541,8 +1556,6 @@ void loop() {
         return;
       }
     }
-
-    // Tombol REC fisik (pin 41) → stop record
     if (digitalRead(REC_BTN_PIN) == LOW) {
       delay(40);
       if (digitalRead(REC_BTN_PIN) == LOW) {
@@ -1551,18 +1564,14 @@ void loop() {
         return;
       }
     }
-
-    // Touch pojok kiri bawah → stop record
     int32_t rtx, rty;
     if (lcd.getTouch(&rtx, &rty)) {
-      // tunggu lepas
       while (lcd.getTouch(&rtx, &rty)) { delay(10); esp_task_wdt_reset(); }
       if (inZoneBottomLeft(rtx, rty) || inZoneTopLeft(rtx, rty)) {
         stopRecording();
         return;
       }
     }
-
     recordFrame();
     return;
   }
@@ -1607,7 +1616,6 @@ void loop() {
       appMode = MODE_GALLERY;
       drawGallery();
     } else if (appMode == MODE_MJPEG_PLAYER) {
-      // BOOT di player → stop & back gallery
       mjpegClose();
       appMode = MODE_GALLERY;
       drawGallery();
@@ -1631,7 +1639,6 @@ void loop() {
     // ── MODE VIEWFINDER ───────────────────────────────────────────────────
     if (appMode == MODE_VIEWFINDER && !usbModeActive) {
 
-      // Long tap → USB mode
       if (touchDur >= LONG_TAP_MS) {
         if (sdReady) {
           lcd.setFont(&fonts::Font0);
@@ -1649,7 +1656,6 @@ void loop() {
 
       unsigned long now = millis();
 
-      // Pojok kiri atas → Gallery
       if (inZoneTopLeft(tx, ty)) {
         if (sdReady) {
           scanGalleryFiles();
@@ -1666,13 +1672,11 @@ void loop() {
         return;
       }
 
-      // Pojok kanan atas → toggle face detect
       if (inZoneTopRight(tx, ty)) {
         toggleFaceDetect();
         return;
       }
 
-      // ← NEW: Pojok kiri bawah → mulai / stop record
       if (inZoneBottomLeft(tx, ty)) {
         if (now - lastTapMs > DEBOUNCE_MS) {
           lastTapMs = now;
@@ -1682,7 +1686,6 @@ void loop() {
         return;
       }
 
-      // Capture: setengah kanan layar
       if (inZoneCapture(tx, ty)) {
         if (now - lastTapMs > DEBOUNCE_MS) {
           lastTapMs = now;
@@ -1694,7 +1697,6 @@ void loop() {
     // ── MODE GALLERY ──────────────────────────────────────────────────────
     else if (appMode == MODE_GALLERY) {
 
-      // Pojok kanan (back)
       if (inZoneTopRight(tx, ty)) {
         appMode = MODE_VIEWFINDER;
         lcd.fillScreen(COL_BLACK);
@@ -1702,7 +1704,6 @@ void loop() {
         return;
       }
 
-      // Swipe vertikal → scroll
       if (abs(swipeY) > 20 && abs(swipeY) > abs(swipeX)) {
         if (swipeY < 0) {
           galleryScroll = min(galleryScroll + 1, max(0, galleryCount - GALLERY_ITEMS_PAGE));
@@ -1713,12 +1714,10 @@ void loop() {
         return;
       }
 
-      // Tap item → buka foto atau MJPEG player
       if (ty > 20 && galleryCount > 0) {
         int idx = galleryScroll + (ty - 24) / GALLERY_ITEM_H;
         if (idx >= 0 && idx < galleryCount) {
           if (galleryIsVideo[idx]) {
-            // ← NEW: buka MJPEG player
             openMjpegPlayer(galleryFiles[idx]);
           } else {
             appMode = MODE_PHOTO_VIEW;
@@ -1738,7 +1737,7 @@ void loop() {
 
     // ── MODE MJPEG PLAYER ─────────────────────────────────────────────────
     else if (appMode == MODE_MJPEG_PLAYER) {
-      mjpegHandleTouch(tx, ty);   // ← NEW
+      mjpegHandleTouch(tx, ty);
     }
   }
 
@@ -1746,7 +1745,7 @@ void loop() {
   if (appMode == MODE_VIEWFINDER && !usbModeActive) {
     renderViewfinder();
   } else if (appMode == MODE_MJPEG_PLAYER) {
-    loopMjpegPlayer();            // ← NEW
+    loopMjpegPlayer();
   } else if (usbModeActive) {
     delay(50); esp_task_wdt_reset();
   }
