@@ -1,18 +1,21 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.9-patched
+ * Version: v4.9b
  *
- * PATCH NOTES (dari v4.9):
- *  - DOUBLE_TAP_MS naik 350 → 450ms (lebih mudah double tap)
- *  - PAN_DEADZONE naik 8 → 15px (pan tidak terlalu sensitif)
- *  - LONG_TAP_MS dipisah:
- *      LONG_TAP_GALLERY_MS = 1500ms (compare select)
- *      LONG_TAP_PHOTO_MS   = 2500ms (delete, lebih susah ter-trigger)
- *  - Navigasi foto (prev/next) ditunda ~450ms untuk memastikan
- *    bukan tap pertama dari double tap (fix: single tap langsung pindah foto)
+ * PATCH v4.9b (dari v4.9-patched):
+ *  - Photo View: zona touch dipisah dengan jelas
+ *      Pojok kiri atas  (x<70, y<70)  → ZOOM tap biasa (cycle 1×→2×→4×→1×)
+ *      Pojok kiri bawah (x<70, y>170) → COMPARE (pilih foto ini sebagai slot A, lalu ke gallery)
+ *      Pojok kanan atas                → back ke gallery (sama seperti sebelumnya)
+ *      Long press 1.5s (di mana saja) → delete dialog
+ *      Tap kiri  (x<160, di luar zona pojok) → PREV foto (langsung, tanpa delay)
+ *      Tap kanan (x>160, di luar zona pojok) → NEXT foto (langsung, tanpa delay)
+ *  - double tap & konfirmasi DIHAPUS — tidak diperlukan lagi karena zona terpisah
+ *  - PAN_DEADZONE tetap 15px
+ *  - LONG_TAP_PHOTO_MS = 1500ms (sesuai permintaan)
  *
  * CHANGELOG v4.9:
- *  - Photo View: Zoom in/out via double tap (1× → 2× → 4× → 1×)
+ *  - Photo View: Zoom in/out
  *  - Photo View: Pan (drag) saat zoom > 1×
  *  - Photo View: Compare mode — dua foto side by side
  *  - MJPEG Player: Loop mode toggle
@@ -20,6 +23,15 @@
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape + XPT2046 resistive touch
+ *
+ * Touch controls (photo view):
+ *  Pojok kiri atas  (x<70, y<70)   → zoom cycle 1×→2×→4×→1×
+ *  Pojok kiri bawah (x<70, y>170)  → compare (foto ini jadi slot A, pilih B dari gallery)
+ *  Pojok kanan atas                 → back ke gallery
+ *  Long press >1.5s (mana saja)    → delete dialog
+ *  Drag saat zoom>1×               → pan
+ *  Tap kiri  (x<160, bukan pojok)  → foto sebelumnya (langsung)
+ *  Tap kanan (x>160, bukan pojok)  → foto berikutnya (langsung)
  */
 
 #include "esp_camera.h"
@@ -142,19 +154,23 @@ static LGFX lcd;
 #define PID_GC2145 0x2145
 #define PID_OV3660 0x3660
 
-#define DEBOUNCE_MS        400
-#define LONG_PRESS_MS     2000
-#define REC_LONG_PRESS_MS 2000
+#define DEBOUNCE_MS          400
+#define LONG_PRESS_MS       2000
+#define REC_LONG_PRESS_MS   2000
+#define LONG_TAP_GALLERY_MS 1500   // compare select di gallery
+#define LONG_TAP_PHOTO_MS   1500   // delete di photo view
+#define PAN_DEADZONE          15   // pixel min untuk dianggap drag
 
-// ── PATCH: pisah long tap untuk gallery vs photo view ──────────────────────
-#define LONG_TAP_GALLERY_MS  1500   // compare select di gallery
-#define LONG_TAP_PHOTO_MS    2500   // delete di photo view (lebih lama, aman)
+// ── Zona pojok di photo view ──────────────────────────────────────────────
+#define PV_ZONE_SZ     70          // ukuran kotak pojok (px)
+#define PV_ZONE_TOP    70          // batas bawah zona atas
+#define PV_ZONE_BOT   170          // batas atas zona bawah
 
-// ── PATCH: double tap lebih mudah ─────────────────────────────────────────
-#define DOUBLE_TAP_MS        450    // was 350
-
-// ── PATCH: pan deadzone lebih besar ───────────────────────────────────────
-#define PAN_DEADZONE          15    // was 8
+// Inline helpers zona photo view
+#define pvZoneTopLeft(x,y)   ((x) < PV_ZONE_SZ && (y) < PV_ZONE_TOP)
+#define pvZoneTopRight(x,y)  ((x) > DISP_W - PV_ZONE_SZ && (y) < PV_ZONE_TOP)
+#define pvZoneBotLeft(x,y)   ((x) < PV_ZONE_SZ && (y) > PV_ZONE_BOT)
+#define pvZoneAny(x,y)       (pvZoneTopLeft(x,y)||pvZoneTopRight(x,y)||pvZoneBotLeft(x,y))
 
 #define HMIRROR_GC2145 1
 #define VFLIP_GC2145   0
@@ -204,13 +220,12 @@ int      photoZoomOffY   = 0;
 uint16_t* photoPixelBuf  = nullptr;
 uint16_t  photoBufW      = 0;
 uint16_t  photoBufH      = 0;
-unsigned long lastTapPhotoMs = 0;
 
 int  compareIdxA = -1;
 int  compareIdxB = -1;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Touch zones
+//  Touch zones (viewfinder / gallery)
 // ─────────────────────────────────────────────────────────────────────────────
 #define TOUCH_ZONE_SZ 70
 
@@ -364,6 +379,25 @@ void blinkLED(int n, int on_ms=100, int off_ms=100) {
     digitalWrite(LED_PIN,LOW); if(i<n-1) delay(off_ms);
     esp_task_wdt_reset();
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Photo View — ikon zona di overlay
+//  Tampilkan hint kecil di pojok supaya user tahu zona aktif
+// ─────────────────────────────────────────────────────────────────────────────
+void photoViewDrawZoneHints() {
+  // pojok kiri atas: ikon zoom (kaca pembesar minimalis)
+  lcd.drawCircle(14, 14, 7, COL_GRAY_5);
+  lcd.drawLine(19, 19, 24, 24, COL_GRAY_5);
+
+  // pojok kiri bawah: ikon compare (dua kotak kecil)
+  lcd.drawRect(4,  DISP_H-22, 10, 10, COL_GRAY_5);
+  lcd.drawRect(17, DISP_H-22, 10, 10, COL_GRAY_5);
+
+  // pojok kanan atas: ikon back (panah kiri)
+  lcd.drawLine(DISP_W-24, 14, DISP_W-14, 14, COL_GRAY_5);
+  lcd.drawLine(DISP_W-24, 14, DISP_W-20, 10, COL_GRAY_5);
+  lcd.drawLine(DISP_W-24, 14, DISP_W-20, 18, COL_GRAY_5);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -555,14 +589,12 @@ bool photoLoadPixelBuf(int idx) {
   if(!buf) { free(jpgBuf); return false; }
   memset(buf,0,(size_t)iw*ih*sizeof(uint16_t));
 
-  _decodeTargetBuf=buf;
-  _decodeTargetW=iw;
+  _decodeTargetBuf=buf; _decodeTargetW=iw;
   TJpgDec.drawJpg(0,0,jpgBuf,fsize);
   _decodeTargetBuf=nullptr;
 
   free(jpgBuf);
-  photoPixelBuf=buf;
-  photoBufW=iw; photoBufH=ih;
+  photoPixelBuf=buf; photoBufW=iw; photoBufH=ih;
   return true;
 }
 
@@ -606,10 +638,14 @@ void photoViewRender() {
     }
   }
 
+  // zoom indicator
   if(photoZoomLevel>0) {
     char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f×",(double)zf);
     drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
   }
+
+  // gambar ikon zona pojok setelah render foto
+  photoViewDrawZoneHints();
 }
 
 void photoViewDrawCaption(int idx) {
@@ -691,9 +727,7 @@ void showPhotoView(int idx) {
   photoViewIndex=idx;
   strncpy(photoViewPath,galleryFiles[idx],sizeof(photoViewPath)-1);
 
-  photoZoomLevel=0;
-  photoZoomOffX=0; photoZoomOffY=0;
-  lastTapPhotoMs=0;
+  photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
 
   lcd.fillScreen(COL_BLACK);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
@@ -762,7 +796,6 @@ void compareRenderSlot(int idx, int slotX) {
     lcd.drawString("---",slotX+COMPARE_W/2-10,DISP_H/2);
     return;
   }
-
   char path[56];
   snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
   FILE* f=fopen(path,"rb"); if(!f) return;
@@ -777,12 +810,9 @@ void compareRenderSlot(int idx, int slotX) {
 
   TJpgDec.setJpgScale(2);
   TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
-  _decodeTargetBuf=slotBuf;
-  _decodeTargetW=COMPARE_W;
+  _decodeTargetBuf=slotBuf; _decodeTargetW=COMPARE_W;
   TJpgDec.drawJpg(0,0,jpgBuf,fsize);
-  _decodeTargetBuf=nullptr;
-  TJpgDec.setJpgScale(1);
-
+  _decodeTargetBuf=nullptr; TJpgDec.setJpgScale(1);
   free(jpgBuf);
 
   for(int row=0;row<DISP_H;row++) {
@@ -802,18 +832,14 @@ void showComparePage() {
   lcd.fillScreen(COL_BLACK);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("loading...",DISP_W/2-24,DISP_H/2-4);
-
   compareRenderSlot(compareIdxA, 0);
   compareRenderSlot(compareIdxB, COMPARE_W);
-
   lcd.drawFastVLine(COMPARE_W,0,DISP_H,COL_GRAY_5);
-
   lcd.fillRect(0,0,DISP_W,12,COL_GRAY_D);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
   int hw=lcd.textWidth("COMPARE");
   lcd.drawString("COMPARE",(DISP_W-hw)/2,2);
   lcd.setTextColor(COL_GRAY_5); lcd.drawString("X",DISP_W-10,2);
-
   appMode=MODE_COMPARE;
 }
 
@@ -824,20 +850,15 @@ bool mjpegOpen(const char* filename) {
   char path[48]; snprintf(path,sizeof(path),"/sdcard/%s",filename);
   if(mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
   if(mjpegBuf)  { free(mjpegBuf);   mjpegBuf=nullptr; }
-
   mjpegBuf=(uint8_t*)malloc(MJPEG_BUF_SIZE);
   if(!mjpegBuf) return false;
-
   mjpegFile=fopen(path,"rb");
   if(!mjpegFile) { free(mjpegBuf); mjpegBuf=nullptr; return false; }
-
   fileStream.f=mjpegFile;
   mjpeg.setup(&fileStream,mjpegBuf,jpegDrawCallback,true,0,0,DISP_W,DISP_H);
-
   strncpy(mjpegPath,filename,sizeof(mjpegPath)-1);
   strncpy(mjpegPathSaved,filename,sizeof(mjpegPathSaved)-1);
   mjpegFrame=0; mjpegPlaying=true; mjpegPaused=false; mjpegNotifUntilMs=0;
-
   lcd.fillScreen(COL_BLACK);
   return true;
 }
@@ -871,8 +892,7 @@ void mjpegClearNotif() {
 void mjpegDrawHUD() {
   char buf[24];
   snprintf(buf,sizeof(buf),"%.1f×  %s",
-           (double)mjpegSpeeds[mjpegSpeedIdx],
-           mjpegLoop?"LOOP":"—");
+           (double)mjpegSpeeds[mjpegSpeedIdx], mjpegLoop?"LOOP":"—");
   lcd.setFont(&fonts::Font0);
   int tw=lcd.textWidth(buf);
   int pw=tw+10,ph=13;
@@ -883,58 +903,39 @@ void mjpegDrawHUD() {
 
 void mjpegHandleTouch(int32_t tx, int32_t ty, int32_t tx2, int32_t ty2, unsigned long dur) {
   int swipeX=tx2-tx;
-
   if(inZoneTopRight(tx,ty)) {
-    mjpegClose();
-    appMode=MODE_GALLERY; drawGallery();
-    return;
+    mjpegClose(); appMode=MODE_GALLERY; drawGallery(); return;
   }
-
   if(inZoneTopLeft(tx,ty)) {
     mjpegLoop=!mjpegLoop;
-    mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
-    return;
+    mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF"); return;
   }
-
   if(abs(swipeX)>40) {
     if(swipeX<0 && mjpegSpeedIdx<2) mjpegSpeedIdx++;
     else if(swipeX>0 && mjpegSpeedIdx>0) mjpegSpeedIdx--;
     char spBuf[12];
     snprintf(spBuf,sizeof(spBuf),"%.1f×",(double)mjpegSpeeds[mjpegSpeedIdx]);
-    mjpegShowNotif(spBuf);
-    return;
+    mjpegShowNotif(spBuf); return;
   }
-
   mjpegPaused=!mjpegPaused;
   mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
 }
 
 void loopMjpegPlayer() {
   if(!mjpegPlaying) return;
-
   if(!mjpegPaused) {
     int64_t frameStart=esp_timer_get_time();
-
     bool ok=mjpeg.readMjpegBuf();
     if(!ok) {
       if(mjpegLoop) {
         mjpegClose();
-        if(!mjpegOpen(mjpegPathSaved)) {
-          appMode=MODE_GALLERY; drawGallery();
-        }
+        if(!mjpegOpen(mjpegPathSaved)) { appMode=MODE_GALLERY; drawGallery(); }
         return;
       }
-      mjpegClose();
-      appMode=MODE_GALLERY; drawGallery();
-      return;
+      mjpegClose(); appMode=MODE_GALLERY; drawGallery(); return;
     }
-
-    mjpeg.drawJpg();
-    mjpegFrame++;
-    mjpegDrawHUD();
-
+    mjpeg.drawJpg(); mjpegFrame++; mjpegDrawHUD();
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
-
     float speed=mjpegSpeeds[mjpegSpeedIdx];
     int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
     int64_t elapsed=esp_timer_get_time()-frameStart;
@@ -1015,16 +1016,13 @@ void recordFrame() {
   if(fb->format==PIXFORMAT_JPEG) { jpg_buf=fb->buf; jpg_len=fb->len; ok=true; }
   else { ok=frame2jpg(fb,70,&jpg_buf,&jpg_len); }
   if(ok&&jpg_buf) {
-    fwrite(jpg_buf,1,jpg_len,recFile);
-    recFrameCount++;
+    fwrite(jpg_buf,1,jpg_len,recFile); recFrameCount++;
     if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
   }
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
-    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
-    drawRecIndicator();
+    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf); drawRecIndicator();
   }
-  esp_camera_fb_return(fb);
-  esp_task_wdt_reset();
+  esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1069,7 +1067,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.9-patched  ILI9341 + XPT2046",DISP_W/2-90,103);
+  lcd.drawString("v4.9b  ILI9341 + XPT2046",DISP_W/2-72,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1119,7 +1117,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw=lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE",(DISP_W-lw)/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.9",DISP_W-24,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.9b",DISP_W-28,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw=lcd.textWidth("SD CONNECTED");
@@ -1134,7 +1132,6 @@ void drawUSBModeScreen() {
     lcd.setTextColor(COL_GRAY_C);
     lcd.drawString(val,DISP_W-44-lcd.textWidth(val),y);
   };
-
   char buf[32];
   infoRow(156,"SENSOR",sensorName);
   if(sdSizeMB<1024) snprintf(buf,sizeof(buf),"%lluMB  FAT32",sdSizeMB);
@@ -1361,7 +1358,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.9-patched ===");
+  Serial.println("\n=== Sanzxcam v4.9b ===");
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   pinMode(BOOT_BTN_PIN,INPUT_PULLUP);
   pinMode(REC_BTN_PIN,INPUT_PULLUP);
@@ -1482,8 +1479,7 @@ void loop() {
       if(now-lastBtnPress>DEBOUNCE_MS) { lastBtnPress=now; captureAndPreview(); }
     } else if(appMode==MODE_GALLERY) {
       if(galleryCompareSelect) {
-        galleryCompareSelect=false; galleryCompareIdxA=-1;
-        drawGallery();
+        galleryCompareSelect=false; galleryCompareIdxA=-1; drawGallery();
       } else {
         appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
         fpsLastTime=millis(); fpsFrameCount=0;
@@ -1592,7 +1588,6 @@ void loop() {
           } else {
             if(galleryIsVideo[idx]) openMjpegPlayer(galleryFiles[idx]);
             else {
-              // ── PATCH: pakai LONG_TAP_GALLERY_MS untuk compare ──────
               if(touchDur>=LONG_TAP_GALLERY_MS) {
                 galleryCompareSelect=true;
                 galleryCompareIdxA=idx;
@@ -1608,9 +1603,21 @@ void loop() {
 
     // ── MODE PHOTO VIEW ─────────────────────────────────────────────────
     else if(appMode==MODE_PHOTO_VIEW) {
-      if(isPan) return;
+      if(isPan) return; // sudah dihandle saat drag
 
-      if(inZoneTopRight(tx,ty)) {
+      // ── Long press (di mana saja) → delete ──────────────────────────
+      if(touchDur>=LONG_TAP_PHOTO_MS) {
+        photoViewClearCaption();
+        bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
+        if(doDelete) photoViewDeleteCurrent();
+        else showPhotoView(photoViewIndex);
+        return;
+      }
+
+      unsigned long now=millis();
+
+      // ── Pojok kanan atas → back ke gallery ──────────────────────────
+      if(pvZoneTopRight(tx,ty)) {
         photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
         photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
         if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
@@ -1618,32 +1625,16 @@ void loop() {
         return;
       }
 
-      // ── PATCH: pakai LONG_TAP_PHOTO_MS untuk delete ─────────────────
-      if(touchDur>=LONG_TAP_PHOTO_MS) {
-        photoViewClearCaption();
-        bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
-        if(doDelete) {
-          photoViewDeleteCurrent();
-        } else {
-          showPhotoView(photoViewIndex);
-        }
-        return;
-      }
-
-      unsigned long now=millis();
-
-      // ── PATCH: Double tap dengan tunggu konfirmasi ───────────────────
-      // Cek apakah ini tap kedua dari double tap
-      if(now-lastTapPhotoMs<DOUBLE_TAP_MS && lastTapPhotoMs!=0) {
-        // INI double tap → zoom
-        lastTapPhotoMs=0;
+      // ── Pojok kiri atas → zoom cycle ────────────────────────────────
+      if(pvZoneTopLeft(tx,ty)) {
         photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
         photoZoomOffX=0; photoZoomOffY=0;
+        // center zoom ke tengah layar
         if(photoZoomLevel>0) {
           float zf=photoZoomFactors[photoZoomLevel];
           int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
-          photoZoomOffX=constrain((int)(tx/zf)-vpW/2,0,max(0,(int)photoBufW-vpW));
-          photoZoomOffY=constrain((int)(ty/zf)-vpH/2,0,max(0,(int)photoBufH-vpH));
+          photoZoomOffX=max(0,(int)photoBufW/2-vpW/2);
+          photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
         }
         photoViewRender();
         if(photoZoomLevel==0) {
@@ -1654,52 +1645,30 @@ void loop() {
         return;
       }
 
-      // Ini tap pertama — simpan timestamp, lalu tunggu sebentar
-      // untuk memastikan bukan tap pertama dari double tap
-      lastTapPhotoMs=now;
+      // ── Pojok kiri bawah → compare ──────────────────────────────────
+      if(pvZoneBotLeft(tx,ty)) {
+        // foto ini jadi slot A, kembali ke gallery pilih B
+        compareIdxA=photoViewIndex;
+        compareIdxB=-1;
+        photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
+        if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+        // masuk gallery compare select
+        scanGalleryFiles();
+        galleryCompareSelect=true;
+        galleryCompareIdxA=compareIdxA;
+        appMode=MODE_GALLERY; drawGallery();
+        return;
+      }
 
+      // ── Tap area tengah / kiri / kanan → navigasi (zoom=1× saja) ───
       if(photoZoomLevel==0) {
-        // ── PATCH: tunda navigasi, tunggu konfirmasi bukan double tap ──
-        unsigned long waitUntil=millis()+DOUBLE_TAP_MS;
-        bool isDoubleTap=false;
-        int32_t cx=tx,cy=ty;
-        while(millis()<waitUntil) {
-          if(lcd.getTouch(&cx,&cy)) {
-            // ada sentuhan lagi dalam window → double tap
-            while(lcd.getTouch(&cx,&cy)) { delay(10); esp_task_wdt_reset(); }
-            isDoubleTap=true;
-            break;
-          }
-          delay(10); esp_task_wdt_reset();
-        }
-
-        if(isDoubleTap) {
-          // proses sebagai double tap zoom
-          lastTapPhotoMs=0;
-          photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
-          photoZoomOffX=0; photoZoomOffY=0;
-          if(photoZoomLevel>0) {
-            float zf=photoZoomFactors[photoZoomLevel];
-            int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
-            photoZoomOffX=constrain((int)(tx/zf)-vpW/2,0,max(0,(int)photoBufW-vpW));
-            photoZoomOffY=constrain((int)(ty/zf)-vpH/2,0,max(0,(int)photoBufH-vpH));
-          }
-          photoViewRender();
-          if(photoZoomLevel==0) {
-            photoViewDrawCaption(photoViewIndex);
-            photoViewCaptionUntilMs=millis()+2000;
-            photoViewCaptionVisible=true;
-          }
-        } else {
-          // benar single tap → navigasi prev/next
-          if(now-lastTapMs>DEBOUNCE_MS) {
-            lastTapMs=now;
-            if(tx<DISP_W/2) photoViewPrev();
-            else photoViewNext();
-          }
+        if(now-lastTapMs>DEBOUNCE_MS) {
+          lastTapMs=now;
+          if(tx<DISP_W/2) photoViewPrev();
+          else             photoViewNext();
         }
       }
-      // zoom>1×: tap tidak navigasi, hanya pan yang jalan
+      // zoom>1×: navigasi tidak aktif, hanya pan
     }
 
     // ── MODE COMPARE ────────────────────────────────────────────────────
@@ -1708,15 +1677,10 @@ void loop() {
         appMode=MODE_GALLERY; drawGallery();
         return;
       }
-      if(tx<COMPARE_W) {
-        galleryCompareSelect=false;
-        appMode=MODE_GALLERY;
-        drawGallery();
-      } else {
-        galleryCompareSelect=false;
-        appMode=MODE_GALLERY;
-        drawGallery();
-      }
+      // tap kiri/kanan → kembali gallery untuk ganti foto slot
+      appMode=MODE_GALLERY;
+      galleryCompareSelect=false;
+      drawGallery();
     }
 
     // ── MODE MJPEG PLAYER ───────────────────────────────────────────────
