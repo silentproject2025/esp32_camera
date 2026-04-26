@@ -1,21 +1,21 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.7-ILI9341
+ * Version: v4.8-ILI9341
+ *
+ * CHANGELOG v4.8:
+ *  - Photo View: caption bar tampil 2 detik lalu auto-clear (layar bersih fullscreen)
+ *  - Photo View: long press (>1.5s) → dialog delete file (YES / NO, monochrome rounded)
+ *  - Viewfinder: hapus rssi dots (lingkaran bawah tengah)
+ *  - Recording: layar bersih saat recording, hanya tampil indikator REC minimal
  *
  * CHANGELOG v4.7:
  *  - Gallery scroll: swipe momentum — kecepatan swipe menentukan jumlah item yang di-scroll
- *    Rumus: speed = |swipeY| / durasi_ms, steps = clamp(round(speed * 15), 1, PAGE_SIZE)
- *    Swipe lambat (200ms) = 1-2 item, normal (100ms) = 3-4 item, fling (40ms) = 6-8 item
  *
  * CHANGELOG v4.6:
- *  - MJPEG Player: HUD overlay dihapus total (nama file, ikon pause/play, frame counter)
- *  - MJPEG Player: saat pause/play di-toggle, tampil notif kecil "PAUSE"/"PLAY"
- *                  selama 1.5 detik lalu hilang → layar bersih kembali
- *  - MJPEG Player: BACK via tap pojok kanan atas (zona touch tetap aktif, tanpa label)
- *  - Gallery Photo View: tap kiri (x < 160) → foto sebelumnya, wrap ke terakhir jika di awal
- *  - Gallery Photo View: tap kanan (x > 160) → foto berikutnya, wrap ke pertama jika di akhir
- *  - Gallery Photo View: tap pojok kanan atas → back ke gallery (tanpa label)
- *  - Bar bawah photo view menampilkan nomor urut "< N / Total >"
+ *  - MJPEG Player: HUD overlay dihapus total
+ *  - MJPEG Player: notif singkat PAUSE/PLAY lalu hilang
+ *  - Gallery Photo View: tap kiri/kanan navigasi foto, wrap
+ *  - Bar bawah photo view menampilkan nomor urut
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape + XPT2046 resistive touch
@@ -28,20 +28,21 @@
  *  Tap 1/2 kanan layar   (x > 160)           -> capture foto
  *
  * Touch controls (gallery):
- *  Swipe atas/bawah      -> scroll list (foto & video), momentum proporsional kecepatan
+ *  Swipe atas/bawah      -> scroll list, momentum proporsional kecepatan
  *  Tap nama file .jpg    -> lihat foto full screen
  *  Tap nama file .mjpeg  -> putar MJPEG player
  *  Tap pojok kanan       -> back ke viewfinder
  *
  * Touch controls (photo view):
- *  Tap pojok kanan atas  -> back ke gallery (tanpa label)
- *  Tap kiri (x < 160)   -> foto sebelumnya (wrap ke terakhir)
- *  Tap kanan (x > 160)  -> foto berikutnya (wrap ke pertama)
+ *  Tap pojok kanan atas  -> back ke gallery
+ *  Tap kiri (x < 160)   -> foto sebelumnya (wrap)
+ *  Tap kanan (x > 160)  -> foto berikutnya (wrap)
+ *  Long press (>1.5s)   -> dialog delete file (YES / NO)
  *  Tombol BOOT           -> back ke gallery
  *
  * Touch controls (MJPEG player):
  *  Tap pojok kanan atas  -> stop & back ke gallery
- *  Tap area lain         -> pause / resume (notif singkat 1.5s lalu hilang)
+ *  Tap area lain         -> pause / resume
  */
 
 #include "esp_camera.h"
@@ -192,7 +193,13 @@ bool galleryIsVideo[GALLERY_MAX_FILES];
 int  galleryCount  = 0;
 int  galleryScroll = 0;
 char photoViewPath[48];
-int  photoViewIndex = 0;  // index saat ini di galleryFiles[] (hanya foto)
+int  photoViewIndex = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Photo View state (v4.8)
+// ─────────────────────────────────────────────────────────────────────────────
+unsigned long photoViewCaptionUntilMs = 0;
+bool          photoViewCaptionVisible = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Touch zones
@@ -315,14 +322,6 @@ void drawPill(int cx, int cy, const char* text, uint16_t bgCol, uint16_t fgCol) 
   lcd.drawString(text, px + PILL_PAD_X, py + 2);
 }
 
-void drawRSSIDots(int rssi) {
-  uint16_t cols[4] = { COL_GRAY_5, COL_GRAY_7, COL_GRAY_A, COL_GRAY_C };
-  int dotY = DISP_H - 7, startX = DISP_W / 2 - 14;
-  for (int i = 0; i < 4; i++)
-    lcd.fillCircle(startX + i * 9, dotY, 2, (i < rssi) ? cols[i] : COL_GRAY_2);
-}
-int getSignalBars() { return 4; }
-
 void blinkLED(int n, int on_ms = 100, int off_ms = 100) {
   for (int i = 0; i < n; i++) {
     digitalWrite(LED_PIN, HIGH); delay(on_ms);
@@ -425,7 +424,6 @@ void scanGalleryFiles() {
     }
   }
   closedir(dir);
-  // Sort ascending
   for (int i = 0; i < galleryCount-1; i++) {
     for (int j = 0; j < galleryCount-i-1; j++) {
       if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
@@ -488,12 +486,112 @@ void drawGallery() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo View — navigasi kiri/kanan antar foto, skip video
+//  Photo View — fullscreen, caption 2 detik lalu clear, long press delete
 // ─────────────────────────────────────────────────────────────────────────────
 #include <TJpg_Decoder.h>
 
 bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   lcd.pushImage(x, y, w, h, bitmap); return true;
+}
+
+// Gambar caption bar di bawah
+void photoViewDrawCaption(int idx) {
+  int photoSeq = 0, photoTotal = 0;
+  for (int i = 0; i < galleryCount; i++) {
+    if (!galleryIsVideo[i]) {
+      photoTotal++;
+      if (i <= idx) photoSeq = photoTotal;
+    }
+  }
+  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
+  lcd.setFont(&fonts::Font0);
+  char bar[40], barFull[64];
+  snprintf(bar,     sizeof(bar),     "< %d / %d >", photoSeq, photoTotal);
+  snprintf(barFull, sizeof(barFull), "< %d / %d >  %s", photoSeq, photoTotal, galleryFiles[idx]);
+  const char* barStr = (lcd.textWidth(barFull) < DISP_W - 4) ? barFull : bar;
+  lcd.setTextColor(COL_GRAY_A);
+  int nw = lcd.textWidth(barStr);
+  lcd.drawString(barStr, (DISP_W - nw) / 2, DISP_H - 13);
+}
+
+// Hapus caption bar (kembalikan layar bersih bagian bawah)
+void photoViewClearCaption() {
+  // Ambil ulang baris terbawah foto (QVGA = full 240px, jadi render ulang area itu)
+  // Paling simpel: fillRect hitam saja, foto sudah di atas
+  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_BLACK);
+  photoViewCaptionVisible = false;
+  photoViewCaptionUntilMs = 0;
+}
+
+// Dialog konfirmasi delete — monochrome, rounded
+// Return true = user pilih YES, false = NO / batal
+bool photoViewDeleteDialog(const char* filename) {
+  // Overlay gelap semi-transparan via fillRect dengan warna gelap
+  int dw = 200, dh = 80;
+  int dx = (DISP_W - dw) / 2;
+  int dy = (DISP_H - dh) / 2;
+
+  // Background dialog
+  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(dx, dy, dw, dh, 10, COL_GRAY_5);
+
+  // Judul
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "HAPUS FILE?";
+  int tw = lcd.textWidth(title);
+  lcd.drawString(title, dx + (dw - tw) / 2, dy + 10);
+
+  // Nama file (truncate jika panjang)
+  lcd.setTextColor(COL_GRAY_7);
+  char truncName[28];
+  strncpy(truncName, filename, 27); truncName[27] = '\0';
+  int fnw = lcd.textWidth(truncName);
+  lcd.drawString(truncName, dx + (dw - fnw) / 2, dy + 24);
+
+  // Divider
+  lcd.drawFastHLine(dx + 10, dy + 38, dw - 20, COL_GRAY_3);
+
+  // Tombol NO (kiri) — terang
+  int btnW = 70, btnH = 22, btnY = dy + 46;
+  int btnNoX  = dx + 16;
+  int btnYesX = dx + dw - 16 - btnW;
+
+  // NO button
+  lcd.fillRoundRect(btnNoX, btnY, btnW, btnH, 6, COL_GRAY_3);
+  lcd.drawRoundRect(btnNoX, btnY, btnW, btnH, 6, COL_GRAY_5);
+  lcd.setTextColor(COL_GRAY_C);
+  int noW = lcd.textWidth("NO");
+  lcd.drawString("NO", btnNoX + (btnW - noW) / 2, btnY + 7);
+
+  // YES button — lebih terang (aksi destruktif)
+  lcd.fillRoundRect(btnYesX, btnY, btnW, btnH, 6, COL_GRAY_7);
+  lcd.drawRoundRect(btnYesX, btnY, btnW, btnH, 6, COL_GRAY_A);
+  lcd.setTextColor(COL_BLACK);
+  int yesW = lcd.textWidth("YES");
+  lcd.drawString("YES", btnYesX + (btnW - yesW) / 2, btnY + 7);
+
+  // Tunggu touch
+  unsigned long waitStart = millis();
+  while (millis() - waitStart < 10000) { // timeout 10 detik
+    int32_t tx, ty;
+    if (lcd.getTouch(&tx, &ty)) {
+      while (lcd.getTouch(&tx, &ty)) { delay(10); esp_task_wdt_reset(); }
+      // Cek area YES
+      if (tx >= btnYesX && tx <= btnYesX + btnW && ty >= btnY && ty <= btnY + btnH) {
+        return true;
+      }
+      // Cek area NO atau luar dialog
+      return false;
+    }
+    // Cek BOOT btn sebagai cancel
+    if (digitalRead(BOOT_BTN_PIN) == LOW) {
+      while (digitalRead(BOOT_BTN_PIN) == LOW) { delay(10); esp_task_wdt_reset(); }
+      return false;
+    }
+    delay(10); esp_task_wdt_reset();
+  }
+  return false; // timeout = batal
 }
 
 void showPhotoView(int idx) {
@@ -529,26 +627,10 @@ void showPhotoView(int idx) {
   TJpgDec.drawJpg(ox, oy, buf, fsize);
   free(buf);
 
-  lcd.fillRect(0, DISP_H-16, DISP_W, 16, COL_GRAY_D);
-  lcd.setFont(&fonts::Font0);
-
-  int photoSeq = 0, photoTotal = 0;
-  for (int i = 0; i < galleryCount; i++) {
-    if (!galleryIsVideo[i]) {
-      photoTotal++;
-      if (i <= idx) photoSeq = photoTotal;
-    }
-  }
-
-  char bar[40];
-  snprintf(bar, sizeof(bar), "< %d / %d >", photoSeq, photoTotal);
-  char barFull[64];
-  snprintf(barFull, sizeof(barFull), "< %d / %d >  %s", photoSeq, photoTotal, galleryFiles[idx]);
-  const char* barStr = (lcd.textWidth(barFull) < DISP_W - 4) ? barFull : bar;
-
-  lcd.setTextColor(COL_GRAY_A);
-  int nw = lcd.textWidth(barStr);
-  lcd.drawString(barStr, (DISP_W - nw) / 2, DISP_H - 13);
+  // Tampil caption, set auto-clear timer 2 detik
+  photoViewDrawCaption(idx);
+  photoViewCaptionUntilMs = millis() + 2000;
+  photoViewCaptionVisible = true;
 }
 
 void photoViewPrev() {
@@ -567,6 +649,32 @@ void photoViewNext() {
     if (!galleryIsVideo[idx]) { showPhotoView(idx); return; }
     idx++; if (idx >= galleryCount) idx = 0;
   }
+}
+
+// Hapus file foto dari SD, update gallery
+void photoViewDeleteCurrent() {
+  char path[56];
+  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[photoViewIndex]);
+  if (remove(path) == 0) {
+    Serial.printf("Deleted: %s\n", path);
+    // Tampil feedback singkat
+    lcd.fillRoundRect(80, DISP_H/2 - 10, 160, 20, 6, COL_GRAY_3);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
+    int tw = lcd.textWidth("FILE DIHAPUS");
+    lcd.drawString("FILE DIHAPUS", (DISP_W - tw) / 2, DISP_H/2 - 6);
+    delay(800);
+  } else {
+    lcd.fillRoundRect(80, DISP_H/2 - 10, 160, 20, 6, COL_GRAY_3);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+    int tw = lcd.textWidth("GAGAL HAPUS");
+    lcd.drawString("GAGAL HAPUS", (DISP_W - tw) / 2, DISP_H/2 - 6);
+    delay(800);
+  }
+  // Kembali ke gallery dan rescan
+  scanGalleryFiles();
+  scanPhotoCount();
+  appMode = MODE_GALLERY;
+  drawGallery();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -684,27 +792,25 @@ void openMjpegPlayer(const char* filename) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  REC overlay
+//  REC overlay — v4.8: layar bersih, hanya indikator minimal di pojok
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRecIndicator() {
   if (!recActive) return;
+  // Hanya tampil di pojok kiri atas: dot blink + timer
+  // Area kecil: x=4..80, y=4..18 — tidak ganggu feed
   unsigned long elapsed = (millis() - recStartMs) / 1000;
-  char timeBuf[12]; snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu", elapsed/60, elapsed%60);
+  char timeBuf[10]; snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu", elapsed/60, elapsed%60);
   bool blink = (millis() / 500) % 2;
-  lcd.fillCircle(DISP_W/2 - 22, 10, 4, blink ? COL_WHITE : COL_GRAY_5);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_WHITE);
-  lcd.drawString(timeBuf, DISP_W/2 - 14, 6);
-  char fBuf[12]; snprintf(fBuf, sizeof(fBuf), "%df", recFrameCount);
-  lcd.setTextColor(COL_GRAY_7); lcd.drawString(fBuf, DISP_W/2 + 24, 6);
-}
 
-void drawRecTouchHint() {
-  bool blink = recActive && ((millis() / 600) % 2);
-  uint16_t c = recActive ? (blink ? COL_WHITE : COL_GRAY_5) : COL_GRAY_3;
-  lcd.fillCircle(12, DISP_H-12, 6, c);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(recActive ? COL_GRAY_A : COL_GRAY_3);
-  lcd.drawString(recActive ? "STOP" : "REC", 22, DISP_H-16);
+  // Clear area indikator dulu (patch kecil agar tidak ghosting)
+  lcd.fillRect(4, 4, 76, 14, COL_BLACK);
+
+  // Dot merah (monochrome: putih/abu saat blink)
+  lcd.fillCircle(10, 11, 4, blink ? COL_WHITE : COL_GRAY_5);
+
+  // Timer
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
+  lcd.drawString(timeBuf, 18, 6);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -719,12 +825,16 @@ void startRecording() {
   if (!recFile) { recVideoCount--; return; }
   recFrameCount = 0; recStartMs = millis(); recActive = true;
   Serial.printf("REC START: %s\n", path);
+
+  // Feedback singkat lalu layar bersih
   lcd.setFont(&fonts::Font0);
   char buf[20]; snprintf(buf, sizeof(buf), "REC  #%04d", recVideoCount);
   int tw = lcd.textWidth(buf), pw = tw + 14, px = (DISP_W - pw) / 2;
   lcd.fillRoundRect(px, 6, pw, 15, 7, COL_WHITE);
   lcd.setTextColor(COL_BLACK); lcd.drawString(buf, px+7, 9);
   delay(600);
+  // Clear feedback — layar akan diisi frame kamera
+  lcd.fillScreen(COL_BLACK);
 }
 
 void stopRecording() {
@@ -732,6 +842,7 @@ void stopRecording() {
   fclose(recFile); recFile = nullptr; recActive = false;
   unsigned long dur = (millis() - recStartMs) / 1000;
   Serial.printf("REC STOP: %d frames, %lus\n", recFrameCount, dur);
+  lcd.fillScreen(COL_BLACK);
   lcd.setFont(&fonts::Font0);
   char buf[28]; snprintf(buf, sizeof(buf), "SAVED  %df  %02lu:%02lu", recFrameCount, dur/60, dur%60);
   int tw = lcd.textWidth(buf), pw = tw + 14, px = (DISP_W - pw) / 2;
@@ -754,10 +865,10 @@ void recordFrame() {
     recFrameCount++;
     if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
   }
+  // Push frame ke layar setiap 3 frame — layar bersih, hanya feed + indikator kecil
   if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-    drawCornerBrackets(COL_GRAY_E);
-    drawRecIndicator(); drawRecTouchHint();
+    drawRecIndicator(); // hanya dot + timer di pojok kiri atas
   }
   esp_camera_fb_return(fb);
   esp_task_wdt_reset();
@@ -805,7 +916,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xc
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM", DISP_W/2 - 57, 85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.7  ILI9341 + XPT2046", DISP_W/2 - 72, 103);
+  lcd.drawString("v4.8  ILI9341 + XPT2046", DISP_W/2 - 72, 103);
   lcd.drawFastHLine(20, 116, DISP_W-40, COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -855,7 +966,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw = lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE", (DISP_W-lw)/2, 4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.7", DISP_W-24, 4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.8", DISP_W-24, 4);
   drawUSBIcon(DISP_W/2, 85, COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw = lcd.textWidth("SD CONNECTED");
@@ -966,7 +1077,7 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Viewfinder
+//  Viewfinder — v4.8: tanpa rssi dots, tanpa rec touch hint
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb = esp_camera_fb_get(); if (!fb) return;
@@ -985,8 +1096,9 @@ void renderViewfinder() {
       char faceBuf[12];
       snprintf(faceBuf, sizeof(faceBuf), faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
       drawPill(DISP_W/2, DISP_H-10, faceBuf, COL_PILL_BG, COL_GRAY_C);
-    } else { drawRSSIDots(getSignalBars()); }
-    drawRecTouchHint(); updateFPS();
+    }
+    // rssi dots dihapus di v4.8
+    updateFPS();
   } else {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
     lcd.drawString("format not rgb565", 10, 110);
@@ -1096,7 +1208,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.7 ===");
+  Serial.println("\n=== Sanzxcam v4.8 ===");
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   pinMode(REC_BTN_PIN, INPUT_PULLUP);
@@ -1139,6 +1251,12 @@ void setup() {
 //  Loop
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
+
+  // ── Caption auto-clear di photo view ─────────────────────────────────────
+  if (appMode == MODE_PHOTO_VIEW && photoViewCaptionVisible &&
+      millis() > photoViewCaptionUntilMs) {
+    photoViewClearCaption();
+  }
 
   // ── Tombol REC fisik (pin 41) ─────────────────────────────────────────────
   if (appMode == MODE_VIEWFINDER && !recActive && digitalRead(REC_BTN_PIN) == LOW) {
@@ -1214,6 +1332,7 @@ void loop() {
       appMode = MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
       fpsLastTime = millis(); fpsFrameCount = 0;
     } else if (appMode == MODE_PHOTO_VIEW) {
+      photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
       appMode = MODE_GALLERY; drawGallery();
     } else if (appMode == MODE_MJPEG_PLAYER) {
       mjpegClose(); appMode = MODE_GALLERY; drawGallery();
@@ -1275,27 +1394,15 @@ void loop() {
         appMode = MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
         fpsLastTime = millis(); fpsFrameCount = 0; return;
       }
-
-      // Swipe scroll dengan momentum proporsional kecepatan
       if (abs(swipeY) > 20 && abs(swipeY) > abs(swipeX)) {
-        // speed dalam px/ms, lalu scale ke jumlah item
         float speed = (float)abs(swipeY) / (float)max(1UL, touchDur);
-        // Faktor 15: tiap 1px/ms kecepatan ≈ 15 item scroll
-        // clamp antara 1 s.d. satu halaman penuh
         int steps = max(1, min(GALLERY_ITEMS_PAGE, (int)(speed * 15.0f)));
-
-        Serial.printf("swipe: dy=%d dur=%lums spd=%.2f steps=%d\n",
-                      swipeY, touchDur, speed, steps);
-
         if (swipeY < 0)
           galleryScroll = min(galleryScroll + steps, max(0, galleryCount - GALLERY_ITEMS_PAGE));
         else
           galleryScroll = max(galleryScroll - steps, 0);
-
         drawGallery(); return;
       }
-
-      // Tap item
       if (ty > 20 && galleryCount > 0) {
         int idx = galleryScroll + (ty-24) / GALLERY_ITEM_H;
         if (idx >= 0 && idx < galleryCount) {
@@ -1308,10 +1415,26 @@ void loop() {
     // ── MODE PHOTO VIEW ───────────────────────────────────────────────────
     else if (appMode == MODE_PHOTO_VIEW) {
       if (inZoneTopRight(tx, ty)) {
+        photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
         appMode = MODE_GALLERY;
         drawGallery();
         return;
       }
+
+      // Long press → dialog delete
+      if (touchDur >= LONG_TAP_MS) {
+        // Clear caption dulu biar dialog keliatan bersih
+        photoViewClearCaption();
+        bool doDelete = photoViewDeleteDialog(galleryFiles[photoViewIndex]);
+        if (doDelete) {
+          photoViewDeleteCurrent(); // ini sudah handle kembali ke gallery
+        } else {
+          // Batal: redraw foto lagi (dialog sudah kotor layar)
+          showPhotoView(photoViewIndex);
+        }
+        return;
+      }
+
       unsigned long now = millis();
       if (now - lastTapMs > DEBOUNCE_MS) {
         lastTapMs = now;
