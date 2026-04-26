@@ -1,6 +1,11 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.6-ILI9341
+ * Version: v4.7-ILI9341
+ *
+ * CHANGELOG v4.7:
+ *  - Gallery scroll: swipe momentum — kecepatan swipe menentukan jumlah item yang di-scroll
+ *    Rumus: speed = |swipeY| / durasi_ms, steps = clamp(round(speed * 15), 1, PAGE_SIZE)
+ *    Swipe lambat (200ms) = 1-2 item, normal (100ms) = 3-4 item, fling (40ms) = 6-8 item
  *
  * CHANGELOG v4.6:
  *  - MJPEG Player: HUD overlay dihapus total (nama file, ikon pause/play, frame counter)
@@ -23,7 +28,7 @@
  *  Tap 1/2 kanan layar   (x > 160)           -> capture foto
  *
  * Touch controls (gallery):
- *  Swipe atas/bawah      -> scroll list (foto & video)
+ *  Swipe atas/bawah      -> scroll list (foto & video), momentum proporsional kecepatan
  *  Tap nama file .jpg    -> lihat foto full screen
  *  Tap nama file .mjpeg  -> putar MJPEG player
  *  Tap pojok kanan       -> back ke viewfinder
@@ -278,7 +283,6 @@ char  mjpegPath[48];
 bool  mjpegPlaying       = false;
 bool  mjpegPaused        = false;
 int   mjpegFrame         = 0;
-// Timestamp kapan notif pause/play harus dihapus (0 = tidak ada notif aktif)
 unsigned long mjpegNotifUntilMs = 0;
 
 int jpegDrawCallback(JPEGDRAW *pDraw) {
@@ -492,7 +496,6 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
   lcd.pushImage(x, y, w, h, bitmap); return true;
 }
 
-// Render foto pada index idx (harus non-video)
 void showPhotoView(int idx) {
   if (idx < 0 || idx >= galleryCount || galleryIsVideo[idx]) return;
   photoViewIndex = idx;
@@ -526,11 +529,9 @@ void showPhotoView(int idx) {
   TJpgDec.drawJpg(ox, oy, buf, fsize);
   free(buf);
 
-  // Bar bawah: nomor urut foto (skip video) + nama file
   lcd.fillRect(0, DISP_H-16, DISP_W, 16, COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
 
-  // Hitung posisi foto ini di antara semua foto (bukan video)
   int photoSeq = 0, photoTotal = 0;
   for (int i = 0; i < galleryCount; i++) {
     if (!galleryIsVideo[i]) {
@@ -541,7 +542,6 @@ void showPhotoView(int idx) {
 
   char bar[40];
   snprintf(bar, sizeof(bar), "< %d / %d >", photoSeq, photoTotal);
-  // Tambahkan nama file jika masih muat
   char barFull[64];
   snprintf(barFull, sizeof(barFull), "< %d / %d >  %s", photoSeq, photoTotal, galleryFiles[idx]);
   const char* barStr = (lcd.textWidth(barFull) < DISP_W - 4) ? barFull : bar;
@@ -551,7 +551,6 @@ void showPhotoView(int idx) {
   lcd.drawString(barStr, (DISP_W - nw) / 2, DISP_H - 13);
 }
 
-// Navigasi ke foto sebelumnya, skip video, wrap-around ke foto terakhir
 void photoViewPrev() {
   int idx = photoViewIndex - 1;
   if (idx < 0) idx = galleryCount - 1;
@@ -561,7 +560,6 @@ void photoViewPrev() {
   }
 }
 
-// Navigasi ke foto berikutnya, skip video, wrap-around ke foto pertama
 void photoViewNext() {
   int idx = photoViewIndex + 1;
   if (idx >= galleryCount) idx = 0;
@@ -572,9 +570,8 @@ void photoViewNext() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MJPEG Player — HUD dihapus total, notif singkat saat pause/play
+//  MJPEG Player
 // ─────────────────────────────────────────────────────────────────────────────
-
 bool mjpegOpen(const char* filename) {
   char path[48]; snprintf(path, sizeof(path), "/sdcard/%s", filename);
   if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
@@ -607,7 +604,6 @@ void mjpegClose() {
   mjpegPlaying = false; mjpegPaused = false; mjpegFrame = 0; mjpegNotifUntilMs = 0;
 }
 
-// Tampil notif kecil di tengah layar, hilang otomatis setelah 1.5 detik
 void mjpegShowNotif(const char* text) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   int tw = lcd.textWidth(text);
@@ -620,7 +616,6 @@ void mjpegShowNotif(const char* text) {
   mjpegNotifUntilMs = millis() + 1500;
 }
 
-// Hapus area notif (timpa hitam agar bersih)
 void mjpegClearNotif() {
   int pw = 140, ph = 21;
   int px = (DISP_W - pw) / 2, py = (DISP_H - ph) / 2;
@@ -629,14 +624,12 @@ void mjpegClearNotif() {
 }
 
 void mjpegHandleTouch(int32_t tx, int32_t ty) {
-  // Pojok kanan atas -> stop & back ke gallery
   if (inZoneTopRight(tx, ty)) {
     mjpegClose();
     appMode = MODE_GALLERY;
     drawGallery();
     return;
   }
-  // Tap area mana saja -> toggle pause/resume
   mjpegPaused = !mjpegPaused;
   mjpegShowNotif(mjpegPaused ? "PAUSE" : "PLAY");
 }
@@ -659,12 +652,10 @@ void loopMjpegPlayer() {
     mjpeg.drawJpg();
     mjpegFrame++;
 
-    // Jika notif aktif dan sudah waktunya hilang, hapus
     if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) {
       mjpegClearNotif();
     }
 
-    // Frame timing
     int64_t elapsed  = esp_timer_get_time() - frameStart;
     int64_t targetUs = 1000000LL / MJPEG_FRAME_RATE;
     int64_t remain   = targetUs - elapsed;
@@ -673,7 +664,6 @@ void loopMjpegPlayer() {
       while (esp_timer_get_time() < waitEnd) { delayMicroseconds(500); esp_task_wdt_reset(); }
     }
   } else {
-    // Saat pause: cek apakah notif perlu dihapus
     if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) {
       mjpegClearNotif();
     }
@@ -815,7 +805,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xc
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM", DISP_W/2 - 57, 85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.6  ILI9341 + XPT2046", DISP_W/2 - 72, 103);
+  lcd.drawString("v4.7  ILI9341 + XPT2046", DISP_W/2 - 72, 103);
   lcd.drawFastHLine(20, 116, DISP_W-40, COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -865,7 +855,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw = lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE", (DISP_W-lw)/2, 4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.6", DISP_W-24, 4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.7", DISP_W-24, 4);
   drawUSBIcon(DISP_W/2, 85, COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw = lcd.textWidth("SD CONNECTED");
@@ -1106,7 +1096,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.6 ===");
+  Serial.println("\n=== Sanzxcam v4.7 ===");
   pinMode(LED_PIN, OUTPUT); digitalWrite(LED_PIN, LOW);
   pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
   pinMode(REC_BTN_PIN, INPUT_PULLUP);
@@ -1285,11 +1275,27 @@ void loop() {
         appMode = MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
         fpsLastTime = millis(); fpsFrameCount = 0; return;
       }
+
+      // Swipe scroll dengan momentum proporsional kecepatan
       if (abs(swipeY) > 20 && abs(swipeY) > abs(swipeX)) {
-        if (swipeY < 0) galleryScroll = min(galleryScroll+1, max(0, galleryCount-GALLERY_ITEMS_PAGE));
-        else            galleryScroll = max(galleryScroll-1, 0);
+        // speed dalam px/ms, lalu scale ke jumlah item
+        float speed = (float)abs(swipeY) / (float)max(1UL, touchDur);
+        // Faktor 15: tiap 1px/ms kecepatan ≈ 15 item scroll
+        // clamp antara 1 s.d. satu halaman penuh
+        int steps = max(1, min(GALLERY_ITEMS_PAGE, (int)(speed * 15.0f)));
+
+        Serial.printf("swipe: dy=%d dur=%lums spd=%.2f steps=%d\n",
+                      swipeY, touchDur, speed, steps);
+
+        if (swipeY < 0)
+          galleryScroll = min(galleryScroll + steps, max(0, galleryCount - GALLERY_ITEMS_PAGE));
+        else
+          galleryScroll = max(galleryScroll - steps, 0);
+
         drawGallery(); return;
       }
+
+      // Tap item
       if (ty > 20 && galleryCount > 0) {
         int idx = galleryScroll + (ty-24) / GALLERY_ITEM_H;
         if (idx >= 0 && idx < galleryCount) {
@@ -1300,9 +1306,6 @@ void loop() {
     }
 
     // ── MODE PHOTO VIEW ───────────────────────────────────────────────────
-    // Tap pojok kanan atas  -> back ke gallery (tanpa label)
-    // Tap kiri (x < DISP_W/2) -> foto sebelumnya, wrap ke terakhir
-    // Tap kanan (x >= DISP_W/2) -> foto berikutnya, wrap ke pertama
     else if (appMode == MODE_PHOTO_VIEW) {
       if (inZoneTopRight(tx, ty)) {
         appMode = MODE_GALLERY;
