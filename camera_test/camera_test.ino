@@ -1,58 +1,25 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.9
+ * Version: v4.9-patched
+ *
+ * PATCH NOTES (dari v4.9):
+ *  - DOUBLE_TAP_MS naik 350 → 450ms (lebih mudah double tap)
+ *  - PAN_DEADZONE naik 8 → 15px (pan tidak terlalu sensitif)
+ *  - LONG_TAP_MS dipisah:
+ *      LONG_TAP_GALLERY_MS = 1500ms (compare select)
+ *      LONG_TAP_PHOTO_MS   = 2500ms (delete, lebih susah ter-trigger)
+ *  - Navigasi foto (prev/next) ditunda ~450ms untuk memastikan
+ *    bukan tap pertama dari double tap (fix: single tap langsung pindah foto)
  *
  * CHANGELOG v4.9:
  *  - Photo View: Zoom in/out via double tap (1× → 2× → 4× → 1×)
  *  - Photo View: Pan (drag) saat zoom > 1×
  *  - Photo View: Compare mode — dua foto side by side
- *    (dari gallery: long press foto pertama → tap foto kedua → compare tampil)
- *  - MJPEG Player: Loop mode toggle (tap pojok kiri atas saat player aktif)
- *  - MJPEG Player: Speed selector 0.5× / 1× / 2× (swipe kiri/kanan saat player aktif)
- *
- * CHANGELOG v4.8:
- *  - Photo View: caption bar tampil 2 detik lalu auto-clear
- *  - Photo View: long press → dialog delete file
- *  - Viewfinder: hapus rssi dots
- *  - Recording: layar bersih, hanya indikator REC minimal
+ *  - MJPEG Player: Loop mode toggle
+ *  - MJPEG Player: Speed selector 0.5× / 1× / 2×
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape + XPT2046 resistive touch
- *
- * Touch controls (viewfinder):
- *  Tap pojok kiri atas   -> buka Gallery
- *  Tap pojok kanan atas  -> toggle face detect
- *  Tap pojok kiri bawah  -> mulai / stop record MJPEG
- *  Long tap (>1.5s)      -> masuk USB mode
- *  Tap 1/2 kanan layar   -> capture foto
- *
- * Touch controls (gallery):
- *  Swipe atas/bawah      -> scroll list, momentum proporsional
- *  Tap nama file .jpg    -> lihat foto full screen
- *  Tap nama file .mjpeg  -> putar MJPEG player
- *  Long press file .jpg  -> masuk compare select mode
- *  Tap pojok kanan       -> back ke viewfinder
- *
- * Touch controls (photo view):
- *  Double tap            -> zoom in/out (1× → 2× → 4× → 1×)
- *  Drag (saat zoom>1×)   -> pan foto
- *  Tap kiri (x<160, zoom=1×) -> foto sebelumnya
- *  Tap kanan (x>160, zoom=1×) -> foto berikutnya
- *  Long press (>1.5s)    -> dialog delete file
- *  Tap pojok kanan atas  -> back ke gallery
- *  Tombol BOOT           -> back ke gallery
- *
- * Touch controls (compare mode):
- *  Tap pojok kanan atas  -> keluar compare, kembali gallery
- *  Tap kiri (x<160)      -> ganti foto kiri (pilih dari gallery)
- *  Tap kanan (x>160)     -> ganti foto kanan (pilih dari gallery)
- *
- * Touch controls (MJPEG player):
- *  Tap pojok kanan atas  -> stop & back ke gallery
- *  Tap pojok kiri atas   -> toggle loop mode
- *  Swipe kiri            -> speed up (0.5→1→2×)
- *  Swipe kanan           -> speed down (2→1→0.5×)
- *  Tap area lain         -> pause / resume
  */
 
 #include "esp_camera.h"
@@ -178,9 +145,16 @@ static LGFX lcd;
 #define DEBOUNCE_MS        400
 #define LONG_PRESS_MS     2000
 #define REC_LONG_PRESS_MS 2000
-#define LONG_TAP_MS       1500
-#define DOUBLE_TAP_MS      350   // max interval double tap
-#define PAN_DEADZONE         8   // pixel min untuk dianggap drag
+
+// ── PATCH: pisah long tap untuk gallery vs photo view ──────────────────────
+#define LONG_TAP_GALLERY_MS  1500   // compare select di gallery
+#define LONG_TAP_PHOTO_MS    2500   // delete di photo view (lebih lama, aman)
+
+// ── PATCH: double tap lebih mudah ─────────────────────────────────────────
+#define DOUBLE_TAP_MS        450    // was 350
+
+// ── PATCH: pan deadzone lebih besar ───────────────────────────────────────
+#define PAN_DEADZONE          15    // was 8
 
 #define HMIRROR_GC2145 1
 #define VFLIP_GC2145   0
@@ -213,7 +187,6 @@ int  galleryScroll = 0;
 char photoViewPath[48];
 int  photoViewIndex = 0;
 
-// Gallery compare select mode
 bool galleryCompareSelect = false;
 int  galleryCompareIdxA   = -1;
 
@@ -223,18 +196,16 @@ int  galleryCompareIdxA   = -1;
 unsigned long photoViewCaptionUntilMs = 0;
 bool          photoViewCaptionVisible = false;
 
-// Zoom & Pan
 #define ZOOM_LEVELS 3
 float    photoZoomFactors[ZOOM_LEVELS] = { 1.0f, 2.0f, 4.0f };
-uint8_t  photoZoomLevel  = 0;    // 0=1× 1=2× 2=4×
-int      photoZoomOffX   = 0;    // pan offset dalam koordinat gambar
+uint8_t  photoZoomLevel  = 0;
+int      photoZoomOffX   = 0;
 int      photoZoomOffY   = 0;
 uint16_t* photoPixelBuf  = nullptr;
 uint16_t  photoBufW      = 0;
 uint16_t  photoBufH      = 0;
 unsigned long lastTapPhotoMs = 0;
 
-// Compare mode
 int  compareIdxA = -1;
 int  compareIdxB = -1;
 
@@ -324,15 +295,14 @@ MjpegClass mjpeg;
 uint8_t*   mjpegBuf  = nullptr;
 
 char  mjpegPath[48];
-char  mjpegPathSaved[48];  // DIPINDAHKAN KE SINI
+char  mjpegPathSaved[48];
 bool  mjpegPlaying       = false;
 bool  mjpegPaused        = false;
 int   mjpegFrame         = 0;
 unsigned long mjpegNotifUntilMs = 0;
 
-// v4.9 extras
 bool    mjpegLoop      = false;
-uint8_t mjpegSpeedIdx  = 1;               // 0=0.5× 1=1× 2=2×
+uint8_t mjpegSpeedIdx  = 1;
 const float mjpegSpeeds[3] = { 0.5f, 1.0f, 2.0f };
 
 int jpegDrawCallback(JPEGDRAW *pDraw) {
@@ -341,17 +311,15 @@ int jpegDrawCallback(JPEGDRAW *pDraw) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  TJpgDec — decode ke buffer untuk zoom/compare
+//  TJpgDec
 // ─────────────────────────────────────────────────────────────────────────────
 #include <TJpg_Decoder.h>
 
-// Buffer target untuk decode ke RAM
 static uint16_t* _decodeTargetBuf = nullptr;
 static uint16_t  _decodeTargetW   = 0;
 
 bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (_decodeTargetBuf) {
-    // decode ke buffer
     for (int row = 0; row < h; row++) {
       int destY = y + row;
       if (destY < 0 || destY >= DISP_H) continue;
@@ -542,7 +510,6 @@ void drawGallery() {
     if(galleryIsVideo[i]) { lcd.setTextColor(COL_GRAY_7); lcd.drawString("\x10",26,rowY+8); }
     else { lcd.drawRect(26,rowY+6,7,7,COL_GRAY_5); }
 
-    // compare select: skip video
     if(galleryCompareSelect && galleryIsVideo[i]) {
       lcd.setTextColor(COL_GRAY_3);
     } else {
@@ -562,7 +529,7 @@ void drawGallery() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo pixel buffer — load foto ke RAM untuk zoom/compare
+//  Photo pixel buffer
 // ─────────────────────────────────────────────────────────────────────────────
 bool photoLoadPixelBuf(int idx) {
   if(idx<0||idx>=galleryCount||galleryIsVideo[idx]) return false;
@@ -609,10 +576,8 @@ void photoViewRender() {
   lcd.fillScreen(COL_BLACK);
 
   if(zf <= 1.0f) {
-    // 1× — render normal
     int ox=(DISP_W-min((int)photoBufW,DISP_W))/2;
     int oy=(DISP_H-min((int)photoBufH,DISP_H))/2;
-    // push baris per baris supaya hemat stack
     int renderW=min((int)photoBufW,DISP_W);
     int renderH=min((int)photoBufH,DISP_H);
     for(int row=0;row<renderH;row++) {
@@ -620,18 +585,13 @@ void photoViewRender() {
       if(row%20==0) esp_task_wdt_reset();
     }
   } else {
-    // zoom > 1× — crop region dari buffer lalu scale ke layar
-    // viewport di gambar asli: DISP_W/zf × DISP_H/zf
     int vpW=(int)(DISP_W/zf);
     int vpH=(int)(DISP_H/zf);
-
-    // clamp offset
     int maxOffX=max(0,(int)photoBufW-vpW);
     int maxOffY=max(0,(int)photoBufH-vpH);
     photoZoomOffX=constrain(photoZoomOffX,0,maxOffX);
     photoZoomOffY=constrain(photoZoomOffY,0,maxOffY);
 
-    // nearest-neighbor scale: tiap pixel layar → pixel di buffer
     static uint16_t lineBuf[DISP_W];
     for(int sy=0;sy<DISP_H;sy++) {
       int srcY=photoZoomOffY+(int)(sy/zf);
@@ -646,7 +606,6 @@ void photoViewRender() {
     }
   }
 
-  // zoom indicator pill
   if(photoZoomLevel>0) {
     char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f×",(double)zf);
     drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
@@ -674,7 +633,6 @@ void photoViewDrawCaption(int idx) {
 
 void photoViewClearCaption() {
   lcd.fillRect(0,DISP_H-16,DISP_W,16,COL_BLACK);
-  // redraw zoom indicator kalau ada
   if(photoZoomLevel>0) {
     float zf=photoZoomFactors[photoZoomLevel];
     char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f×",(double)zf);
@@ -733,7 +691,6 @@ void showPhotoView(int idx) {
   photoViewIndex=idx;
   strncpy(photoViewPath,galleryFiles[idx],sizeof(photoViewPath)-1);
 
-  // reset zoom & pan
   photoZoomLevel=0;
   photoZoomOffX=0; photoZoomOffY=0;
   lastTapPhotoMs=0;
@@ -794,11 +751,10 @@ void photoViewDeleteCurrent() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Compare Mode — dua foto side by side 160×240 masing-masing
+//  Compare Mode
 // ─────────────────────────────────────────────────────────────────────────────
-#define COMPARE_W (DISP_W/2)   // 160
+#define COMPARE_W (DISP_W/2)
 
-// Render satu foto ke area kiri atau kanan
 void compareRenderSlot(int idx, int slotX) {
   if(idx<0||idx>=galleryCount||galleryIsVideo[idx]) {
     lcd.fillRect(slotX,0,COMPARE_W,DISP_H,COL_GRAY_2);
@@ -815,12 +771,11 @@ void compareRenderSlot(int idx, int slotX) {
   if(!jpgBuf) { fclose(f); return; }
   fread(jpgBuf,1,fsize,f); fclose(f);
 
-  // decode ke buffer sementara COMPARE_W × DISP_H
   uint16_t* slotBuf=(uint16_t*)ps_malloc((size_t)COMPARE_W*DISP_H*sizeof(uint16_t));
   if(!slotBuf) { free(jpgBuf); return; }
   memset(slotBuf,0,(size_t)COMPARE_W*DISP_H*sizeof(uint16_t));
 
-  TJpgDec.setJpgScale(2); // scale down 2× → QVGA/2 = 160×120, cukup untuk slot
+  TJpgDec.setJpgScale(2);
   TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
   _decodeTargetBuf=slotBuf;
   _decodeTargetW=COMPARE_W;
@@ -830,14 +785,12 @@ void compareRenderSlot(int idx, int slotX) {
 
   free(jpgBuf);
 
-  // push ke layar di posisi slot
   for(int row=0;row<DISP_H;row++) {
     lcd.pushImage(slotX,row,COMPARE_W,1,slotBuf+row*COMPARE_W);
     if(row%20==0) esp_task_wdt_reset();
   }
   free(slotBuf);
 
-  // label nama file
   lcd.fillRect(slotX,DISP_H-14,COMPARE_W,14,COL_GRAY_D);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
   char shortName[18]; strncpy(shortName,galleryFiles[idx],17); shortName[17]='\0';
@@ -847,17 +800,14 @@ void compareRenderSlot(int idx, int slotX) {
 
 void showComparePage() {
   lcd.fillScreen(COL_BLACK);
-  // loading hint
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("loading...",DISP_W/2-24,DISP_H/2-4);
 
   compareRenderSlot(compareIdxA, 0);
   compareRenderSlot(compareIdxB, COMPARE_W);
 
-  // divider
   lcd.drawFastVLine(COMPARE_W,0,DISP_H,COL_GRAY_5);
 
-  // header
   lcd.fillRect(0,0,DISP_W,12,COL_GRAY_D);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
   int hw=lcd.textWidth("COMPARE");
@@ -918,7 +868,6 @@ void mjpegClearNotif() {
   mjpegNotifUntilMs=0;
 }
 
-// Overlay status HUD pojok kiri atas: LOOP + SPEED
 void mjpegDrawHUD() {
   char buf[24];
   snprintf(buf,sizeof(buf),"%.1f×  %s",
@@ -941,14 +890,12 @@ void mjpegHandleTouch(int32_t tx, int32_t ty, int32_t tx2, int32_t ty2, unsigned
     return;
   }
 
-  // pojok kiri atas → toggle loop
   if(inZoneTopLeft(tx,ty)) {
     mjpegLoop=!mjpegLoop;
     mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
     return;
   }
 
-  // swipe kiri → speed up, swipe kanan → speed down
   if(abs(swipeX)>40) {
     if(swipeX<0 && mjpegSpeedIdx<2) mjpegSpeedIdx++;
     else if(swipeX>0 && mjpegSpeedIdx>0) mjpegSpeedIdx--;
@@ -958,7 +905,6 @@ void mjpegHandleTouch(int32_t tx, int32_t ty, int32_t tx2, int32_t ty2, unsigned
     return;
   }
 
-  // tap biasa → pause/resume
   mjpegPaused=!mjpegPaused;
   mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
 }
@@ -972,7 +918,6 @@ void loopMjpegPlayer() {
     bool ok=mjpeg.readMjpegBuf();
     if(!ok) {
       if(mjpegLoop) {
-        // restart
         mjpegClose();
         if(!mjpegOpen(mjpegPathSaved)) {
           appMode=MODE_GALLERY; drawGallery();
@@ -990,7 +935,6 @@ void loopMjpegPlayer() {
 
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
 
-    // frame timing disesuaikan speed
     float speed=mjpegSpeeds[mjpegSpeedIdx];
     int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
     int64_t elapsed=esp_timer_get_time()-frameStart;
@@ -1125,7 +1069,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.9  ILI9341 + XPT2046",DISP_W/2-72,103);
+  lcd.drawString("v4.9-patched  ILI9341 + XPT2046",DISP_W/2-90,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1417,7 +1361,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.9 ===");
+  Serial.println("\n=== Sanzxcam v4.9-patched ===");
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   pinMode(BOOT_BTN_PIN,INPUT_PULLUP);
   pinMode(REC_BTN_PIN,INPUT_PULLUP);
@@ -1564,7 +1508,7 @@ void loop() {
     int32_t panLastX=tx,panLastY=ty;
     bool isPan=false;
 
-    // track drag untuk pan (photo view zoom>1)
+    // ── Pan tracking (photo view zoom>1×) ─────────────────────────────
     if(appMode==MODE_PHOTO_VIEW&&photoZoomLevel>0) {
       while(lcd.getTouch(&tx2,&ty2)) {
         int dx=tx2-panLastX, dy=ty2-panLastY;
@@ -1587,7 +1531,7 @@ void loop() {
 
     // ── MODE VIEWFINDER ─────────────────────────────────────────────────
     if(appMode==MODE_VIEWFINDER&&!usbModeActive) {
-      if(touchDur>=LONG_TAP_MS) {
+      if(touchDur>=LONG_TAP_GALLERY_MS) {
         if(sdReady) {
           lcd.setFont(&fonts::Font0);
           const char* msg="masuk USB mode...";
@@ -1639,7 +1583,6 @@ void loop() {
         int idx=galleryScroll+(ty-24)/GALLERY_ITEM_H;
         if(idx>=0&&idx<galleryCount) {
           if(galleryCompareSelect) {
-            // pilih foto kedua untuk compare
             if(!galleryIsVideo[idx]&&idx!=galleryCompareIdxA) {
               compareIdxA=galleryCompareIdxA;
               compareIdxB=idx;
@@ -1649,8 +1592,8 @@ void loop() {
           } else {
             if(galleryIsVideo[idx]) openMjpegPlayer(galleryFiles[idx]);
             else {
-              // long press di gallery → masuk compare select
-              if(touchDur>=LONG_TAP_MS) {
+              // ── PATCH: pakai LONG_TAP_GALLERY_MS untuk compare ──────
+              if(touchDur>=LONG_TAP_GALLERY_MS) {
                 galleryCompareSelect=true;
                 galleryCompareIdxA=idx;
                 drawGallery();
@@ -1665,7 +1608,7 @@ void loop() {
 
     // ── MODE PHOTO VIEW ─────────────────────────────────────────────────
     else if(appMode==MODE_PHOTO_VIEW) {
-      if(isPan) return; // sudah dihandle saat drag
+      if(isPan) return;
 
       if(inZoneTopRight(tx,ty)) {
         photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
@@ -1675,8 +1618,8 @@ void loop() {
         return;
       }
 
-      // Long press → delete dialog
-      if(touchDur>=LONG_TAP_MS) {
+      // ── PATCH: pakai LONG_TAP_PHOTO_MS untuk delete ─────────────────
+      if(touchDur>=LONG_TAP_PHOTO_MS) {
         photoViewClearCaption();
         bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
         if(doDelete) {
@@ -1689,12 +1632,13 @@ void loop() {
 
       unsigned long now=millis();
 
-      // Double tap → zoom cycle
-      if(now-lastTapPhotoMs<DOUBLE_TAP_MS) {
+      // ── PATCH: Double tap dengan tunggu konfirmasi ───────────────────
+      // Cek apakah ini tap kedua dari double tap
+      if(now-lastTapPhotoMs<DOUBLE_TAP_MS && lastTapPhotoMs!=0) {
+        // INI double tap → zoom
         lastTapPhotoMs=0;
         photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
         photoZoomOffX=0; photoZoomOffY=0;
-        // saat zoom: center ke titik tap
         if(photoZoomLevel>0) {
           float zf=photoZoomFactors[photoZoomLevel];
           int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
@@ -1709,16 +1653,53 @@ void loop() {
         }
         return;
       }
+
+      // Ini tap pertama — simpan timestamp, lalu tunggu sebentar
+      // untuk memastikan bukan tap pertama dari double tap
       lastTapPhotoMs=now;
 
-      // Single tap — hanya navigasi kalau zoom = 1×
       if(photoZoomLevel==0) {
-        if(now-lastTapMs>DEBOUNCE_MS) {
-          lastTapMs=now;
-          if(tx<DISP_W/2) photoViewPrev();
-          else photoViewNext();
+        // ── PATCH: tunda navigasi, tunggu konfirmasi bukan double tap ──
+        unsigned long waitUntil=millis()+DOUBLE_TAP_MS;
+        bool isDoubleTap=false;
+        int32_t cx=tx,cy=ty;
+        while(millis()<waitUntil) {
+          if(lcd.getTouch(&cx,&cy)) {
+            // ada sentuhan lagi dalam window → double tap
+            while(lcd.getTouch(&cx,&cy)) { delay(10); esp_task_wdt_reset(); }
+            isDoubleTap=true;
+            break;
+          }
+          delay(10); esp_task_wdt_reset();
+        }
+
+        if(isDoubleTap) {
+          // proses sebagai double tap zoom
+          lastTapPhotoMs=0;
+          photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
+          photoZoomOffX=0; photoZoomOffY=0;
+          if(photoZoomLevel>0) {
+            float zf=photoZoomFactors[photoZoomLevel];
+            int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
+            photoZoomOffX=constrain((int)(tx/zf)-vpW/2,0,max(0,(int)photoBufW-vpW));
+            photoZoomOffY=constrain((int)(ty/zf)-vpH/2,0,max(0,(int)photoBufH-vpH));
+          }
+          photoViewRender();
+          if(photoZoomLevel==0) {
+            photoViewDrawCaption(photoViewIndex);
+            photoViewCaptionUntilMs=millis()+2000;
+            photoViewCaptionVisible=true;
+          }
+        } else {
+          // benar single tap → navigasi prev/next
+          if(now-lastTapMs>DEBOUNCE_MS) {
+            lastTapMs=now;
+            if(tx<DISP_W/2) photoViewPrev();
+            else photoViewNext();
+          }
         }
       }
+      // zoom>1×: tap tidak navigasi, hanya pan yang jalan
     }
 
     // ── MODE COMPARE ────────────────────────────────────────────────────
@@ -1727,21 +1708,13 @@ void loop() {
         appMode=MODE_GALLERY; drawGallery();
         return;
       }
-      // tap kiri → ganti slot A, tap kanan → ganti slot B
-      // masuk gallery compare select lagi
       if(tx<COMPARE_W) {
-        // pilih ganti foto kiri
-        galleryCompareSelect=true;
-        galleryCompareIdxA=compareIdxB; // yang satu tetap
-        // swap: A jadi slot yang akan diganti
-        // simpan B, buka gallery pilih A baru
-        // simpel: buka gallery biasa, user pilih
-        appMode=MODE_GALLERY;
         galleryCompareSelect=false;
+        appMode=MODE_GALLERY;
         drawGallery();
       } else {
-        appMode=MODE_GALLERY;
         galleryCompareSelect=false;
+        appMode=MODE_GALLERY;
         drawGallery();
       }
     }
