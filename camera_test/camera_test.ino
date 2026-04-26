@@ -1366,7 +1366,7 @@ void setup() {
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
 
-  static uint16_t touchCalData[8]={3822,3653,501,3456,3835,291,550,267};
+  static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   bool calValid=false;
   for(int i=0;i<8;i++) if(touchCalData[i]!=0) { calValid=true; break; }
   if(calValid) lcd.setTouchCalibrate(touchCalData);
