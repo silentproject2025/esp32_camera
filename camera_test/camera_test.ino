@@ -324,6 +324,7 @@ MjpegClass mjpeg;
 uint8_t*   mjpegBuf  = nullptr;
 
 char  mjpegPath[48];
+char  mjpegPathSaved[48];  // DIPINDAHKAN KE SINI
 bool  mjpegPlaying       = false;
 bool  mjpegPaused        = false;
 int   mjpegFrame         = 0;
@@ -890,8 +891,6 @@ bool mjpegOpen(const char* filename) {
   lcd.fillScreen(COL_BLACK);
   return true;
 }
-
-char mjpegPathSaved[48];  // sudah dideklarasikan di atas tapi definisi ulang aman
 
 void mjpegClose() {
   if(mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
