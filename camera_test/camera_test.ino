@@ -131,7 +131,7 @@ static LGFX lcd;
 #define SD_MMC_D0_PIN  40
 
 #define LED_PIN        48
-#define BOOT_BTN_PIN    0
+#define BOOT_BTN_PIN    -1
 #define REC_BTN_PIN    -1
 
 #define DISP_W        320
