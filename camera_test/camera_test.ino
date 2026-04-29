@@ -1,6 +1,12 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v4.9b
+ * Version: v4.9c
+ *
+ * PATCH v4.9c (dari v4.9b):
+ *  - HAPUS fitur REC tombol fisik sepenuhnya
+ *  - REC_BTN_PIN dihapus — tidak ada lagi pinMode(-1) dan digitalRead(-1)
+ *  - REC hanya via touch: pojok kiri bawah di viewfinder
+ *  - Progress bar spurious di viewfinder hilang
  *
  * PATCH v4.9b (dari v4.9-patched):
  *  - Photo View: zona touch dipisah dengan jelas
@@ -14,24 +20,8 @@
  *  - PAN_DEADZONE tetap 15px
  *  - LONG_TAP_PHOTO_MS = 1500ms (sesuai permintaan)
  *
- * CHANGELOG v4.9:
- *  - Photo View: Zoom in/out
- *  - Photo View: Pan (drag) saat zoom > 1×
- *  - Photo View: Compare mode — dua foto side by side
- *  - MJPEG Player: Loop mode toggle
- *  - MJPEG Player: Speed selector 0.5× / 1× / 2×
- *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape + XPT2046 resistive touch
- *
- * Touch controls (photo view):
- *  Pojok kiri atas  (x<70, y<70)   → zoom cycle 1×→2×→4×→1×
- *  Pojok kiri bawah (x<70, y>170)  → compare (foto ini jadi slot A, pilih B dari gallery)
- *  Pojok kanan atas                 → back ke gallery
- *  Long press >1.5s (mana saja)    → delete dialog
- *  Drag saat zoom>1×               → pan
- *  Tap kiri  (x<160, bukan pojok)  → foto sebelumnya (langsung)
- *  Tap kanan (x>160, bukan pojok)  → foto berikutnya (langsung)
  */
 
 #include "esp_camera.h"
@@ -131,8 +121,8 @@ static LGFX lcd;
 #define SD_MMC_D0_PIN  40
 
 #define LED_PIN        48
-#define BOOT_BTN_PIN    -1
-#define REC_BTN_PIN    -1
+#define BOOT_BTN_PIN    0
+// REC_BTN_PIN dihapus sepenuhnya
 
 #define DISP_W        320
 #define DISP_H        240
@@ -156,17 +146,15 @@ static LGFX lcd;
 
 #define DEBOUNCE_MS          400
 #define LONG_PRESS_MS       2000
-#define REC_LONG_PRESS_MS   2000
-#define LONG_TAP_GALLERY_MS 1500   // compare select di gallery
-#define LONG_TAP_PHOTO_MS   1500   // delete di photo view
-#define PAN_DEADZONE          15   // pixel min untuk dianggap drag
+#define LONG_TAP_GALLERY_MS 1500
+#define LONG_TAP_PHOTO_MS   1500
+#define PAN_DEADZONE          15
 
 // ── Zona pojok di photo view ──────────────────────────────────────────────
-#define PV_ZONE_SZ     70          // ukuran kotak pojok (px)
-#define PV_ZONE_TOP    70          // batas bawah zona atas
-#define PV_ZONE_BOT   170          // batas atas zona bawah
+#define PV_ZONE_SZ     70
+#define PV_ZONE_TOP    70
+#define PV_ZONE_BOT   170
 
-// Inline helpers zona photo view
 #define pvZoneTopLeft(x,y)   ((x) < PV_ZONE_SZ && (y) < PV_ZONE_TOP)
 #define pvZoneTopRight(x,y)  ((x) > DISP_W - PV_ZONE_SZ && (y) < PV_ZONE_TOP)
 #define pvZoneBotLeft(x,y)   ((x) < PV_ZONE_SZ && (y) > PV_ZONE_BOT)
@@ -382,19 +370,13 @@ void blinkLED(int n, int on_ms=100, int off_ms=100) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo View — ikon zona di overlay
-//  Tampilkan hint kecil di pojok supaya user tahu zona aktif
+//  Photo View zone hints
 // ─────────────────────────────────────────────────────────────────────────────
 void photoViewDrawZoneHints() {
-  // pojok kiri atas: ikon zoom (kaca pembesar minimalis)
   lcd.drawCircle(14, 14, 7, COL_GRAY_5);
   lcd.drawLine(19, 19, 24, 24, COL_GRAY_5);
-
-  // pojok kiri bawah: ikon compare (dua kotak kecil)
   lcd.drawRect(4,  DISP_H-22, 10, 10, COL_GRAY_5);
   lcd.drawRect(17, DISP_H-22, 10, 10, COL_GRAY_5);
-
-  // pojok kanan atas: ikon back (panah kiri)
   lcd.drawLine(DISP_W-24, 14, DISP_W-14, 14, COL_GRAY_5);
   lcd.drawLine(DISP_W-24, 14, DISP_W-20, 10, COL_GRAY_5);
   lcd.drawLine(DISP_W-24, 14, DISP_W-20, 18, COL_GRAY_5);
@@ -638,13 +620,11 @@ void photoViewRender() {
     }
   }
 
-  // zoom indicator
   if(photoZoomLevel>0) {
     char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f×",(double)zf);
     drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
   }
 
-  // gambar ikon zona pojok setelah render foto
   photoViewDrawZoneHints();
 }
 
@@ -1067,7 +1047,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v4.9b  ILI9341 + XPT2046",DISP_W/2-72,103);
+  lcd.drawString("v4.9c  ILI9341 + XPT2046",DISP_W/2-72,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1117,7 +1097,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw=lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE",(DISP_W-lw)/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.9b",DISP_W-28,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v4.9c",DISP_W-28,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw=lcd.textWidth("SD CONNECTED");
@@ -1358,10 +1338,10 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v4.9b ===");
+  Serial.println("\n=== Sanzxcam v4.9c ===");
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   pinMode(BOOT_BTN_PIN,INPUT_PULLUP);
-  pinMode(REC_BTN_PIN,INPUT_PULLUP);
+
   setCpuFrequencyMhz(240);
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
@@ -1407,40 +1387,12 @@ void loop() {
     photoViewClearCaption();
   }
 
-  // ── Tombol REC fisik ────────────────────────────────────────────────────
-  if(appMode==MODE_VIEWFINDER&&!recActive&&digitalRead(REC_BTN_PIN)==LOW) {
-    delay(50);
-    if(digitalRead(REC_BTN_PIN)==LOW) {
-      unsigned long recPressStart=millis();
-      while(digitalRead(REC_BTN_PIN)==LOW) {
-        delay(10); esp_task_wdt_reset();
-        unsigned long held=millis()-recPressStart;
-        if(held>500) {
-          int barW=constrain((int)map((long)held,500L,(long)REC_LONG_PRESS_MS,0L,(long)DISP_W),0,DISP_W);
-          lcd.fillRect(0,0,barW,3,COL_GRAY_5);
-          lcd.fillRect(barW,0,DISP_W-barW,3,COL_BLACK);
-        }
-      }
-      unsigned long recDuration=millis()-recPressStart;
-      lcd.fillRect(0,0,DISP_W,3,COL_BLACK);
-      if(recDuration>=REC_LONG_PRESS_MS) toggleFaceDetect();
-      else startRecording();
-    }
-  }
-
-  // ── Saat recording ──────────────────────────────────────────────────────
+  // ── Saat recording — stop via BOOT button atau touch pojok kiri ──────────
   if(recActive) {
     if(digitalRead(BOOT_BTN_PIN)==LOW) {
       delay(40);
       if(digitalRead(BOOT_BTN_PIN)==LOW) {
         while(digitalRead(BOOT_BTN_PIN)==LOW) { delay(10); esp_task_wdt_reset(); }
-        stopRecording(); return;
-      }
-    }
-    if(digitalRead(REC_BTN_PIN)==LOW) {
-      delay(40);
-      if(digitalRead(REC_BTN_PIN)==LOW) {
-        while(digitalRead(REC_BTN_PIN)==LOW) { delay(10); esp_task_wdt_reset(); }
         stopRecording(); return;
       }
     }
@@ -1504,7 +1456,6 @@ void loop() {
     int32_t panLastX=tx,panLastY=ty;
     bool isPan=false;
 
-    // ── Pan tracking (photo view zoom>1×) ─────────────────────────────
     if(appMode==MODE_PHOTO_VIEW&&photoZoomLevel>0) {
       while(lcd.getTouch(&tx2,&ty2)) {
         int dx=tx2-panLastX, dy=ty2-panLastY;
@@ -1603,9 +1554,8 @@ void loop() {
 
     // ── MODE PHOTO VIEW ─────────────────────────────────────────────────
     else if(appMode==MODE_PHOTO_VIEW) {
-      if(isPan) return; // sudah dihandle saat drag
+      if(isPan) return;
 
-      // ── Long press (di mana saja) → delete ──────────────────────────
       if(touchDur>=LONG_TAP_PHOTO_MS) {
         photoViewClearCaption();
         bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
@@ -1616,7 +1566,6 @@ void loop() {
 
       unsigned long now=millis();
 
-      // ── Pojok kanan atas → back ke gallery ──────────────────────────
       if(pvZoneTopRight(tx,ty)) {
         photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
         photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
@@ -1625,11 +1574,9 @@ void loop() {
         return;
       }
 
-      // ── Pojok kiri atas → zoom cycle ────────────────────────────────
       if(pvZoneTopLeft(tx,ty)) {
         photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
         photoZoomOffX=0; photoZoomOffY=0;
-        // center zoom ke tengah layar
         if(photoZoomLevel>0) {
           float zf=photoZoomFactors[photoZoomLevel];
           int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
@@ -1645,14 +1592,11 @@ void loop() {
         return;
       }
 
-      // ── Pojok kiri bawah → compare ──────────────────────────────────
       if(pvZoneBotLeft(tx,ty)) {
-        // foto ini jadi slot A, kembali ke gallery pilih B
         compareIdxA=photoViewIndex;
         compareIdxB=-1;
         photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
         if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-        // masuk gallery compare select
         scanGalleryFiles();
         galleryCompareSelect=true;
         galleryCompareIdxA=compareIdxA;
@@ -1660,7 +1604,6 @@ void loop() {
         return;
       }
 
-      // ── Tap area tengah / kiri / kanan → navigasi (zoom=1× saja) ───
       if(photoZoomLevel==0) {
         if(now-lastTapMs>DEBOUNCE_MS) {
           lastTapMs=now;
@@ -1668,7 +1611,6 @@ void loop() {
           else             photoViewNext();
         }
       }
-      // zoom>1×: navigasi tidak aktif, hanya pan
     }
 
     // ── MODE COMPARE ────────────────────────────────────────────────────
@@ -1677,7 +1619,6 @@ void loop() {
         appMode=MODE_GALLERY; drawGallery();
         return;
       }
-      // tap kiri/kanan → kembali gallery untuk ganti foto slot
       appMode=MODE_GALLERY;
       galleryCompareSelect=false;
       drawGallery();
