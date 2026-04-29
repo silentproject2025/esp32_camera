@@ -93,7 +93,7 @@ public:
       auto cfg = _touch_instance.config();
       cfg.x_min = 75; cfg.x_max = 285;
       cfg.y_min = 44; cfg.y_max = 216;
-      cfg.pin_int = 3; cfg.bus_shared = true; cfg.offset_rotation = 0;
+      cfg.pin_int = 41; cfg.bus_shared = true; cfg.offset_rotation = 0;
       cfg.spi_host = SPI2_HOST; cfg.freq = 2500000;
       cfg.pin_sclk = 47; cfg.pin_mosi = 45;
       cfg.pin_miso = 42; cfg.pin_cs = 2;
@@ -132,7 +132,7 @@ static LGFX lcd;
 
 #define LED_PIN        48
 #define BOOT_BTN_PIN    0
-#define REC_BTN_PIN    41
+#define REC_BTN_PIN    -1
 
 #define DISP_W        320
 #define DISP_H        240
