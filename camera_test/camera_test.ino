@@ -1489,7 +1489,7 @@ void setup() {
   // ── Fix lampu GPIO 2 (CS touch XPT2046) ──────────────────────────────────
   // Dipasang PALING AKHIR agar tidak di-override oleh init LCD/touch di atas
   pinMode(2, OUTPUT);
-  digitalWrite(2, HIGH);
+  digitalWrite(2, LOW);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
