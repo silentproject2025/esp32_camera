@@ -207,16 +207,18 @@ AppMode appMode = MODE_VIEWFINDER;
 // ─────────────────────────────────────────────────────────────────────────────
 //  Gallery state
 // ─────────────────────────────────────────────────────────────────────────────
-#define GALLERY_MAX_FILES  200
+#define GALLERY_MAX_FILES  1000
 #define GALLERY_ITEMS_PAGE   8
 #define GALLERY_ITEM_H      26
 
-char galleryFiles[GALLERY_MAX_FILES][32];
-bool galleryIsVideo[GALLERY_MAX_FILES];
-int  galleryCount  = 0;
-int  galleryScroll = 0;
-char photoViewPath[48];
-int  photoViewIndex = 0;
+// galleryFiles & galleryIsVideo dialokasikan di PSRAM saat setup()
+// agar tidak overflow DRAM — max 1000 file x 32 byte = 32KB
+char (*galleryFiles)[32] = nullptr;
+bool* galleryIsVideo      = nullptr;
+int   galleryCount  = 0;
+int   galleryScroll = 0;
+char  photoViewPath[48];
+int   photoViewIndex = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo View state
@@ -1276,6 +1278,14 @@ bool initCamera() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.0 4-BTN ===");
+
+  // Alokasi gallery arrays di PSRAM agar tidak overflow DRAM
+  galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
+  galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
+  if(!galleryFiles || !galleryIsVideo) {
+    Serial.println("PSRAM alloc gallery failed! Reboot.");
+    ESP.restart();
+  }
 
   pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
   pinMode(BTN_BOOT, INPUT_PULLUP);
