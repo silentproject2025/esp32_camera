@@ -211,8 +211,6 @@ AppMode appMode = MODE_VIEWFINDER;
 #define GALLERY_ITEMS_PAGE   8
 #define GALLERY_ITEM_H      26
 
-// galleryFiles & galleryIsVideo dialokasikan di PSRAM saat setup()
-// agar tidak overflow DRAM — max 1000 file x 32 byte = 32KB
 char (*galleryFiles)[32] = nullptr;
 bool* galleryIsVideo      = nullptr;
 int   galleryCount  = 0;
@@ -248,22 +246,20 @@ bool faceDetectMode  = false;
 int  faceDetectCount = 0;
 
 // ─── Exposure Preset ────────────────────────────────────────────────────────
-// 0=AUTO  1=MOON  2=NIGHT  3=MANUAL
 uint8_t expPreset     = 0;
-int     expManualVal  = 300;   // aec_value saat MANUAL (0-1200)
-int     expManualGain = 0;     // agc_gain saat MANUAL (0-30)
+int     expManualVal  = 300;
+int     expManualGain = 0;
 
 const char* expPresetNames[4] = { "AUTO", "MOON", "NIGHT", "MANUAL" };
-// Struct preset: aec_on, aec2_on, aec_val, agc_on, agc_gain, gainceiling, ae_level
 struct ExpPresetCfg {
   bool aec_on; bool aec2_on; int aec_val;
   bool agc_on; int agc_gain; int gainceiling; int ae_level;
 };
 const ExpPresetCfg expPresets[4] = {
-  { true,  true,  300, true,  0,  2,  0 },  // AUTO
-  { false, false, 40,  false, 0,  0, -2 },  // MOON
-  { false, true,  800, false, 5,  4,  1 },  // NIGHT
-  { false, false, 300, false, 0,  0,  0 },  // MANUAL (val dari expManualVal)
+  { true,  true,  300, true,  0,  2,  0 },
+  { false, false, 40,  false, 0,  0, -2 },
+  { false, true,  800, false, 5,  4,  1 },
+  { false, false, 300, false, 0,  0,  0 },
 };
 
 USBMSC msc;
@@ -366,8 +362,7 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Button helper — baca 1 tombol, return durasi tekan (ms), 0 = tidak ditekan
-//  Blokir sampai tombol dilepas. Minimal tekan DEBOUNCE_MS agar valid.
+//  Button helper
 // ─────────────────────────────────────────────────────────────────────────────
 unsigned long readButtonDuration(uint8_t pin) {
   if (digitalRead(pin) != LOW) return 0;
@@ -377,7 +372,6 @@ unsigned long readButtonDuration(uint8_t pin) {
   return (dur >= DEBOUNCE_MS) ? dur : 0;
 }
 
-// Cek apakah tombol ditekan tanpa blokir (untuk polling di loop REC)
 bool btnPressed(uint8_t pin) { return digitalRead(pin) == LOW; }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -550,10 +544,6 @@ void drawGallery() {
     lcd.setTextColor(COL_GRAY_3); lcd.drawString(">",DISP_W-12,rowY+8);
   }
 
-  // Cursor indicator — highlight item yang sedang di-select (galleryScroll = baris pertama)
-  // Tanda ">" sudah cukup, tapi kita tambah highlight baris aktif (scroll position)
-  // agar user tahu tombol BOOT akan buka item mana
-  int selRow = galleryScroll; // item pertama yg terlihat = yg akan di-buka BOOT
   int selY = 24;
   lcd.drawRect(0, selY, DISP_W-4, GALLERY_ITEM_H-1, COL_GRAY_5);
 
@@ -566,16 +556,13 @@ void drawGallery() {
   }
 }
 
-// Gambar ulang highlight gallery tanpa full redraw
 void galleryUpdateHighlight(int oldSel, int newSel) {
-  // Hapus highlight lama
   int oldRow = oldSel - galleryScroll;
   if(oldRow>=0 && oldRow<GALLERY_ITEMS_PAGE) {
     int y = 24 + oldRow*GALLERY_ITEM_H;
     lcd.drawRect(0, y, DISP_W-4, GALLERY_ITEM_H-1,
                  (oldSel%2==0)?COL_GRAY_D:COL_BLACK);
   }
-  // Gambar highlight baru
   int newRow = newSel - galleryScroll;
   if(newRow>=0 && newRow<GALLERY_ITEMS_PAGE) {
     int y = 24 + newRow*GALLERY_ITEM_H;
@@ -583,10 +570,7 @@ void galleryUpdateHighlight(int oldSel, int newSel) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Gallery selected index (baris yg di-highlight, bisa berbeda dari galleryScroll)
-// ─────────────────────────────────────────────────────────────────────────────
-int gallerySelIdx = 0;  // index item yang di-highlight
+int gallerySelIdx = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo pixel buffer
@@ -657,7 +641,6 @@ void photoViewRender() {
     char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f\xd7",(double)zf);
     drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
   }
-  // hint tombol di pojok
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_3);
   lcd.drawString("B=zoom",2,2);
@@ -702,7 +685,7 @@ void photoViewClearCaption() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Delete dialog — konfirmasi via BTN_BOOT (yes) atau BTN_B/BTN_C/BTN_D (no)
+//  Delete dialog
 // ─────────────────────────────────────────────────────────────────────────────
 bool photoViewDeleteDialog(const char* filename) {
   int dw=200,dh=80;
@@ -1183,10 +1166,7 @@ void applyExpPreset(uint8_t preset) {
   s->set_ae_level(s, c.ae_level);
 }
 
-// Menu pilih preset — muncul overlay di layar
-// Navigasi C/D, konfirmasi BOOT, batal B
 void showExpMenu() {
-  // Overlay background
   int mw=220, mh=130;
   int mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
@@ -1227,12 +1207,12 @@ void showExpMenu() {
   while(!done && !cancelled) {
     if(btnPressed(BTN_C)) {
       while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
-      sel = (sel + 3) % 4;  // naik
+      sel = (sel + 3) % 4;
       redrawItems();
     }
     if(btnPressed(BTN_D)) {
       while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
-      sel = (sel + 1) % 4;  // turun
+      sel = (sel + 1) % 4;
       redrawItems();
     }
     if(btnPressed(BTN_BOOT)) {
@@ -1248,43 +1228,30 @@ void showExpMenu() {
 
   if(done) {
     applyExpPreset((uint8_t)sel);
-    // Kalau MANUAL, langsung masuk adjust mode dengan live viewfinder
     if(sel == 3) {
       bool adjDone = false;
-
-      // Helper: gambar overlay EXP/GAIN di bagian bawah layar (tidak tutup viewfinder)
       auto drawAdjOverlay = [&]() {
         int oh = 38;
         int oy = DISP_H - oh;
-        // Background bar bawah semi-transparan
         lcd.fillRect(0, oy, DISP_W, oh, COL_GRAY_D);
         lcd.drawFastHLine(0, oy, DISP_W, COL_GRAY_5);
-
-        // Label EXP dan GAIN
         lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
         lcd.setTextColor(COL_GRAY_E);
         char buf[32];
         snprintf(buf, sizeof(buf), "EXP  %4d", expManualVal);
         lcd.drawString(buf, 8, oy+4);
-
         snprintf(buf, sizeof(buf), "GAIN %2d", expManualGain);
         lcd.drawString(buf, DISP_W-56, oy+4);
-
-        // Bar EXP
         int barX = 8, barY = oy+18, barW = DISP_W-70, barH = 7;
         lcd.fillRect(barX, barY, barW, barH, COL_GRAY_3);
         int filled = map(expManualVal, 0, 1200, 0, barW);
         lcd.fillRect(barX, barY, filled, barH, COL_GRAY_C);
         lcd.drawRect(barX, barY, barW, barH, COL_GRAY_5);
-
-        // Bar GAIN
         int gbarX = DISP_W-56, gbarY = oy+18, gbarW = 48, gbarH = 7;
         lcd.fillRect(gbarX, gbarY, gbarW, gbarH, COL_GRAY_3);
         int gfilled = map(expManualGain, 0, 30, 0, gbarW);
         lcd.fillRect(gbarX, gbarY, gfilled, gbarH, COL_GRAY_7);
         lcd.drawRect(gbarX, gbarY, gbarW, gbarH, COL_GRAY_5);
-
-        // Hint tombol di tengah bawah
         lcd.setTextColor(COL_GRAY_5);
         const char* hint = "C=exp-  D=exp+  B=gain+  BOOT=ok";
         int hw = lcd.textWidth(hint);
@@ -1292,25 +1259,18 @@ void showExpMenu() {
       };
 
       while(!adjDone) {
-        // Render viewfinder dulu (tanpa pill/HUD bawaan)
         camera_fb_t *fb = esp_camera_fb_get();
         if(fb) {
           if(fb->format==PIXFORMAT_RGB565 && fb->width==DISP_W && fb->height==DISP_H) {
-            // Push frame tapi hanya bagian atas (sisakan bawah untuk overlay)
             int visH = DISP_H - 38;
             for(int row=0; row<visH; row++) {
-              lcd.pushImage(0, row, DISP_W, 1,
-                (uint16_t*)fb->buf + row * DISP_W);
+              lcd.pushImage(0, row, DISP_W, 1, (uint16_t*)fb->buf + row * DISP_W);
             }
           }
           esp_camera_fb_return(fb);
         }
-
-        // Gambar overlay di atas frame
         drawAdjOverlay();
-
         esp_task_wdt_reset();
-
         bool changed = false;
         if(btnPressed(BTN_C)) {
           while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
@@ -1323,7 +1283,7 @@ void showExpMenu() {
         if(btnPressed(BTN_B)) {
           while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
           expManualGain = constrain(expManualGain + 1, 0, 30);
-          if(expManualGain > 30) expManualGain = 0; // wrap
+          if(expManualGain > 30) expManualGain = 0;
           changed = true;
         }
         if(btnPressed(BTN_BOOT)) {
@@ -1333,7 +1293,6 @@ void showExpMenu() {
         if(changed) applyExpPreset(3);
       }
     }
-    // Feedback
     char fbBuf[24];
     snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[expPreset]);
     int fw = lcd.textWidth(fbBuf), fp = fw+14, fpx = (DISP_W-fp)/2;
@@ -1353,7 +1312,6 @@ void renderViewfinder() {
     char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
     drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
     drawPill(DISP_W-35,10,sensorName,COL_PILL_BG,COL_GRAY_A);
-    // Pill exposure mode (hanya kalau bukan AUTO)
     if(expPreset > 0) {
       char expBuf[12];
       if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
@@ -1482,7 +1440,6 @@ void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.0 4-BTN ===");
 
-  // Alokasi gallery arrays di PSRAM agar tidak overflow DRAM
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
   if(!galleryFiles || !galleryIsVideo) {
@@ -1499,9 +1456,7 @@ void setup() {
   setCpuFrequencyMhz(240);
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
-  
-  pinMode(2, OUTPUT);
-digitalWrite(2, HIGH);
+
   // Touch tidak dikalibrasi / tidak digunakan — tetap init agar tidak error bus
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
@@ -1530,6 +1485,11 @@ digitalWrite(2, HIGH);
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis(); fpsFrameCount=0;
   blinkLED(3,120,120);
+
+  // ── Fix lampu GPIO 2 (CS touch XPT2046) ──────────────────────────────────
+  // Dipasang PALING AKHIR agar tidak di-override oleh init LCD/touch di atas
+  pinMode(2, OUTPUT);
+  digitalWrite(2, HIGH);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1568,8 +1528,6 @@ void loop() {
 
   // ─────────────────────────────────────────────────────────────────────────
   //  Baca semua tombol (non-blocking scan)
-  //  PENTING: pakai int & -1 sebagai sentinel, bukan 0,
-  //           karena BTN_BOOT = pin 0 sehingga uint8_t=0 ambigu!
   // ─────────────────────────────────────────────────────────────────────────
   int pressedPin = -1;
   if      (btnPressed(BTN_BOOT)) pressedPin = BTN_BOOT;
@@ -1578,24 +1536,20 @@ void loop() {
   else if (btnPressed(BTN_D))    pressedPin = BTN_D;
 
   if(pressedPin == -1) {
-    // Tidak ada tombol — render viewfinder atau mjpeg
     if(appMode==MODE_VIEWFINDER) renderViewfinder();
     else if(appMode==MODE_MJPEG_PLAYER) loopMjpegPlayer();
     return;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  GALLERY C/D: handle langsung di sini SEBELUM tunggu lepas,
-  //  supaya auto-scroll bisa deteksi tahan tombol dengan benar
+  //  GALLERY C/D: auto-scroll dengan akselerasi
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_GALLERY && (pressedPin==BTN_C || pressedPin==BTN_D)) {
     int dir = (pressedPin==BTN_C) ? -1 : 1;
 
-    // Helper gerak sel
     auto galleryStep = [&](int delta) {
       if(galleryCount<=0) return;
       int oldSel = gallerySelIdx;
-      // Wrap-around: dari atas ke file terakhir, dari bawah ke file pertama
       gallerySelIdx = (gallerySelIdx + delta % galleryCount + galleryCount) % galleryCount;
       if(gallerySelIdx == oldSel) return;
       bool needRedraw = false;
@@ -1608,25 +1562,22 @@ void loop() {
       else galleryUpdateHighlight(oldSel, gallerySelIdx);
     };
 
-    // Debounce awal
     delay(DEBOUNCE_MS);
     if(!btnPressed((uint8_t)pressedPin)) {
-      // Sudah lepas saat debounce = short press → gerak 1 item
       galleryStep(dir);
       return;
     }
 
-    // Masih ditekan → mulai hitung tahan
-    galleryStep(dir); // gerak pertama
+    galleryStep(dir);
     unsigned long holdStart = millis();
     unsigned long lastStep  = millis();
 
     while(btnPressed((uint8_t)pressedPin) && appMode==MODE_GALLERY) {
       unsigned long held = millis() - holdStart;
       unsigned long interval;
-      if      (held < 500)  interval = 200;   // lambat
-      else if (held < 1500) interval = 100;   // sedang
-      else                  interval = 50;    // cepat
+      if      (held < 500)  interval = 200;
+      else if (held < 1500) interval = 100;
+      else                  interval = 50;
 
       if(millis() - lastStep >= interval) {
         galleryStep(dir);
@@ -1635,17 +1586,14 @@ void loop() {
       delay(5);
       esp_task_wdt_reset();
     }
-
-    // Cek apakah ini long press (tahan >= LONG_PRESS_MS tanpa auto-scroll triggered)
-    // Long press = loncat 1 halaman — sudah ter-handle via auto-scroll di atas
     return;
   }
 
-  // Tunggu dilepas & ukur durasi (untuk semua tombol lain)
+  // Tunggu dilepas & ukur durasi
   unsigned long t0=millis();
   while(btnPressed((uint8_t)pressedPin)) { delay(5); esp_task_wdt_reset(); }
   unsigned long dur=millis()-t0;
-  if(dur<DEBOUNCE_MS) return; // noise
+  if(dur<DEBOUNCE_MS) return;
 
   bool isLong  = (dur >= LONG_PRESS_MS);
   bool isShort = !isLong;
@@ -1662,7 +1610,6 @@ void loop() {
       }
     }
     else if(pressedPin==BTN_B) {
-      // short: toggle REC
       if(isShort) {
         if(recActive) stopRecording(); else startRecording();
       }
@@ -1671,8 +1618,6 @@ void loop() {
       if(isLong) {
         toggleFaceDetect();
       } else {
-        // short press: buka gallery
-        // (long press >= 1.5s = toggle face detect)
         if(sdReady) {
           scanGalleryFiles();
           gallerySelIdx=0; galleryScroll=0;
@@ -1682,30 +1627,18 @@ void loop() {
     }
     else if(pressedPin==BTN_D) {
       if(isShort) {
-        // Short: toggle face detect
         toggleFaceDetect();
       } else {
-        // Long: buka menu exposure
         showExpMenu();
       }
     }
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
   //  MODE_GALLERY
-  //
-  //  BOOT short → buka item highlight
-  //  B short    → kembali ke viewfinder
-  //  C/D short  → gerak 1 item
-  //  C/D long   → loncat 1 halaman (page up/down)
-  //  C/D tahan  → auto-scroll akselerasi:
-  //               0-500ms    → 200ms/step (lambat)
-  //               500-1500ms → 100ms/step (sedang)
-  //               >1500ms    →  50ms/step (cepat)
-  // ─────────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_GALLERY) {
-
     if(pressedPin==BTN_BOOT && isShort) {
       if(galleryCount>0 && gallerySelIdx>=0 && gallerySelIdx<galleryCount) {
         if(galleryIsVideo[gallerySelIdx]) {
@@ -1724,14 +1657,11 @@ void loop() {
     return;
   }
 
-
   // ─────────────────────────────────────────────────────────────────────────
   //  MODE_PHOTO_VIEW
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_PHOTO_VIEW) {
-
     if(pressedPin==BTN_BOOT && isShort) {
-      // Kembali ke gallery
       photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
       photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
       if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
@@ -1741,13 +1671,11 @@ void loop() {
 
     if(pressedPin==BTN_B) {
       if(isLong) {
-        // Delete dengan konfirmasi
         photoViewClearCaption();
         bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
         if(doDelete) photoViewDeleteCurrent();
         else showPhotoView(photoViewIndex);
       } else {
-        // Cycle zoom: 1x→2x→4x→1x
         photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
         photoZoomOffX=0; photoZoomOffY=0;
         if(photoZoomLevel>0) {
@@ -1766,25 +1694,21 @@ void loop() {
       return;
     }
 
-    // ── C dan D: konteks zoom ──────────────────────────────────────────────
     if(photoZoomLevel==0) {
-      // Tidak zoom → PREV / NEXT foto
       if(pressedPin==BTN_C && isShort) photoViewPrev();
       if(pressedPin==BTN_D && isShort) photoViewNext();
     } else {
-      // Zoom aktif → Pan
       float zf=photoZoomFactors[photoZoomLevel];
       int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
       int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
       bool moved=false;
-
       if(pressedPin==BTN_C) {
-        if(isShort) { photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX); moved=true; } // pan kiri
-        else        { photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY); moved=true; } // pan atas
+        if(isShort) { photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX); moved=true; }
+        else        { photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY); moved=true; }
       }
       if(pressedPin==BTN_D) {
-        if(isShort) { photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX); moved=true; } // pan kanan
-        else        { photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY); moved=true; } // pan bawah
+        if(isShort) { photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX); moved=true; }
+        else        { photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY); moved=true; }
       }
       if(moved) photoViewRender();
     }
