@@ -1420,12 +1420,37 @@ void loop() {
     return;
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────────────
   //  MODE_GALLERY
-  // ─────────────────────────────────────────────────────────────────────────
+  //
+  //  BOOT short → buka item highlight
+  //  B short    → kembali ke viewfinder
+  //  C/D short  → gerak 1 item
+  //  C/D long   → loncat 1 halaman (page up/down)
+  //  C/D tahan  → auto-scroll akselerasi:
+  //               0-500ms    → 200ms/step (lambat)
+  //               500-1500ms → 100ms/step (sedang)
+  //               >1500ms    →  50ms/step (cepat)
+  // ─────────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_GALLERY) {
+
+    // Helper: gerak sel 1 langkah & update display
+    auto galleryStep = [&](int delta) {
+      if(galleryCount<=0) return;
+      int oldSel = gallerySelIdx;
+      gallerySelIdx = constrain(gallerySelIdx + delta, 0, galleryCount-1);
+      if(gallerySelIdx == oldSel) return;
+      bool needRedraw = false;
+      if(gallerySelIdx < galleryScroll) {
+        galleryScroll = gallerySelIdx; needRedraw = true;
+      } else if(gallerySelIdx >= galleryScroll + GALLERY_ITEMS_PAGE) {
+        galleryScroll = gallerySelIdx - GALLERY_ITEMS_PAGE + 1; needRedraw = true;
+      }
+      if(needRedraw) drawGallery();
+      else galleryUpdateHighlight(oldSel, gallerySelIdx);
+    };
+
     if(pressedPin==BTN_BOOT && isShort) {
-      // Buka item yang sedang di-highlight
       if(galleryCount>0 && gallerySelIdx>=0 && gallerySelIdx<galleryCount) {
         if(galleryIsVideo[gallerySelIdx]) {
           openMjpegPlayer(galleryFiles[gallerySelIdx]);
@@ -1436,39 +1461,39 @@ void loop() {
       }
     }
     else if(pressedPin==BTN_B && isShort) {
-      // Kembali ke viewfinder
       if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
       appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
       fpsLastTime=millis(); fpsFrameCount=0;
     }
-    else if(pressedPin==BTN_C && isShort) {
-      // Scroll / navigasi UP (index berkurang)
-      if(galleryCount>0) {
-        int oldSel=gallerySelIdx;
-        gallerySelIdx=max(0,gallerySelIdx-1);
-        if(gallerySelIdx<galleryScroll) {
-          galleryScroll=gallerySelIdx;
-          drawGallery();
-        } else {
-          galleryUpdateHighlight(oldSel,gallerySelIdx);
-        }
-      }
-    }
-    else if(pressedPin==BTN_D && isShort) {
-      // Scroll / navigasi DOWN (index bertambah)
-      if(galleryCount>0) {
-        int oldSel=gallerySelIdx;
-        gallerySelIdx=min(galleryCount-1,gallerySelIdx+1);
-        if(gallerySelIdx>=galleryScroll+GALLERY_ITEMS_PAGE) {
-          galleryScroll=gallerySelIdx-GALLERY_ITEMS_PAGE+1;
-          drawGallery();
-        } else {
-          galleryUpdateHighlight(oldSel,gallerySelIdx);
+    else if(pressedPin==BTN_C || pressedPin==BTN_D) {
+      int dir = (pressedPin==BTN_C) ? -1 : 1;
+
+      if(isLong) {
+        // Long press: loncat 1 halaman
+        galleryStep(dir * GALLERY_ITEMS_PAGE);
+      } else {
+        // Short press: gerak 1 item, lalu auto-scroll kalau masih ditekan
+        galleryStep(dir);
+        unsigned long holdStart = millis();
+        unsigned long lastStep  = millis();
+        while(btnPressed((uint8_t)pressedPin) && appMode==MODE_GALLERY) {
+          unsigned long held = millis() - holdStart;
+          unsigned long interval;
+          if      (held < 500)  interval = 200;
+          else if (held < 1500) interval = 100;
+          else                  interval = 50;
+          if(millis() - lastStep >= interval) {
+            galleryStep(dir);
+            lastStep = millis();
+          }
+          delay(5);
+          esp_task_wdt_reset();
         }
       }
     }
     return;
   }
+
 
   // ─────────────────────────────────────────────────────────────────────────
   //  MODE_PHOTO_VIEW
