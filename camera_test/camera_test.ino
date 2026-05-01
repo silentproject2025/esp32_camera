@@ -1499,6 +1499,9 @@ void setup() {
   setCpuFrequencyMhz(240);
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
+  
+  pinMode(2, OUTPUT);
+digitalWrite(2, HIGH);
   // Touch tidak dikalibrasi / tidak digunakan — tetap init agar tidak error bus
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
