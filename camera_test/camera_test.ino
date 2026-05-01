@@ -387,16 +387,29 @@ unsigned long readButtonDuration(uint8_t pin) {
   return (dur >= DEBOUNCE_MS) ? dur : 0;
 }
 
-bool btnPressed(uint8_t pin) { return digitalRead(pin) == LOW; }
+bool btnPressed(uint8_t pin) {
+  if(digitalRead(pin) == HIGH) return false;
+  delay(10);
+  return digitalRead(pin) == LOW;
+}
 
-// Tunggu semua tombol dilepas — dipakai sebelum masuk menu
-void waitAllBtnRelease() {
-  while (btnPressed(BTN_BOOT) || btnPressed(BTN_B) ||
-         btnPressed(BTN_C)    || btnPressed(BTN_D)) {
+void waitBtnRelease(uint8_t pin) {
+  unsigned long start = millis();
+  while (btnPressed(pin) && (millis() - start < 2000)) {
     delay(10);
     esp_task_wdt_reset();
   }
-  delay(150); // debounce lebih panjang agar bounce benar-benar hilang
+}
+
+void waitAllBtnRelease() {
+  unsigned long start = millis();
+  while ((btnPressed(BTN_BOOT) || btnPressed(BTN_B) ||
+          btnPressed(BTN_C)    || btnPressed(BTN_D)) &&
+         (millis() - start < 500)) {
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  delay(100);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -739,11 +752,11 @@ bool photoViewDeleteDialog(const char* filename) {
   unsigned long waitStart=millis();
   while(millis()-waitStart<8000) {
     if(btnPressed(BTN_BOOT)) {
-      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_BOOT);
       return true;
     }
     if(btnPressed(BTN_B)||btnPressed(BTN_C)||btnPressed(BTN_D)) {
-      while(btnPressed(BTN_B)||btnPressed(BTN_C)||btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+      waitAllBtnRelease();
       return false;
     }
     delay(10); esp_task_wdt_reset();
@@ -1225,24 +1238,24 @@ void showLedMenu() {
 
     if(btnPressed(BTN_C)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_C);
       sel = (sel == 0) ? 1 : 0;  // toggle naik
       redraw();
     }
     if(btnPressed(BTN_D)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_D);
       sel = (sel == 0) ? 1 : 0;  // toggle turun
       redraw();
     }
     if(btnPressed(BTN_BOOT)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_BOOT);
       done = true;
     }
     if(btnPressed(BTN_B)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_B);
       cancelled = true;
     }
     delay(10);
@@ -1331,24 +1344,24 @@ void showExpMenu() {
 
     if(btnPressed(BTN_C)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_C);
       sel = (sel + 3) % 4;  // naik
       redrawItems();
     }
     if(btnPressed(BTN_D)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_D);
       sel = (sel + 1) % 4;  // turun
       redrawItems();
     }
     if(btnPressed(BTN_BOOT)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_BOOT);
       done = true;
     }
     if(btnPressed(BTN_B)) {
       delay(DEBOUNCE_MS);
-      while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+      waitBtnRelease(BTN_B);
       cancelled = true;
     }
     delay(10);
@@ -1402,24 +1415,24 @@ void showExpMenu() {
         bool changed = false;
         if(btnPressed(BTN_C)) {
           delay(DEBOUNCE_MS);
-          while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
+          waitBtnRelease(BTN_C);
           expManualVal = constrain(expManualVal - 50, 0, 1200); changed = true;
         }
         if(btnPressed(BTN_D)) {
           delay(DEBOUNCE_MS);
-          while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+          waitBtnRelease(BTN_D);
           expManualVal = constrain(expManualVal + 50, 0, 1200); changed = true;
         }
         if(btnPressed(BTN_B)) {
           delay(DEBOUNCE_MS);
-          while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+          waitBtnRelease(BTN_B);
           expManualGain = constrain(expManualGain + 1, 0, 30);
           if(expManualGain > 30) expManualGain = 0;
           changed = true;
         }
         if(btnPressed(BTN_BOOT)) {
           delay(DEBOUNCE_MS);
-          while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+          waitBtnRelease(BTN_BOOT);
           adjDone = true;
         }
         if(changed) applyExpPreset(3);
@@ -1504,12 +1517,19 @@ void showSavedFeedback(bool saved) {
 }
 
 void captureAndPreview() {
-  if(ledFlashEnabled) digitalWrite(LED_PIN, HIGH);
+  if(ledFlashEnabled) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(150); // Tunggu LED stabil & sensor adjust
+    // Buang 2 frame lama agar dapat frame yang terang
+    for(int i=0; i<2; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if(tfb) esp_camera_fb_return(tfb);
+    }
+  }
 
   camera_fb_t *fb=esp_camera_fb_get();
 
   if(ledFlashEnabled) digitalWrite(LED_PIN, LOW);
-
   if(!fb) { blinkLED(5,50,50); return; }
 
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
@@ -1676,7 +1696,7 @@ void loop() {
     if(btnPressed(BTN_B)) {
       delay(40);
       if(btnPressed(BTN_B)) {
-        while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+        waitBtnRelease(BTN_B);
         stopRecording(); return;
       }
     }
@@ -1729,7 +1749,7 @@ void loop() {
     unsigned long holdStart = millis();
     unsigned long lastStep  = millis();
 
-    while(btnPressed((uint8_t)pressedPin) && appMode==MODE_GALLERY) {
+    while(btnPressed((uint8_t)pressedPin) && appMode==MODE_GALLERY && (millis() - holdStart < 10000)) {
       unsigned long held = millis() - holdStart;
       unsigned long interval;
       if      (held < 500)  interval = 200;
@@ -1748,7 +1768,7 @@ void loop() {
 
   // Tunggu dilepas & ukur durasi
   unsigned long t0=millis();
-  while(btnPressed((uint8_t)pressedPin)) { delay(5); esp_task_wdt_reset(); }
+  waitBtnRelease((uint8_t)pressedPin);
   unsigned long dur=millis()-t0;
   if(dur<DEBOUNCE_MS) return;
 
