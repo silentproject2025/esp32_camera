@@ -388,31 +388,29 @@ unsigned long readButtonDuration(uint8_t pin) {
 }
 
 bool btnPressed(uint8_t pin) {
-  if(digitalRead(pin) == HIGH) return false;
-  delay(10);
+  if (digitalRead(pin) == HIGH) return false;
+  delay(20);
   return digitalRead(pin) == LOW;
 }
 
 void waitBtnRelease(uint8_t pin) {
-  unsigned long start = millis();
-  while (btnPressed(pin) && (millis() - start < 2000)) {
+  uint32_t t0 = millis();
+  while (digitalRead(pin) == LOW && (millis() - t0 < 1000)) {
     delay(10);
     esp_task_wdt_reset();
   }
 }
 
 void waitAllBtnRelease() {
-  unsigned long start = millis();
-  while ((btnPressed(BTN_BOOT) || btnPressed(BTN_B) ||
-          btnPressed(BTN_C)    || btnPressed(BTN_D)) &&
-         (millis() - start < 500)) {
+  uint32_t t0 = millis();
+  while ((digitalRead(BTN_BOOT) == LOW || digitalRead(BTN_B) == LOW ||
+          digitalRead(BTN_C) == LOW    || digitalRead(BTN_D) == LOW) &&
+         (millis() - t0 < 1000)) {
     delay(10);
     esp_task_wdt_reset();
   }
-  delay(100);
+  delay(50);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  Helper: corner brackets
 // ─────────────────────────────────────────────────────────────────────────────
 void drawCornerBrackets(uint16_t col = COL_WHITE) {
@@ -1519,16 +1517,14 @@ void showSavedFeedback(bool saved) {
 void captureAndPreview() {
   if(ledFlashEnabled) {
     digitalWrite(LED_PIN, HIGH);
-    delay(150); // Tunggu LED stabil & sensor adjust
-    // Buang 2 frame lama agar dapat frame yang terang
-    for(int i=0; i<2; i++) {
+    delay(500); // Allow sensor to adjust to bright light
+    for(int i=0; i<6; i++) {
       camera_fb_t *tfb = esp_camera_fb_get();
       if(tfb) esp_camera_fb_return(tfb);
+      delay(10);
     }
   }
-
-  camera_fb_t *fb=esp_camera_fb_get();
-
+  camera_fb_t *fb = esp_camera_fb_get();
   if(ledFlashEnabled) digitalWrite(LED_PIN, LOW);
   if(!fb) { blinkLED(5,50,50); return; }
 
@@ -1749,7 +1745,7 @@ void loop() {
     unsigned long holdStart = millis();
     unsigned long lastStep  = millis();
 
-    while(btnPressed((uint8_t)pressedPin) && appMode==MODE_GALLERY && (millis() - holdStart < 10000)) {
+    while(digitalRead((uint8_t)pressedPin) == LOW && appMode==MODE_GALLERY && (millis() - holdStart < 10000)) {
       unsigned long held = millis() - holdStart;
       unsigned long interval;
       if      (held < 500)  interval = 200;
