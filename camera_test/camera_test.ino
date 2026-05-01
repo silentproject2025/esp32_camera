@@ -1,24 +1,27 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v5.0
+ * Version: v5.1
  *
- * PATCH v5.0 (dari v4.9c):
- *  - HAPUS semua touch handling — diganti 4 tombol fisik
- *  - HAPUS fitur Compare sepenuhnya
- *  - BTN_BOOT (pin 0)  : Capture / Konfirmasi / Exit USB
- *  - BTN_B    (pin 41) : REC toggle / Aksi sekunder / Zoom / Delete
- *  - BTN_C    (pin 3)  : Gallery/Back / Nav KIRI / PREV foto / Pan KIRI atau ATAS
- *  - BTN_D    (pin 46) : Next / Nav KANAN / NEXT foto / Pan KANAN atau BAWAH
+ * PATCH v5.1 (dari v5.0):
+ *  - FIX: debounce saat masuk showExpMenu() — tombol D longpress tidak lagi
+ *         langsung skip pilihan
+ *  - FIX: debounce saat masuk showLedMenu()
+ *  - BARU: BTN_B longpress di MODE_VIEWFINDER → menu LED Flash ON/OFF
+ *          LED ON  = flash menyala saat capture
+ *          LED OFF = tidak ada flash saat capture
+ *  - HAPUS: baris pinMode(2)/digitalWrite(2) yang tidak berguna
  *
- *  LOGIC SHORT/LONG PRESS per mode:
+ * LOGIC SHORT/LONG PRESS per mode:
  *
  *  [MODE_VIEWFINDER]
  *    BOOT short  → Capture foto
  *    BOOT long   → Masuk USB Mode
  *    B short     → Start/Stop REC
+ *    B long      → Menu LED Flash ON/OFF   ← BARU
  *    C short     → Buka Gallery
  *    C long      → Toggle Face Detect
- *    D short     → (reserved / tidak dipakai)
+ *    D short     → Toggle Face Detect
+ *    D long      → Menu Exposure
  *
  *  [MODE_GALLERY]
  *    BOOT short  → Buka item (foto/video)
@@ -50,7 +53,6 @@
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
- * TOUCH: XPT2046 tetap terpasang di kode tapi tidak digunakan (pin_int=-1)
  */
 
 #include "esp_camera.h"
@@ -154,18 +156,15 @@ static LGFX lcd;
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pin Tombol
 // ─────────────────────────────────────────────────────────────────────────────
-#define BTN_BOOT  0   // Capture / Konfirmasi / Exit USB
-#define BTN_B    41   // REC / Zoom / Delete / Play-Pause
-#define BTN_C     3   // Gallery / Back / PREV / Pan kiri/atas
-#define BTN_D    46   // Next / Pan kanan/bawah / Speed
+#define BTN_BOOT  0
+#define BTN_B    41
+#define BTN_C     3
+#define BTN_D    46
 
 #define DEBOUNCE_MS      50
-#define LONG_PRESS_MS  1500   // threshold long press semua tombol
-#define SHORT_MAX_MS   1499   // < ini = short press
+#define LONG_PRESS_MS  1500
+#define SHORT_MAX_MS   1499
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Pan step per keypress (pixel di koordinat sumber sebelum zoom)
-// ─────────────────────────────────────────────────────────────────────────────
 #define PAN_STEP 20
 
 #define DISP_W  320
@@ -203,6 +202,11 @@ enum AppMode {
   MODE_MJPEG_PLAYER
 };
 AppMode appMode = MODE_VIEWFINDER;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  LED Flash state  ← BARU
+// ─────────────────────────────────────────────────────────────────────────────
+bool ledFlashEnabled = true; // default: flash aktif saat capture
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Gallery state
@@ -373,6 +377,16 @@ unsigned long readButtonDuration(uint8_t pin) {
 }
 
 bool btnPressed(uint8_t pin) { return digitalRead(pin) == LOW; }
+
+// Tunggu semua tombol dilepas — dipakai sebelum masuk menu
+void waitAllBtnRelease() {
+  while (btnPressed(BTN_BOOT) || btnPressed(BTN_B) ||
+         btnPressed(BTN_C)    || btnPressed(BTN_D)) {
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  delay(50); // debounce tambahan
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helper: corner brackets
@@ -989,7 +1003,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.0  4-BTN edition",DISP_W/2-60,103);
+  lcd.drawString("v5.1  4-BTN edition",DISP_W/2-60,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1039,7 +1053,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw=lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE",(DISP_W-lw)/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.0",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.1",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw=lcd.textWidth("SD CONNECTED");
@@ -1148,7 +1162,106 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Viewfinder
+//  Menu LED Flash  ← BARU
+// ─────────────────────────────────────────────────────────────────────────────
+void showLedMenu() {
+  waitAllBtnRelease();
+
+  int mw = 200, mh = 90;
+  int mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int sel = ledFlashEnabled ? 0 : 1; // 0=ON, 1=OFF
+  bool done = false, cancelled = false;
+
+  const char* opts[2] = {
+    "[*] LED ON   - flash saat capture",
+    "[ ] LED OFF  - tanpa flash"
+  };
+  // buat label dinamis berdasarkan state
+  auto getLabel = [&](int i) -> const char* {
+    if(i == 0) return ledFlashEnabled
+      ? "[*] LED ON   - flash saat capture"
+      : "[ ] LED ON   - flash saat capture";
+    else return ledFlashEnabled
+      ? "[ ] LED OFF  - tanpa flash"
+      : "[*] LED OFF  - tanpa flash";
+  };
+
+  auto redraw = [&]() {
+    lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
+    lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
+    lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+    lcd.setTextColor(COL_GRAY_E);
+    const char* title = "LED FLASH";
+    int tw = lcd.textWidth(title);
+    lcd.drawString(title, mx + (mw - tw) / 2, my + 7);
+    lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
+
+    for(int i = 0; i < 2; i++) {
+      int iy = my + 24 + i * 24;
+      bool isChecked = (i == 0) ? ledFlashEnabled : !ledFlashEnabled;
+      bool isHighlight = (i == sel);
+      uint16_t bg = isHighlight ? COL_GRAY_5 : COL_GRAY_D;
+      lcd.fillRect(mx + 8, iy, mw - 16, 18, bg);
+      lcd.setFont(&fonts::Font0);
+      lcd.setTextColor(isHighlight ? COL_WHITE : (isChecked ? COL_GRAY_E : COL_GRAY_7));
+      // checkbox
+      lcd.drawRect(mx + 12, iy + 5, 8, 8, isHighlight ? COL_WHITE : COL_GRAY_5);
+      if(isChecked) {
+        lcd.drawFastHLine(mx + 14, iy + 9, 4, isHighlight ? COL_WHITE : COL_GRAY_E);
+        lcd.drawFastVLine(mx + 14, iy + 7, 4, isHighlight ? COL_WHITE : COL_GRAY_E);
+      }
+      const char* label = (i == 0) ? "LED ON   - flash saat capture"
+                                    : "LED OFF  - tanpa flash";
+      lcd.drawString(label, mx + 24, iy + 5);
+    }
+
+    lcd.setTextColor(COL_GRAY_3);
+    const char* hint = "C/D=pilih  BOOT=ok  B=batal";
+    int hw = lcd.textWidth(hint);
+    lcd.drawString(hint, mx + (mw - hw) / 2, my + mh - 13);
+  };
+
+  redraw();
+
+  while(!done && !cancelled) {
+    if(btnPressed(BTN_C)) {
+      while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
+      sel = (sel + 1) % 2; // toggle antara 0 dan 1
+      redraw();
+    }
+    if(btnPressed(BTN_D)) {
+      while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+      sel = (sel + 1) % 2;
+      redraw();
+    }
+    if(btnPressed(BTN_BOOT)) {
+      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      done = true;
+    }
+    if(btnPressed(BTN_B)) {
+      while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+      cancelled = true;
+    }
+    delay(10); esp_task_wdt_reset();
+  }
+
+  if(done) {
+    ledFlashEnabled = (sel == 0);
+    char fbBuf[24];
+    snprintf(fbBuf, sizeof(fbBuf), "FLASH: %s", ledFlashEnabled ? "ON" : "OFF");
+    lcd.setFont(&fonts::Font0);
+    int fw = lcd.textWidth(fbBuf), fp = fw + 14, fpx = (DISP_W - fp) / 2;
+    lcd.fillRoundRect(fpx, DISP_H/2 - 8, fp, 15, 7,
+                      ledFlashEnabled ? COL_WHITE : COL_GRAY_3);
+    lcd.setTextColor(ledFlashEnabled ? COL_BLACK : COL_GRAY_5);
+    lcd.drawString(fbBuf, fpx + 7, DISP_H/2 - 5);
+    delay(800);
+  }
+  lcd.fillScreen(COL_BLACK);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Exposure menu  (fix debounce di awal)
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
@@ -1167,6 +1280,9 @@ void applyExpPreset(uint8_t preset) {
 }
 
 void showExpMenu() {
+  // ← FIX: tunggu semua tombol dilepas dulu sebelum masuk menu
+  waitAllBtnRelease();
+
   int mw=220, mh=130;
   int mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
@@ -1303,6 +1419,9 @@ void showExpMenu() {
   lcd.fillScreen(COL_BLACK);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Viewfinder
+// ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb=esp_camera_fb_get(); if(!fb) return;
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
@@ -1322,10 +1441,15 @@ void renderViewfinder() {
     drawPill(30,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
     drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",COL_PILL_BG,
              sdReady?COL_GRAY_8:COL_GRAY_5);
+    // Indikator LED flash
+    drawPill(DISP_W/2, DISP_H-10,
+             ledFlashEnabled ? "FLASH ON" : "FLASH OFF",
+             COL_PILL_BG,
+             ledFlashEnabled ? COL_GRAY_E : COL_GRAY_5);
     if(faceDetectMode) {
       char faceBuf[12];
       snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
-      drawPill(DISP_W/2,DISP_H-10,faceBuf,COL_PILL_BG,COL_GRAY_C);
+      drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
     }
     if(recActive) drawRecIndicator();
     updateFPS();
@@ -1352,10 +1476,15 @@ void showSavedFeedback(bool saved) {
 }
 
 void captureAndPreview() {
-  digitalWrite(LED_PIN,HIGH);
+  // Flash hanya menyala jika ledFlashEnabled = true
+  if(ledFlashEnabled) digitalWrite(LED_PIN, HIGH);
+
   camera_fb_t *fb=esp_camera_fb_get();
-  if(!fb) { digitalWrite(LED_PIN,LOW); blinkLED(5,50,50); return; }
-  digitalWrite(LED_PIN,LOW);
+
+  if(ledFlashEnabled) digitalWrite(LED_PIN, LOW);
+
+  if(!fb) { blinkLED(5,50,50); return; }
+
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -1438,7 +1567,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.0 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.1 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1447,7 +1576,9 @@ void setup() {
     ESP.restart();
   }
 
-  pinMode(LED_PIN,OUTPUT); digitalWrite(LED_PIN,LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
   pinMode(BTN_BOOT, INPUT_PULLUP);
   pinMode(BTN_B,    INPUT_PULLUP);
   pinMode(BTN_C,    INPUT_PULLUP);
@@ -1457,7 +1588,6 @@ void setup() {
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
 
-  // Touch tidak dikalibrasi / tidak digunakan — tetap init agar tidak error bus
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
 
@@ -1485,11 +1615,6 @@ void setup() {
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis(); fpsFrameCount=0;
   blinkLED(3,120,120);
-
-  // ── Fix lampu GPIO 2 (CS touch XPT2046) ──────────────────────────────────
-  // Dipasang PALING AKHIR agar tidak di-override oleh init LCD/touch di atas
-  pinMode(2, OUTPUT);
-  digitalWrite(2, LOW);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1611,7 +1736,11 @@ void loop() {
     }
     else if(pressedPin==BTN_B) {
       if(isShort) {
+        // Short: start/stop REC
         if(recActive) stopRecording(); else startRecording();
+      } else {
+        // Long: menu LED flash  ← BARU
+        showLedMenu();
       }
     }
     else if(pressedPin==BTN_C) {
@@ -1629,6 +1758,7 @@ void loop() {
       if(isShort) {
         toggleFaceDetect();
       } else {
+        // Long: menu exposure  (sudah ada fix debounce di dalam showExpMenu)
         showExpMenu();
       }
     }
