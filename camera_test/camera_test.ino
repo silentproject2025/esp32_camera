@@ -1352,14 +1352,16 @@ void loop() {
 
   // ─────────────────────────────────────────────────────────────────────────
   //  Baca semua tombol (non-blocking scan) — cek siapa yang ditekan duluan
+  //  PENTING: pakai int & -1 sebagai sentinel, bukan 0,
+  //           karena BTN_BOOT = pin 0 sehingga uint8_t=0 ambigu!
   // ─────────────────────────────────────────────────────────────────────────
-  uint8_t pressedPin = 0;
+  int pressedPin = -1;
   if      (btnPressed(BTN_BOOT)) pressedPin = BTN_BOOT;
   else if (btnPressed(BTN_B))    pressedPin = BTN_B;
   else if (btnPressed(BTN_C))    pressedPin = BTN_C;
   else if (btnPressed(BTN_D))    pressedPin = BTN_D;
 
-  if(pressedPin == 0) {
+  if(pressedPin == -1) {
     // Tidak ada tombol — render viewfinder atau mjpeg
     if(appMode==MODE_VIEWFINDER) renderViewfinder();
     else if(appMode==MODE_MJPEG_PLAYER) loopMjpegPlayer();
@@ -1368,7 +1370,7 @@ void loop() {
 
   // Tunggu dilepas & ukur durasi
   unsigned long t0=millis();
-  while(btnPressed(pressedPin)) { delay(5); esp_task_wdt_reset(); }
+  while(btnPressed((uint8_t)pressedPin)) { delay(5); esp_task_wdt_reset(); }
   unsigned long dur=millis()-t0;
   if(dur<DEBOUNCE_MS) return; // noise
 
