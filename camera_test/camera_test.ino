@@ -1248,29 +1248,69 @@ void showExpMenu() {
 
   if(done) {
     applyExpPreset((uint8_t)sel);
-    // Kalau MANUAL, langsung masuk adjust mode
+    // Kalau MANUAL, langsung masuk adjust mode dengan live viewfinder
     if(sel == 3) {
-      // Tampil adjust overlay
       bool adjDone = false;
-      while(!adjDone) {
-        int aw=240, ah=60;
-        int ax=(DISP_W-aw)/2, ay=(DISP_H-ah)/2;
-        lcd.fillRoundRect(ax, ay, aw, ah, 8, COL_GRAY_D);
-        lcd.drawRoundRect(ax, ay, aw, ah, 8, COL_GRAY_5);
-        lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-        char buf[40];
-        snprintf(buf, sizeof(buf), "EXP: %4d   GAIN: %2d", expManualVal, expManualGain);
-        int bw = lcd.textWidth(buf);
-        lcd.drawString(buf, ax+(aw-bw)/2, ay+8);
-        // Bar exposure
-        int barW = aw-30;
+
+      // Helper: gambar overlay EXP/GAIN di bagian bawah layar (tidak tutup viewfinder)
+      auto drawAdjOverlay = [&]() {
+        int oh = 38;
+        int oy = DISP_H - oh;
+        // Background bar bawah semi-transparan
+        lcd.fillRect(0, oy, DISP_W, oh, COL_GRAY_D);
+        lcd.drawFastHLine(0, oy, DISP_W, COL_GRAY_5);
+
+        // Label EXP dan GAIN
+        lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+        lcd.setTextColor(COL_GRAY_E);
+        char buf[32];
+        snprintf(buf, sizeof(buf), "EXP  %4d", expManualVal);
+        lcd.drawString(buf, 8, oy+4);
+
+        snprintf(buf, sizeof(buf), "GAIN %2d", expManualGain);
+        lcd.drawString(buf, DISP_W-56, oy+4);
+
+        // Bar EXP
+        int barX = 8, barY = oy+18, barW = DISP_W-70, barH = 7;
+        lcd.fillRect(barX, barY, barW, barH, COL_GRAY_3);
         int filled = map(expManualVal, 0, 1200, 0, barW);
-        lcd.fillRect(ax+15, ay+26, barW, 8, COL_GRAY_3);
-        lcd.fillRect(ax+15, ay+26, filled, 8, COL_GRAY_A);
+        lcd.fillRect(barX, barY, filled, barH, COL_GRAY_C);
+        lcd.drawRect(barX, barY, barW, barH, COL_GRAY_5);
+
+        // Bar GAIN
+        int gbarX = DISP_W-56, gbarY = oy+18, gbarW = 48, gbarH = 7;
+        lcd.fillRect(gbarX, gbarY, gbarW, gbarH, COL_GRAY_3);
+        int gfilled = map(expManualGain, 0, 30, 0, gbarW);
+        lcd.fillRect(gbarX, gbarY, gfilled, gbarH, COL_GRAY_7);
+        lcd.drawRect(gbarX, gbarY, gbarW, gbarH, COL_GRAY_5);
+
+        // Hint tombol di tengah bawah
         lcd.setTextColor(COL_GRAY_5);
-        lcd.drawString("C=exp- D=exp+  B=gain- BOOT=ok", ax+10, ay+44);
+        const char* hint = "C=exp-  D=exp+  B=gain+  BOOT=ok";
+        int hw = lcd.textWidth(hint);
+        lcd.drawString(hint, (DISP_W-hw)/2, oy+28);
+      };
+
+      while(!adjDone) {
+        // Render viewfinder dulu (tanpa pill/HUD bawaan)
+        camera_fb_t *fb = esp_camera_fb_get();
+        if(fb) {
+          if(fb->format==PIXFORMAT_RGB565 && fb->width==DISP_W && fb->height==DISP_H) {
+            // Push frame tapi hanya bagian atas (sisakan bawah untuk overlay)
+            int visH = DISP_H - 38;
+            for(int row=0; row<visH; row++) {
+              lcd.pushImage(0, row, DISP_W, 1,
+                (uint16_t*)fb->buf + row * DISP_W);
+            }
+          }
+          esp_camera_fb_return(fb);
+        }
+
+        // Gambar overlay di atas frame
+        drawAdjOverlay();
 
         esp_task_wdt_reset();
+
         bool changed = false;
         if(btnPressed(BTN_C)) {
           while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
@@ -1282,14 +1322,15 @@ void showExpMenu() {
         }
         if(btnPressed(BTN_B)) {
           while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
-          expManualGain = constrain(expManualGain + 1, 0, 30); changed = true;
+          expManualGain = constrain(expManualGain + 1, 0, 30);
+          if(expManualGain > 30) expManualGain = 0; // wrap
+          changed = true;
         }
         if(btnPressed(BTN_BOOT)) {
           while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
           adjDone = true;
         }
         if(changed) applyExpPreset(3);
-        delay(10);
       }
     }
     // Feedback
@@ -1551,7 +1592,8 @@ void loop() {
     auto galleryStep = [&](int delta) {
       if(galleryCount<=0) return;
       int oldSel = gallerySelIdx;
-      gallerySelIdx = constrain(gallerySelIdx + delta, 0, galleryCount-1);
+      // Wrap-around: dari atas ke file terakhir, dari bawah ke file pertama
+      gallerySelIdx = (gallerySelIdx + delta % galleryCount + galleryCount) % galleryCount;
       if(gallerySelIdx == oldSel) return;
       bool needRedraw = false;
       if(gallerySelIdx < galleryScroll) {
