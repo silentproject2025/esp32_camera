@@ -1,15 +1,14 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v5.1
+ * Version: v5.1-fix
  *
- * PATCH v5.1 (dari v5.0):
- *  - FIX: debounce saat masuk showExpMenu() — tombol D longpress tidak lagi
- *         langsung skip pilihan
- *  - FIX: debounce saat masuk showLedMenu()
- *  - BARU: BTN_B longpress di MODE_VIEWFINDER → menu LED Flash ON/OFF
- *          LED ON  = flash menyala saat capture
- *          LED OFF = tidak ada flash saat capture
- *  - HAPUS: baris pinMode(2)/digitalWrite(2) yang tidak berguna
+ * FIX dari v5.1:
+ *  - FIX: Pill "FLASH ON/OFF" dihapus dari viewfinder (posisinya bentrok
+ *         dengan pill shot number & SD di baris bawah, menyebabkan flickering/freeze)
+ *  - FIX: Status flash sekarang ditampilkan HANYA saat pertama masuk viewfinder
+ *         selama 2 detik, lalu hilang — tidak mengganggu live view
+ *  - FIX: Pill tengah bawah (DISP_W/2, DISP_H-10) tidak lagi dipakai
+ *         untuk menghindari tabrakan 3 pill di baris yang sama
  *
  * LOGIC SHORT/LONG PRESS per mode:
  *
@@ -17,7 +16,7 @@
  *    BOOT short  → Capture foto
  *    BOOT long   → Masuk USB Mode
  *    B short     → Start/Stop REC
- *    B long      → Menu LED Flash ON/OFF   ← BARU
+ *    B long      → Menu LED Flash ON/OFF
  *    C short     → Buka Gallery
  *    C long      → Toggle Face Detect
  *    D short     → Toggle Face Detect
@@ -204,9 +203,15 @@ enum AppMode {
 AppMode appMode = MODE_VIEWFINDER;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LED Flash state  ← BARU
+//  LED Flash state
 // ─────────────────────────────────────────────────────────────────────────────
 bool ledFlashEnabled = true; // default: flash aktif saat capture
+
+// ── FIX: Timer untuk notifikasi flash sementara di viewfinder ───────────────
+// Pill flash hanya tampil 2 detik setelah masuk viewfinder / setelah ubah setting
+// Selebihnya tidak ditampilkan agar tidak bentrok dengan pill lain
+unsigned long flashNotifUntilMs = 0;
+bool          flashNotifVisible  = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Gallery state
@@ -1003,7 +1008,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.1  4-BTN edition",DISP_W/2-60,103);
+  lcd.drawString("v5.1fix  4-BTN edition",DISP_W/2-64,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1112,6 +1117,9 @@ void exitUSBMode() {
   esp_task_wdt_reset(); blinkLED(2,150,100); delay(1000);
   lcd.fillScreen(COL_BLACK);
   appMode=MODE_VIEWFINDER;
+  // Tampilkan notif flash singkat saat masuk viewfinder setelah USB
+  flashNotifUntilMs = millis() + 2000;
+  flashNotifVisible  = true;
   fpsLastTime=millis(); fpsFrameCount=0; fpsValue=0.0f;
 }
 
@@ -1162,7 +1170,7 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu LED Flash  ← BARU
+//  Menu LED Flash
 // ─────────────────────────────────────────────────────────────────────────────
 void showLedMenu() {
   waitAllBtnRelease();
@@ -1171,20 +1179,6 @@ void showLedMenu() {
   int mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   int sel = ledFlashEnabled ? 0 : 1; // 0=ON, 1=OFF
   bool done = false, cancelled = false;
-
-  const char* opts[2] = {
-    "[*] LED ON   - flash saat capture",
-    "[ ] LED OFF  - tanpa flash"
-  };
-  // buat label dinamis berdasarkan state
-  auto getLabel = [&](int i) -> const char* {
-    if(i == 0) return ledFlashEnabled
-      ? "[*] LED ON   - flash saat capture"
-      : "[ ] LED ON   - flash saat capture";
-    else return ledFlashEnabled
-      ? "[ ] LED OFF  - tanpa flash"
-      : "[*] LED OFF  - tanpa flash";
-  };
 
   auto redraw = [&]() {
     lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
@@ -1226,7 +1220,7 @@ void showLedMenu() {
   while(!done && !cancelled) {
     if(btnPressed(BTN_C)) {
       while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
-      sel = (sel + 1) % 2; // toggle antara 0 dan 1
+      sel = (sel + 1) % 2;
       redraw();
     }
     if(btnPressed(BTN_D)) {
@@ -1247,6 +1241,7 @@ void showLedMenu() {
 
   if(done) {
     ledFlashEnabled = (sel == 0);
+    // Tampilkan konfirmasi singkat di tengah layar
     char fbBuf[24];
     snprintf(fbBuf, sizeof(fbBuf), "FLASH: %s", ledFlashEnabled ? "ON" : "OFF");
     lcd.setFont(&fonts::Font0);
@@ -1256,12 +1251,17 @@ void showLedMenu() {
     lcd.setTextColor(ledFlashEnabled ? COL_BLACK : COL_GRAY_5);
     lcd.drawString(fbBuf, fpx + 7, DISP_H/2 - 5);
     delay(800);
+
+    // ── FIX: Setelah ubah setting flash, tampilkan pill notif singkat
+    //         di viewfinder selama 2 detik (di posisi tengah ATAS, tidak bentrok)
+    flashNotifUntilMs = millis() + 2000;
+    flashNotifVisible  = true;
   }
   lcd.fillScreen(COL_BLACK);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Exposure menu  (fix debounce di awal)
+//  Exposure menu
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
@@ -1280,7 +1280,6 @@ void applyExpPreset(uint8_t preset) {
 }
 
 void showExpMenu() {
-  // ← FIX: tunggu semua tombol dilepas dulu sebelum masuk menu
   waitAllBtnRelease();
 
   int mw=220, mh=130;
@@ -1428,29 +1427,39 @@ void renderViewfinder() {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
     if(faceDetectMode) runFaceDetect(fb);
+
+    // ── Baris ATAS: fps (kiri) | info tengah | sensor (kanan) ──────────────
     char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
     drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
     drawPill(DISP_W-35,10,sensorName,COL_PILL_BG,COL_GRAY_A);
-    if(expPreset > 0) {
-      char expBuf[12];
-      if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
-      else snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
-      drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
-    }
-    char shotBuf[10]; snprintf(shotBuf,sizeof(shotBuf),"#%04d",photoCount+1);
-    drawPill(30,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
-    drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",COL_PILL_BG,
-             sdReady?COL_GRAY_8:COL_GRAY_5);
-    // Indikator LED flash
-    drawPill(DISP_W/2, DISP_H-10,
-             ledFlashEnabled ? "FLASH ON" : "FLASH OFF",
-             COL_PILL_BG,
-             ledFlashEnabled ? COL_GRAY_E : COL_GRAY_5);
+
+    // Tengah atas: prioritas face > exposure > flash notif
     if(faceDetectMode) {
       char faceBuf[12];
       snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
       drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
+    } else if(expPreset > 0) {
+      char expBuf[12];
+      if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
+      else snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
+      drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
+    } else if(flashNotifVisible && millis() < flashNotifUntilMs) {
+      // ── FIX: Pill flash HANYA tampil sementara di tengah atas,
+      //         dan HANYA bila tidak ada info lain yang lebih penting ──────
+      drawPill(DISP_W/2,10,
+               ledFlashEnabled ? "FLASH ON" : "FLASH OFF",
+               COL_PILL_BG,
+               ledFlashEnabled ? COL_GRAY_E : COL_GRAY_5);
     }
+
+    // ── Baris BAWAH: shot# (kiri) | SD (kanan) ─────────────────────────────
+    // TIDAK ADA pill di tengah bawah (DISP_W/2, DISP_H-10)
+    // agar tidak bentrok dengan pill kiri & kanan
+    char shotBuf[10]; snprintf(shotBuf,sizeof(shotBuf),"#%04d",photoCount+1);
+    drawPill(30,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
+    drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",COL_PILL_BG,
+             sdReady?COL_GRAY_8:COL_GRAY_5);
+
     if(recActive) drawRecIndicator();
     updateFPS();
   } else {
@@ -1458,6 +1467,11 @@ void renderViewfinder() {
     lcd.drawString("format not rgb565",10,110);
   }
   esp_camera_fb_return(fb);
+
+  // Auto-clear flash notif timer
+  if(flashNotifVisible && millis() >= flashNotifUntilMs) {
+    flashNotifVisible = false;
+  }
 }
 
 void showSavedFeedback(bool saved) {
@@ -1567,7 +1581,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.1 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.1-fix 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1614,6 +1628,12 @@ void setup() {
 
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis(); fpsFrameCount=0;
+
+  // ── FIX: Saat pertama masuk viewfinder, tampilkan status flash
+  //         selama 2 detik di tengah atas — lalu hilang sendiri
+  flashNotifUntilMs = millis() + 2000;
+  flashNotifVisible  = true;
+
   blinkLED(3,120,120);
 }
 
@@ -1736,10 +1756,9 @@ void loop() {
     }
     else if(pressedPin==BTN_B) {
       if(isShort) {
-        // Short: start/stop REC
         if(recActive) stopRecording(); else startRecording();
       } else {
-        // Long: menu LED flash  ← BARU
+        // Long: menu LED flash
         showLedMenu();
       }
     }
@@ -1758,7 +1777,6 @@ void loop() {
       if(isShort) {
         toggleFaceDetect();
       } else {
-        // Long: menu exposure  (sudah ada fix debounce di dalam showExpMenu)
         showExpMenu();
       }
     }
