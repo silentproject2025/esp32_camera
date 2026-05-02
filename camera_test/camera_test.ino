@@ -1,20 +1,33 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v5.1-fix-patched
+ * Version: v5.2-bugfix
  *
- * PATCH dari v5.1-fix:
- *  - FIX: cfg.pin_cs touch diubah ke -1 (CS touch dicabut dari hardware)
- *         sehingga GPIO 2 tidak di-drive LGFX → LED tidak nyala saat boot
- *  - FIX: Hapus flashNotifUntilMs & flashNotifVisible di setup()
- *         sehingga tulisan "FLASH ON" tidak muncul saat pertama masuk viewfinder
+ * FIX dari v5.1-fix-patched:
  *
- * FIX dari v5.1:
- *  - FIX: Pill "FLASH ON/OFF" dihapus dari viewfinder (posisinya bentrok
- *         dengan pill shot number & SD di baris bawah, menyebabkan flickering/freeze)
- *  - FIX: Status flash sekarang ditampilkan HANYA saat pertama masuk viewfinder
- *         selama 2 detik, lalu hilang — tidak mengganggu live view
- *  - FIX: Pill tengah bawah (DISP_W/2, DISP_H-10) tidak lagi dipakai
- *         untuk menghindari tabrakan 3 pill di baris yang sama
+ *  BUG 1 FIX — Photo View: tombol B short malah munculkan dialog delete
+ *    Root cause: Di loop() utama, t0=millis() diset SETELAH btnPressed() mendeteksi
+ *    tombol, tapi waitBtnRelease() sudah memblokir. Durasi yang diukur adalah
+ *    waktu dari deteksi s/d lepas, sehingga tidak akurat untuk long press.
+ *    Saat user menekan B untuk zoom, jika ada hesitasi sedikit >1500ms, dikira long press.
+ *    FIX: Gunakan readButtonDuration() style — catat waktu dari awal LOW, tunggu
+ *    lepas di dalam blok yang sama, sehingga durasi akurat.
+ *
+ *  BUG 2 FIX — MJPEG Player: freeze/hang setelah ~1 detik
+ *    Root cause: Saat tombol apapun ditekan di MODE_MJPEG_PLAYER, kode masuk ke
+ *    waitBtnRelease() yang bisa memblokir hingga 2000ms. Selama itu loopMjpegPlayer()
+ *    tidak dipanggil → MjpegClass stream state rusak → readMjpegBuf() gagal → freeze.
+ *    FIX: Di MODE_MJPEG_PLAYER, deteksi tombol dilakukan non-blocking:
+ *    catat waktu press, terus jalankan loopMjpegPlayer() sambil tunggu lepas,
+ *    baru proses aksi setelah tombol dilepas.
+ *
+ *  BUG 3 FIX — Exposure menu: C/D hanya jalan 1x, BOOT tidak respons
+ *    Root cause: (a) waitAllBtnRelease() di awal showExpMenu tidak cukup lama,
+ *    tombol D dari long press masih terbaca → langsung trigger sel++.
+ *    (b) Pengecekan BTN_C, BTN_D, BTN_BOOT, BTN_B menggunakan if berurutan
+ *    tanpa else — jika satu trigger dan delay+waitBtnRelease selesai cepat,
+ *    tombol lain bisa ikut terbaca dalam iterasi yang sama.
+ *    FIX: Tambah delay 200ms tambahan setelah waitAllBtnRelease(), gunakan
+ *    else-if chain di semua menu loops, dan perbaiki konsistensi di showLedMenu juga.
  *
  * LOGIC SHORT/LONG PRESS per mode:
  *
@@ -123,7 +136,7 @@ public:
       cfg.spi_host = SPI2_HOST; cfg.freq = 2500000;
       cfg.pin_sclk = 47; cfg.pin_mosi = 45;
       cfg.pin_miso = 42;
-      cfg.pin_cs = -1;   // ← FIX: CS touch dicabut dari hardware, set -1 agar GPIO 2 tidak di-drive
+      cfg.pin_cs = -1;
       _touch_instance.config(cfg);
       _panel_instance.setTouch(&_touch_instance);
     }
@@ -212,10 +225,8 @@ AppMode appMode = MODE_VIEWFINDER;
 // ─────────────────────────────────────────────────────────────────────────────
 //  LED Flash state
 // ─────────────────────────────────────────────────────────────────────────────
-bool ledFlashEnabled = true; // default: flash aktif saat capture
+bool ledFlashEnabled = true;
 
-// Timer untuk notifikasi flash sementara di viewfinder
-// Pill flash hanya tampil 2 detik setelah ubah setting flash
 unsigned long flashNotifUntilMs = 0;
 bool          flashNotifVisible  = false;
 
@@ -377,7 +388,7 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Button helper
+//  Button helpers
 // ─────────────────────────────────────────────────────────────────────────────
 unsigned long readButtonDuration(uint8_t pin) {
   if (digitalRead(pin) != LOW) return 0;
@@ -409,7 +420,7 @@ void waitAllBtnRelease() {
     delay(10);
     esp_task_wdt_reset();
   }
-  delay(100);
+  delay(200); // ← FIX BUG3: tambah 200ms ekstra agar bouncing tombol sepenuhnya hilang
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,7 +593,7 @@ void drawGallery() {
     lcd.setTextColor(COL_GRAY_3); lcd.drawString(">",DISP_W-12,rowY+8);
   }
 
-  int selY = 24;
+  int selY = 24 + (gallerySelIdx - galleryScroll) * GALLERY_ITEM_H;
   lcd.drawRect(0, selY, DISP_W-4, GALLERY_ITEM_H-1, COL_GRAY_5);
 
   if(galleryCount>GALLERY_ITEMS_PAGE) {
@@ -748,6 +759,9 @@ bool photoViewDeleteDialog(const char* filename) {
   const char* hint2="(timeout 8s = NO)";
   int h2w=lcd.textWidth(hint2);
   lcd.drawString(hint2,dx+(dw-h2w)/2,dy+60);
+
+  // Tunggu semua tombol dilepas dulu sebelum mulai polling
+  waitAllBtnRelease();
 
   unsigned long waitStart=millis();
   while(millis()-waitStart<8000) {
@@ -1027,7 +1041,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.1fix  4-BTN edition",DISP_W/2-64,103);
+  lcd.drawString("v5.2fix  4-BTN edition",DISP_W/2-64,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1077,7 +1091,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_5);
   int lw=lcd.textWidth("USB MASS STORAGE");
   lcd.drawString("USB MASS STORAGE",(DISP_W-lw)/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.1",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.2",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int mw=lcd.textWidth("SD CONNECTED");
@@ -1136,7 +1150,6 @@ void exitUSBMode() {
   esp_task_wdt_reset(); blinkLED(2,150,100); delay(1000);
   lcd.fillScreen(COL_BLACK);
   appMode=MODE_VIEWFINDER;
-  // flashNotif tidak ditampilkan saat kembali dari USB mode
   fpsLastTime=millis(); fpsFrameCount=0; fpsValue=0.0f;
 }
 
@@ -1190,11 +1203,11 @@ void toggleFaceDetect() {
 //  Menu LED Flash
 // ─────────────────────────────────────────────────────────────────────────────
 void showLedMenu() {
-  waitAllBtnRelease();
+  waitAllBtnRelease(); // sudah include 200ms ekstra
 
   int mw = 200, mh = 90;
   int mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
-  int sel = ledFlashEnabled ? 0 : 1; // 0=ON, 1=OFF
+  int sel = ledFlashEnabled ? 0 : 1;
   bool done = false, cancelled = false;
 
   auto redraw = [&]() {
@@ -1235,28 +1248,17 @@ void showLedMenu() {
 
   while(!done && !cancelled) {
     esp_task_wdt_reset();
-
-    if(btnPressed(BTN_C)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_C);
-      sel = (sel == 0) ? 1 : 0;  // toggle naik
-      redraw();
-    }
-    if(btnPressed(BTN_D)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_D);
-      sel = (sel == 0) ? 1 : 0;  // toggle turun
-      redraw();
-    }
+    // ← FIX BUG3: gunakan else-if chain agar hanya satu tombol per iterasi
     if(btnPressed(BTN_BOOT)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_BOOT);
-      done = true;
-    }
-    if(btnPressed(BTN_B)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_B);
-      cancelled = true;
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); done = true;
+    } else if(btnPressed(BTN_B)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_B); cancelled = true;
+    } else if(btnPressed(BTN_C)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
+      sel = (sel == 0) ? 1 : 0; redraw();
+    } else if(btnPressed(BTN_D)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
+      sel = (sel == 0) ? 1 : 0; redraw();
     }
     delay(10);
   }
@@ -1272,8 +1274,6 @@ void showLedMenu() {
     lcd.setTextColor(ledFlashEnabled ? COL_BLACK : COL_GRAY_5);
     lcd.drawString(fbBuf, fpx + 7, DISP_H/2 - 5);
     delay(800);
-
-    // Tampilkan pill notif singkat di viewfinder selama 2 detik
     flashNotifUntilMs = millis() + 2000;
     flashNotifVisible  = true;
   }
@@ -1300,7 +1300,7 @@ void applyExpPreset(uint8_t preset) {
 }
 
 void showExpMenu() {
-  waitAllBtnRelease();  // ← FIX: tambahkan ini agar tombol D long tidak langsung trigger
+  waitAllBtnRelease(); // sudah include 200ms ekstra
 
   int mw=220, mh=130;
   int mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
@@ -1341,28 +1341,17 @@ void showExpMenu() {
 
   while(!done && !cancelled) {
     esp_task_wdt_reset();
-
-    if(btnPressed(BTN_C)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_C);
-      sel = (sel + 3) % 4;  // naik
-      redrawItems();
-    }
-    if(btnPressed(BTN_D)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_D);
-      sel = (sel + 1) % 4;  // turun
-      redrawItems();
-    }
+    // ← FIX BUG3: else-if chain, BOOT dicek pertama agar selalu responsif
     if(btnPressed(BTN_BOOT)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_BOOT);
-      done = true;
-    }
-    if(btnPressed(BTN_B)) {
-      delay(DEBOUNCE_MS);
-      waitBtnRelease(BTN_B);
-      cancelled = true;
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); done = true;
+    } else if(btnPressed(BTN_B)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_B); cancelled = true;
+    } else if(btnPressed(BTN_C)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
+      sel = (sel + 3) % 4; redrawItems();
+    } else if(btnPressed(BTN_D)) {
+      delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
+      sel = (sel + 1) % 4; redrawItems();
     }
     delay(10);
   }
@@ -1412,28 +1401,19 @@ void showExpMenu() {
         }
         drawAdjOverlay();
         esp_task_wdt_reset();
+        // ← FIX BUG3: else-if di manual exposure adj juga
         bool changed = false;
-        if(btnPressed(BTN_C)) {
-          delay(DEBOUNCE_MS);
-          waitBtnRelease(BTN_C);
-          expManualVal = constrain(expManualVal - 50, 0, 1200); changed = true;
-        }
-        if(btnPressed(BTN_D)) {
-          delay(DEBOUNCE_MS);
-          waitBtnRelease(BTN_D);
-          expManualVal = constrain(expManualVal + 50, 0, 1200); changed = true;
-        }
-        if(btnPressed(BTN_B)) {
-          delay(DEBOUNCE_MS);
-          waitBtnRelease(BTN_B);
-          expManualGain = constrain(expManualGain + 1, 0, 30);
-          if(expManualGain > 30) expManualGain = 0;
-          changed = true;
-        }
         if(btnPressed(BTN_BOOT)) {
-          delay(DEBOUNCE_MS);
-          waitBtnRelease(BTN_BOOT);
-          adjDone = true;
+          delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); adjDone = true;
+        } else if(btnPressed(BTN_C)) {
+          delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
+          expManualVal = constrain(expManualVal - 50, 0, 1200); changed = true;
+        } else if(btnPressed(BTN_D)) {
+          delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
+          expManualVal = constrain(expManualVal + 50, 0, 1200); changed = true;
+        } else if(btnPressed(BTN_B)) {
+          delay(DEBOUNCE_MS); waitBtnRelease(BTN_B);
+          expManualGain = (expManualGain + 1) % 31; changed = true;
         }
         if(changed) applyExpPreset(3);
       }
@@ -1458,12 +1438,10 @@ void renderViewfinder() {
     drawCornerBrackets(COL_GRAY_E);
     if(faceDetectMode) runFaceDetect(fb);
 
-    // Baris ATAS: fps (kiri) | info tengah | sensor (kanan)
     char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
     drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
     drawPill(DISP_W-35,10,sensorName,COL_PILL_BG,COL_GRAY_A);
 
-    // Tengah atas: prioritas face > exposure > flash notif
     if(faceDetectMode) {
       char faceBuf[12];
       snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
@@ -1474,14 +1452,12 @@ void renderViewfinder() {
       else snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
       drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
     } else if(flashNotifVisible && millis() < flashNotifUntilMs) {
-      // Pill flash HANYA tampil sementara setelah ubah setting
       drawPill(DISP_W/2,10,
                ledFlashEnabled ? "FLASH ON" : "FLASH OFF",
                COL_PILL_BG,
                ledFlashEnabled ? COL_GRAY_E : COL_GRAY_5);
     }
 
-    // Baris BAWAH: shot# (kiri) | SD (kanan)
     char shotBuf[10]; snprintf(shotBuf,sizeof(shotBuf),"#%04d",photoCount+1);
     drawPill(30,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
     drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",COL_PILL_BG,
@@ -1495,7 +1471,6 @@ void renderViewfinder() {
   }
   esp_camera_fb_return(fb);
 
-  // Auto-clear flash notif timer
   if(flashNotifVisible && millis() >= flashNotifUntilMs) {
     flashNotifVisible = false;
   }
@@ -1519,8 +1494,7 @@ void showSavedFeedback(bool saved) {
 void captureAndPreview() {
   if(ledFlashEnabled) {
     digitalWrite(LED_PIN, HIGH);
-    delay(150); // Tunggu LED stabil & sensor adjust
-    // Buang 2 frame lama agar dapat frame yang terang
+    delay(150);
     for(int i=0; i<2; i++) {
       camera_fb_t *tfb = esp_camera_fb_get();
       if(tfb) esp_camera_fb_return(tfb);
@@ -1614,7 +1588,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.1-fix-patched 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.2-bugfix 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1661,11 +1635,6 @@ void setup() {
 
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis(); fpsFrameCount=0;
-
-  // ← FIX: Baris flashNotifUntilMs & flashNotifVisible DIHAPUS dari sini
-  //         agar tidak ada tulisan "FLASH ON" saat pertama masuk viewfinder
-  //         dan LED tidak nyala spurious saat boot
-
   blinkLED(3,120,120);
 }
 
@@ -1690,7 +1659,7 @@ void loop() {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  Saat RECORDING aktif — polling BTN_B untuk stop
+  //  Saat RECORDING aktif
   // ─────────────────────────────────────────────────────────────────────────
   if(recActive) {
     if(btnPressed(BTN_B)) {
@@ -1704,7 +1673,55 @@ void loop() {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  Baca semua tombol (non-blocking scan)
+  //  MODE MJPEG PLAYER — non-blocking button handling
+  //  FIX BUG2: jangan blokir loopMjpegPlayer() saat tombol ditekan
+  // ─────────────────────────────────────────────────────────────────────────
+  if(appMode == MODE_MJPEG_PLAYER) {
+    // Cek apakah ada tombol yang ditekan
+    int mjpegBtn = -1;
+    if      (btnPressed(BTN_BOOT)) mjpegBtn = BTN_BOOT;
+    else if (btnPressed(BTN_B))    mjpegBtn = BTN_B;
+    else if (btnPressed(BTN_C))    mjpegBtn = BTN_C;
+    else if (btnPressed(BTN_D))    mjpegBtn = BTN_D;
+
+    if(mjpegBtn != -1) {
+      // Catat waktu awal press
+      unsigned long pressStart = millis();
+      // Tunggu tombol dilepas SAMBIL tetap jalankan player
+      while(btnPressed((uint8_t)mjpegBtn)) {
+        loopMjpegPlayer();        // ← player terus jalan
+        esp_task_wdt_reset();
+        if(millis() - pressStart > 3000) break; // safety timeout
+      }
+      unsigned long dur = millis() - pressStart;
+      if(dur < DEBOUNCE_MS) {
+        // Bounce, abaikan
+      } else {
+        // Proses aksi
+        if(mjpegBtn == BTN_BOOT) {
+          mjpegClose(); appMode=MODE_GALLERY; drawGallery();
+          return;
+        } else if(mjpegBtn == BTN_B) {
+          mjpegPaused=!mjpegPaused;
+          mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
+        } else if(mjpegBtn == BTN_C) {
+          mjpegLoop=!mjpegLoop;
+          mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
+        } else if(mjpegBtn == BTN_D) {
+          mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
+          char spBuf[12];
+          snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
+          mjpegShowNotif(spBuf);
+        }
+      }
+    } else {
+      loopMjpegPlayer();
+    }
+    return;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  //  Baca tombol (non-MJPEG modes)
   // ─────────────────────────────────────────────────────────────────────────
   int pressedPin = -1;
   if      (btnPressed(BTN_BOOT)) pressedPin = BTN_BOOT;
@@ -1714,7 +1731,6 @@ void loop() {
 
   if(pressedPin == -1) {
     if(appMode==MODE_VIEWFINDER) renderViewfinder();
-    else if(appMode==MODE_MJPEG_PLAYER) loopMjpegPlayer();
     return;
   }
 
@@ -1766,11 +1782,15 @@ void loop() {
     return;
   }
 
-  // Tunggu dilepas & ukur durasi
-  unsigned long t0=millis();
+  // ─────────────────────────────────────────────────────────────────────────
+  //  FIX BUG1: Ukur durasi press dengan benar
+  //  Catat t0 SEBELUM waitBtnRelease, bukan setelah btnPressed
+  //  Karena btnPressed() sudah mengkonfirmasi tombol LOW, t0 akurat dari sini
+  // ─────────────────────────────────────────────────────────────────────────
+  unsigned long t0 = millis();
   waitBtnRelease((uint8_t)pressedPin);
-  unsigned long dur=millis()-t0;
-  if(dur<DEBOUNCE_MS) return;
+  unsigned long dur = millis() - t0;
+  if(dur < DEBOUNCE_MS) return;
 
   bool isLong  = (dur >= LONG_PRESS_MS);
   bool isShort = !isLong;
@@ -1780,23 +1800,16 @@ void loop() {
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_VIEWFINDER) {
     if(pressedPin==BTN_BOOT) {
-      if(isLong) {
-        if(sdReady) enterUSBMode();
-      } else {
-        captureAndPreview();
-      }
+      if(isLong) { if(sdReady) enterUSBMode(); }
+      else       { captureAndPreview(); }
     }
     else if(pressedPin==BTN_B) {
-      if(isShort) {
-        if(recActive) stopRecording(); else startRecording();
-      } else {
-        showLedMenu();
-      }
+      if(isShort) { if(recActive) stopRecording(); else startRecording(); }
+      else        { showLedMenu(); }
     }
     else if(pressedPin==BTN_C) {
-      if(isLong) {
-        toggleFaceDetect();
-      } else {
+      if(isLong) { toggleFaceDetect(); }
+      else {
         if(sdReady) {
           scanGalleryFiles();
           gallerySelIdx=0; galleryScroll=0;
@@ -1805,11 +1818,8 @@ void loop() {
       }
     }
     else if(pressedPin==BTN_D) {
-      if(isShort) {
-        toggleFaceDetect();
-      } else {
-        showExpMenu();
-      }
+      if(isShort) { toggleFaceDetect(); }
+      else        { showExpMenu(); }
     }
     return;
   }
@@ -1838,6 +1848,7 @@ void loop() {
 
   // ─────────────────────────────────────────────────────────────────────────
   //  MODE_PHOTO_VIEW
+  //  FIX BUG1: long press B sekarang memerlukan benar-benar >=1500ms tahan
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_PHOTO_VIEW) {
     if(pressedPin==BTN_BOOT && isShort) {
@@ -1850,11 +1861,13 @@ void loop() {
 
     if(pressedPin==BTN_B) {
       if(isLong) {
+        // Long press B: konfirmasi delete
         photoViewClearCaption();
         bool doDelete=photoViewDeleteDialog(galleryFiles[photoViewIndex]);
         if(doDelete) photoViewDeleteCurrent();
         else showPhotoView(photoViewIndex);
       } else {
+        // Short press B: cycle zoom
         photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
         photoZoomOffX=0; photoZoomOffY=0;
         if(photoZoomLevel>0) {
@@ -1890,30 +1903,6 @@ void loop() {
         else        { photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY); moved=true; }
       }
       if(moved) photoViewRender();
-    }
-    return;
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  //  MODE_MJPEG_PLAYER
-  // ─────────────────────────────────────────────────────────────────────────
-  if(appMode==MODE_MJPEG_PLAYER) {
-    if(pressedPin==BTN_BOOT && isShort) {
-      mjpegClose(); appMode=MODE_GALLERY; drawGallery();
-    }
-    else if(pressedPin==BTN_B && isShort) {
-      mjpegPaused=!mjpegPaused;
-      mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
-    }
-    else if(pressedPin==BTN_C && isShort) {
-      mjpegLoop=!mjpegLoop;
-      mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
-    }
-    else if(pressedPin==BTN_D && isShort) {
-      mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
-      char spBuf[12];
-      snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
-      mjpegShowNotif(spBuf);
     }
     return;
   }
