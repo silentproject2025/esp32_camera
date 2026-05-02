@@ -1,11 +1,12 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.4-island-stego
+ * Version: v5.4-island-stego-smooth
  *
- * FIX v5.4-fixed:
- *  - NotifType enum + NotifStyle struct dipindah ke ATAS sebelum semua
- *    fungsi dan #define warna, agar terlihat oleh Arduino CLI pre-processor.
- *  - Enum diberi underlying type uint8_t agar tidak bentrok dengan ESP-IDF.
+ * FIX v5.4-smooth:
+ *  - Dynamic Island dengan animasi slide-in/out yang smooth
+ *  - Hapus progress bar, pakai fade/pulse animation
+ *  - Fix bug island hilang setelah capture (freeze)
+ *  - Island tetap visible selama ISLAND_SHOW_MS
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -37,8 +38,6 @@
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  *** EARLY TYPE DECLARATIONS ***
-//  Harus di sini — sebelum LGFX, sebelum #define warna, sebelum semua fungsi
-//  Ini fix untuk: 'NotifType' was not declared in this scope
 // ─────────────────────────────────────────────────────────────────────────────
 enum NotifType : uint8_t {
   NOTIF_OK    = 0,
@@ -169,7 +168,7 @@ static LGFX lcd;
 #define VFLIP_OV3660   1
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  NOTIF_STYLES — didefinisikan setelah #define warna agar bisa pakai COL_*
+//  NOTIF_STYLES
 // ─────────────────────────────────────────────────────────────────────────────
 static const NotifStyle NOTIF_STYLES[6] = {
   { 0x0540, 0xFFFF, "+" },    // OK    — hijau
@@ -259,18 +258,20 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — Notification System
+//  DYNAMIC ISLAND — Notification System (SMOOTH VERSION)
 // ─────────────────────────────────────────────────────────────────────────────
-#define ISLAND_SHOW_MS   2000
-#define ISLAND_MAX_STACK    3
-#define ISLAND_W_SINGLE   180
-#define ISLAND_W_STACK    210
-#define ISLAND_H_ROW       18
-#define ISLAND_PAD_V        4
-#define ISLAND_PAD_H       10
-#define ISLAND_ICON_SZ     10
-#define ISLAND_BAR_H        2
-#define ISLAND_CX      (DISP_W / 2)
+#define ISLAND_SHOW_MS      2000
+#define ISLAND_ANIM_MS       150
+#define ISLAND_MAX_STACK       3
+#define ISLAND_W_SINGLE      180
+#define ISLAND_W_STACK       210
+#define ISLAND_H_ROW          18
+#define ISLAND_PAD_V           4
+#define ISLAND_PAD_H          10
+#define ISLAND_ICON_SZ        10
+#define ISLAND_CX       (DISP_W / 2)
+
+enum IslandState { ISLAND_HIDDEN, ISLAND_SLIDING_IN, ISLAND_VISIBLE, ISLAND_SLIDING_OUT };
 
 struct NotifEntry {
   NotifType type;
@@ -280,9 +281,10 @@ struct NotifEntry {
 
 static NotifEntry    islandStack[ISLAND_MAX_STACK];
 static int           islandCount    = 0;
-static bool          islandVisible  = false;
+static IslandState   islandState    = ISLAND_HIDDEN;
 static unsigned long islandShowAt   = 0;
 static unsigned long islandHideAt   = 0;
+static unsigned long islandAnimStart= 0;
 static int           islandLastX    = 0;
 static int           islandLastY    = 0;
 static int           islandLastW    = 0;
@@ -314,6 +316,7 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
   lcd.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
 
+  // REC blinking dot
   if (n.type == NOTIF_REC && isFresh) {
     int dotX = x + w - 4;
     int dotY = y + ISLAND_H_ROW / 2;
@@ -322,63 +325,52 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
-static void islandDraw() {
+static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
 
   int iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
-  int iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2 + ISLAND_BAR_H;
+  int iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
   int iX = ISLAND_CX - iW / 2;
-  int iY = 0;
+  int iY = offsetY;
 
   islandLastX = iX; islandLastY = iY;
   islandLastW = iW; islandLastH = iH;
 
-  lcd.fillRoundRect(iX, iY - ISLAND_BAR_H, iW, iH + ISLAND_BAR_H, ISLAND_BAR_H, COL_BLACK);
+  // Clear area
+  lcd.fillRect(iX - 2, iY - 2, iW + 4, iH + 4, COL_BLACK);
+  
+  // Draw island background & border
+  lcd.fillRoundRect(iX, iY, iW, iH, 6, COL_BLACK);
   lcd.drawFastVLine(iX,          iY, iH, COL_GRAY_3);
   lcd.drawFastVLine(iX + iW - 1, iY, iH, COL_GRAY_3);
+  lcd.drawFastHLine(iX, iY, iW, COL_GRAY_3);
   lcd.drawFastHLine(iX, iY + iH - 1, iW, COL_GRAY_3);
 
+  // Draw rows
   int rowY = iY + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
     islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
     rowY += ISLAND_H_ROW + 2;
   }
-  lcd.fillRect(iX + 1, iY + iH - ISLAND_BAR_H, iW - 2, ISLAND_BAR_H, COL_GRAY_5);
 }
 
-static void islandUpdateBar() {
-  if (!islandVisible || islandLastW == 0) return;
-  unsigned long elapsed = millis() - islandShowAt;
-  int barY   = islandLastY + islandLastH - ISLAND_BAR_H;
-  int barX   = islandLastX + 1;
-  int barW   = islandLastW - 2;
-  int filled = (int)(barW * (1.0f - (float)elapsed / ISLAND_SHOW_MS));
-  filled = constrain(filled, 0, barW);
-  lcd.fillRect(barX, barY, barW, ISLAND_BAR_H, COL_BLACK);
-  if (filled > 0) lcd.fillRect(barX, barY, filled, ISLAND_BAR_H, COL_GRAY_5);
-
-  if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
-    int x    = islandLastX + ISLAND_PAD_H;
-    int y    = islandLastY + ISLAND_PAD_V;
-    int w    = islandLastW - ISLAND_PAD_H * 2;
-    int dotX = x + w - 4;
-    int dotY = y + ISLAND_H_ROW / 2;
-    bool blink = (millis() / 400) % 2;
-    lcd.fillCircle(dotX, dotY, 2, blink ? 0xF800 : COL_GRAY_3);
+static void islandClearArea() {
+  if (islandLastW > 0 && islandLastH > 0) {
+    lcd.fillRect(islandLastX - 2, islandLastY - 2, islandLastW + 4, islandLastH + 4, COL_BLACK);
   }
 }
 
 static void islandHide() {
-  if (islandLastW > 0 && islandLastH > 0)
-    lcd.fillRect(islandLastX, islandLastY, islandLastW, islandLastH, COL_BLACK);
-  islandVisible = false;
-  islandCount   = 0;
-  islandLastW   = 0;
-  islandLastH   = 0;
+  islandClearArea();
+  islandState = ISLAND_HIDDEN;
+  islandCount = 0;
+  islandLastW = 0;
+  islandLastH = 0;
 }
 
 void islandPush(NotifType type, const char* text) {
+  // Push ke stack
   for (int i = ISLAND_MAX_STACK - 1; i > 0; i--) islandStack[i] = islandStack[i-1];
   islandStack[0].type  = type;
   islandStack[0].valid = true;
@@ -386,19 +378,78 @@ void islandPush(NotifType type, const char* text) {
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
 
-  islandShowAt  = millis();
-  islandHideAt  = millis() + ISLAND_SHOW_MS;
-  islandVisible = true;
-  islandDraw();
+  // Trigger slide-in animation
+  islandShowAt   = millis();
+  islandHideAt   = millis() + ISLAND_SHOW_MS;
+  islandAnimStart= millis();
+  islandState    = ISLAND_SLIDING_IN;
 }
 
 void islandTick() {
-  if (!islandVisible) return;
-  if (millis() >= islandHideAt) { islandHide(); return; }
-  islandUpdateBar();
+  unsigned long now = millis();
+  
+  switch (islandState) {
+    case ISLAND_HIDDEN:
+      break;
+      
+    case ISLAND_SLIDING_IN: {
+      unsigned long elapsed = now - islandAnimStart;
+      if (elapsed >= ISLAND_ANIM_MS) {
+        // Animation complete
+        islandState = ISLAND_VISIBLE;
+        islandDraw(0);
+      } else {
+        // Animate slide from top
+        float progress = (float)elapsed / ISLAND_ANIM_MS;
+        // Ease-out cubic
+        progress = 1 - pow(1 - progress, 3);
+        int n = min(islandCount, ISLAND_MAX_STACK);
+        int targetH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
+        int offsetY = (int)(-targetH * (1.0f - progress));
+        islandDraw(offsetY);
+      }
+      break;
+    }
+    
+    case ISLAND_VISIBLE:
+      if (now >= islandHideAt) {
+        // Start slide-out animation
+        islandAnimStart = now;
+        islandState = ISLAND_SLIDING_OUT;
+      } else {
+        // Redraw for REC blinking dot
+        if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
+          islandDraw(0);
+        }
+      }
+      break;
+      
+    case ISLAND_SLIDING_OUT: {
+      unsigned long elapsed = now - islandAnimStart;
+      if (elapsed >= ISLAND_ANIM_MS) {
+        // Animation complete - hide
+        islandHide();
+      } else {
+        // Animate slide to top
+        float progress = (float)elapsed / ISLAND_ANIM_MS;
+        // Ease-in cubic
+        progress = pow(progress, 3);
+        int n = min(islandCount, ISLAND_MAX_STACK);
+        int targetH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
+        int offsetY = (int)(-targetH * progress);
+        islandDraw(offsetY);
+      }
+      break;
+    }
+  }
 }
 
-void islandForceHide() { if (islandVisible) islandHide(); }
+void islandForceHide() { 
+  if (islandState != ISLAND_HIDDEN) {
+    islandClearArea();
+    islandHide();
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEGANOGRAFI LSB
@@ -1276,7 +1327,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.4  island+stego  4-BTN",DISP_W/2-70,103);
+  lcd.drawString("v5.4  smooth-island  4-BTN",DISP_W/2-80,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1289,7 +1340,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND NOTIF","non-blocking  2s auto-dismiss",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND NOTIF","smooth slide-in/out  2s auto",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(182,"STEGO LSB","RGB565 embed  32 char payload",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
   lcd.drawRect(28,196,DISP_W-56,4,COL_GRAY_3);
@@ -1483,7 +1534,7 @@ void renderViewfinder() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview — dengan STEGANOGRAFI + DYNAMIC ISLAND
+//  captureAndPreview — dengan STEGANOGRAFI + DYNAMIC ISLAND (SMOOTH)
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if(ledFlashEnabled) {
@@ -1499,6 +1550,7 @@ void captureAndPreview() {
   if(ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if(!fb) { blinkLED(5,50,50); return; }
 
+  // Display captured frame IMMEDIATELY - no freeze
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -1528,6 +1580,7 @@ void captureAndPreview() {
   }
   esp_camera_fb_return(fb);
 
+  // PUSH NOTIFICATION AFTER FRAME IS DISPLAYED - NO FREEZE
   if(saved) {
     char notifText[24]; snprintf(notifText,sizeof(notifText),"SAVED  #%04d",photoCount);
     islandPush(NOTIF_OK, notifText);
@@ -1537,6 +1590,8 @@ void captureAndPreview() {
     blinkLED(5,50,50);
   }
 
+  // Island will auto-animate and stay visible for ISLAND_SHOW_MS
+  // Continue rendering viewfinder normally - island overlays on top
   fpsLastTime=millis(); fpsFrameCount=0;
   resetAllButtons();
 }
@@ -1600,7 +1655,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.4-island-stego 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.4-smooth-island 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
