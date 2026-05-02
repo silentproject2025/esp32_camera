@@ -1,12 +1,15 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.4-island-stego-smooth
+ * Version: v5.4-island-stego-smooth-FIXED
  *
- * FIX v5.4-smooth:
- *  - Dynamic Island dengan animasi slide-in/out yang smooth
- *  - Hapus progress bar, pakai fade/pulse animation
- *  - Fix bug island hilang setelah capture (freeze)
- *  - Island tetap visible selama ISLAND_SHOW_MS
+ * FIX v5.4-smooth-FIXED:
+ *  - [BUG1] islandLastY tidak lagi disimpan sebagai offsetY animasi
+ *            → clearArea() sekarang selalu bersihkan posisi FINAL island (y=0)
+ *  - [BUG2] islandTick() dihapus dari renderViewfinder()
+ *            → tidak ada lagi double-call per frame (penyebab utama kedipan)
+ *  - [BUG3] islandDraw() skip render jika island masih sepenuhnya di atas layar
+ *            → tidak ada render artefak saat slide-in belum sampai y=0
+ *  - [BUG4] clearArea menggunakan iH final, bukan nilai lama dari islandLastH
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -258,7 +261,16 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — Notification System (SMOOTH VERSION)
+//  DYNAMIC ISLAND — Notification System (FIXED VERSION)
+//
+//  CHANGELOG FIX:
+//  1. islandLastY selalu 0 (posisi final), bukan offsetY animasi
+//     → clearArea() bersihkan area yang benar setiap saat
+//  2. islandTick() DIHAPUS dari renderViewfinder()
+//     → panggil hanya 1x di loop() setelah switch-case
+//  3. islandDraw() early-return jika island masih sepenuhnya di atas layar
+//     → tidak ada artefak saat offsetY sangat negatif
+//  4. clearArea() membersihkan area final + margin atas untuk slide animasi
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      2000
 #define ISLAND_ANIM_MS       150
@@ -286,7 +298,7 @@ static unsigned long islandShowAt   = 0;
 static unsigned long islandHideAt   = 0;
 static unsigned long islandAnimStart= 0;
 static int           islandLastX    = 0;
-static int           islandLastY    = 0;
+static int           islandLastY    = 0;   // FIX: selalu 0, bukan offsetY
 static int           islandLastW    = 0;
 static int           islandLastH    = 0;
 
@@ -325,6 +337,10 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
+// FIX: islandDraw sekarang:
+//   - menyimpan islandLastY = 0 (posisi FINAL, bukan offsetY animasi)
+//   - early-return jika island sepenuhnya di atas layar (offsetY + iH <= 0)
+//   - clearArea dengan height = iH + abs(offsetY) untuk bersihkan area slide
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
@@ -334,12 +350,24 @@ static void islandDraw(int offsetY = 0) {
   int iX = ISLAND_CX - iW / 2;
   int iY = offsetY;
 
-  islandLastX = iX; islandLastY = iY;
-  islandLastW = iW; islandLastH = iH;
+  // FIX BUG1 + BUG4: simpan posisi FINAL (y=0), bukan posisi animasi
+  // Ini memastikan clearArea() selalu tepat sasaran
+  islandLastX = iX;
+  islandLastY = 0;        // ← kunci fix: selalu 0
+  islandLastW = iW;
+  islandLastH = iH;       // ← iH dihitung fresh di sini, bukan nilai lama
 
-  // Clear area
-  lcd.fillRect(iX - 2, iY - 2, iW + 4, iH + 4, COL_BLACK);
-  
+  // FIX BUG3: jika island masih sepenuhnya di atas layar, bersihkan dan keluar
+  if (iY + iH <= 0) {
+    // Bersihkan area atas layar (margin ekstra)
+    lcd.fillRect(iX - 2, 0, iW + 4, 4, COL_BLACK);
+    return;
+  }
+
+  // Bersihkan area animasi: dari atas layar sampai bawah island
+  // Ini menghapus "ghost" dari frame sebelumnya
+  lcd.fillRect(iX - 2, 0, iW + 4, iH + 4 + max(0, -offsetY), COL_BLACK);
+
   // Draw island background & border
   lcd.fillRoundRect(iX, iY, iW, iH, 6, COL_BLACK);
   lcd.drawFastVLine(iX,          iY, iH, COL_GRAY_3);
@@ -357,7 +385,9 @@ static void islandDraw(int offsetY = 0) {
 
 static void islandClearArea() {
   if (islandLastW > 0 && islandLastH > 0) {
-    lcd.fillRect(islandLastX - 2, islandLastY - 2, islandLastW + 4, islandLastH + 4, COL_BLACK);
+    // FIX: islandLastY selalu 0, jadi ini membersihkan dari y=0 (atas layar)
+    // dengan tinggi = iH + margin, cukup untuk menghapus island apapun posisinya
+    lcd.fillRect(islandLastX - 2, 0, islandLastW + 4, islandLastH + 6, COL_BLACK);
   }
 }
 
@@ -385,24 +415,26 @@ void islandPush(NotifType type, const char* text) {
   islandState    = ISLAND_SLIDING_IN;
 }
 
+// FIX: islandTick() TIDAK lagi dipanggil dari renderViewfinder()
+// Hanya dipanggil 1x per loop() di akhir, setelah switch-case semua mode
 void islandTick() {
   unsigned long now = millis();
-  
+
   switch (islandState) {
     case ISLAND_HIDDEN:
       break;
-      
+
     case ISLAND_SLIDING_IN: {
       unsigned long elapsed = now - islandAnimStart;
       if (elapsed >= ISLAND_ANIM_MS) {
-        // Animation complete
+        // Animasi selesai → tampilkan di posisi final
         islandState = ISLAND_VISIBLE;
         islandDraw(0);
       } else {
-        // Animate slide from top
+        // Animasi slide dari atas
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         // Ease-out cubic
-        progress = 1 - pow(1 - progress, 3);
+        progress = 1.0f - pow(1.0f - progress, 3);
         int n = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
         int offsetY = (int)(-targetH * (1.0f - progress));
@@ -410,27 +442,27 @@ void islandTick() {
       }
       break;
     }
-    
+
     case ISLAND_VISIBLE:
       if (now >= islandHideAt) {
-        // Start slide-out animation
+        // Mulai slide-out
         islandAnimStart = now;
         islandState = ISLAND_SLIDING_OUT;
       } else {
-        // Redraw for REC blinking dot
+        // Redraw untuk REC blinking dot
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
           islandDraw(0);
         }
       }
       break;
-      
+
     case ISLAND_SLIDING_OUT: {
       unsigned long elapsed = now - islandAnimStart;
       if (elapsed >= ISLAND_ANIM_MS) {
-        // Animation complete - hide
+        // Animasi selesai → sembunyikan
         islandHide();
       } else {
-        // Animate slide to top
+        // Animasi slide ke atas
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         // Ease-in cubic
         progress = pow(progress, 3);
@@ -444,7 +476,7 @@ void islandTick() {
   }
 }
 
-void islandForceHide() { 
+void islandForceHide() {
   if (islandState != ISLAND_HIDDEN) {
     islandClearArea();
     islandHide();
@@ -1494,6 +1526,7 @@ void applyExpPreset(uint8_t preset) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Viewfinder
+//  FIX: islandTick() DIHAPUS dari sini — tidak boleh dipanggil 2x per frame
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb=esp_camera_fb_get(); if(!fb) return;
@@ -1524,7 +1557,8 @@ void renderViewfinder() {
 
     if(recActive) drawRecIndicator();
 
-    islandTick();
+    // ✅ FIX: islandTick() DIHAPUS dari sini
+    // islandTick() sekarang dipanggil 1x saja di akhir loop()
     updateFPS();
   } else {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
@@ -1534,7 +1568,7 @@ void renderViewfinder() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview — dengan STEGANOGRAFI + DYNAMIC ISLAND (SMOOTH)
+//  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if(ledFlashEnabled) {
@@ -1550,7 +1584,7 @@ void captureAndPreview() {
   if(ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if(!fb) { blinkLED(5,50,50); return; }
 
-  // Display captured frame IMMEDIATELY - no freeze
+  // Tampilkan frame yang dicapture langsung — tidak ada freeze
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -1580,7 +1614,7 @@ void captureAndPreview() {
   }
   esp_camera_fb_return(fb);
 
-  // PUSH NOTIFICATION AFTER FRAME IS DISPLAYED - NO FREEZE
+  // Push notifikasi setelah frame ditampilkan
   if(saved) {
     char notifText[24]; snprintf(notifText,sizeof(notifText),"SAVED  #%04d",photoCount);
     islandPush(NOTIF_OK, notifText);
@@ -1590,8 +1624,6 @@ void captureAndPreview() {
     blinkLED(5,50,50);
   }
 
-  // Island will auto-animate and stay visible for ISLAND_SHOW_MS
-  // Continue rendering viewfinder normally - island overlays on top
   fpsLastTime=millis(); fpsFrameCount=0;
   resetAllButtons();
 }
@@ -1655,7 +1687,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.4-smooth-island 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.4-smooth-island-FIXED 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1875,6 +1907,8 @@ void handleModeDialogDelete(ButtonEvent evt) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LOOP
+//  FIX: islandTick() sekarang hanya dipanggil 1x di sini, setelah switch-case
+//       Tidak ada lagi double-call dari renderViewfinder()
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
@@ -1896,7 +1930,10 @@ void loop() {
     photoViewClearCaption();
 
   if(usbModeActive) { if(evtBoot.valid) exitUSBMode(); return; }
-  if(recActive)     { if(evtB.valid) stopRecording(); else recordFrame(); return; }
+
+  // ✅ FIX: recActive handler tetap memanggil islandTick() sendiri di recordFrame()
+  // karena recordFrame() punya timing sendiri dan tidak lewat switch-case di bawah
+  if(recActive) { if(evtB.valid) stopRecording(); else recordFrame(); return; }
 
   switch(appMode) {
     case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                break;
@@ -1909,5 +1946,7 @@ void loop() {
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);              break;
   }
 
-  if(appMode != MODE_VIEWFINDER) islandTick();
+  // ✅ FIX: islandTick() dipanggil 1x saja di sini untuk SEMUA mode
+  // termasuk MODE_VIEWFINDER yang sebelumnya juga memanggil dari renderViewfinder()
+  islandTick();
 }
