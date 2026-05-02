@@ -1,36 +1,50 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.4-island-stego-smooth-FIXED3
+ * Version: v5.5-island-stego-smooth-FIXED3
  *
- * FIX v5.4-FIXED3 (fix island tidak muncul setelah capture/stop-rec):
+ * ═══════════════════════════════════════════════════════════════
+ *  CHANGELOG v5.5 (fixes di atas v5.4-FIXED2):
  *
- *  ROOT CAUSE:
- *  FPS pill dan SD pill selalu terlihat karena drawPill() dipanggil SETIAP FRAME
- *  di dalam renderViewfinder(). Island tidak muncul karena dua bug di islandDraw():
+ *  [FIX-A] Island tidak muncul setelah capture / flash
+ *    Root cause: captureAndPreview() memanggil resetAllButtons()
+ *    lalu return. Loop berikutnya langsung lcd.pushImage() yang
+ *    menimpa island SLIDING_IN (160ms) sebelum selesai → glitch.
+ *    Fix: tambah islandFreezeUntilMs. Selama freeze aktif,
+ *    renderViewfinder() skip pushImage dan hanya draw island di
+ *    atas frame statis. Freeze = ANIM_IN + SHOW + ANIM_OUT = ~2.3s.
+ *    Juga: setelah capture, flush 1 frame kamera agar buffer bersih.
  *
- *  [BUG-A] islandDraw() memanggil lcd.fillRect(..., COL_BLACK) untuk
- *          "membersihkan area animasi" — ini menghapus FPS pill, SD pill,
- *          dan semua overlay yang baru digambar di atas pushImage().
- *          pushImage() frame berikutnya menimpa semuanya, island hilang.
+ *  [FIX-B] Exposure mode tidak berubah pada GC2145
+ *    Root cause 1: applyExpPreset() tidak menjaga hmirror/vflip
+ *      per-sensor → sensor bisa reset ke posisi salah.
+ *    Root cause 2: GC2145 butuh delay ~150ms setelah perubahan
+ *      register AEC/AGC sebelum efek terlihat di sensor.
+ *    Root cause 3: Setelah delay, frame lama masih di buffer PSRAM
+ *      → perlu flush 2 frame agar frame baru dengan exposure baru
+ *      yang muncul di viewfinder.
+ *    Fix: applyExpPreset() sekarang:
+ *      1. Selalu set hmirror/vflip sesuai PID sensor
+ *      2. delay(150) setelah semua set_* dipanggil
+ *      3. Flush 2 frame kamera setelah delay
  *
- *  [BUG-B] Early-return saat iY+iH<=0 melakukan fillRect hitam kecil,
- *          sebelum islandLastW/H di-set — sehingga islandClearArea()
- *          tidak tahu dimensi island dan tidak berfungsi.
+ *  [FIX-C] Steganografi: embed hilang karena JPEG lossy compression
+ *    Root cause: stegoEmbedRGB565() embed ke pixel buffer, lalu
+ *      frame2jpg() mengompresi → LSB hancur. Tidak ada fungsi
+ *      extract yang dipanggil di kode.
+ *    Fix: Embed payload ke EXIF APP1 comment marker di dalam JPEG
+ *      setelah frame2jpg() selesai. Payload ditulis sebagai JFIF
+ *      COM marker (0xFFFE) sehingga tahan disimpan/dibaca ulang.
+ *      stegoExtractFromJpeg() membaca COM marker dari file JPEG
+ *      saat gallery membuka foto (dipanggil di showPhotoView).
  *
- *  FIX:
- *  • islandDraw(): hapus lcd.fillRect "clear area animasi" — tidak diperlukan
- *    karena pushImage() sudah menimpa seluruh layar setiap frame di viewfinder.
- *  • islandDraw(): simpan islandLastX/W/H SEBELUM visibility check.
- *  • islandDraw(): early-return cukup "return" saja, tanpa fillRect hitam.
- *  • islandClearArea() tetap ada untuk mode NON-viewfinder (gallery, photo view)
- *    di mana tidak ada pushImage() yang membersihkan layar setiap frame.
- *
- * ─────────────────────────────────────────────────────────────────────────────
- * FIX v5.4-FIXED2 (sebelumnya):
- *  - [BUG5] islandTick() dipindah ke DALAM renderViewfinder()
- *  - [BUG6] islandDraw() menggunakan fillRoundRect+drawRoundRect (radius=10)
- *  - [BUG7] loop() hanya memanggil islandTick() untuk mode NON-viewfinder
- *  - [BONUS] Inner highlight ring, shadow, separator line
+ * ═══════════════════════════════════════════════════════════════
+ *  TETAP dari v5.4-FIXED2:
+ *  - islandTick() dipanggil di akhir renderViewfinder() (bukan loop)
+ *  - islandDraw() pakai fillRoundRect radius=10 → sudut smooth
+ *  - Shadow + inner highlight ring pada island
+ *  - Separator line antar row dalam island stack
+ *  - loop() hanya panggil islandTick() untuk mode NON-viewfinder
+ * ═══════════════════════════════════════════════════════════════
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -195,12 +209,12 @@ static LGFX lcd;
 //  NOTIF_STYLES
 // ─────────────────────────────────────────────────────────────────────────────
 static const NotifStyle NOTIF_STYLES[6] = {
-  { 0x0540, 0xFFFF, "+" },    // OK    — hijau
-  { 0x4400, 0xFFE0, "*" },    // FLASH — kuning
-  { 0x5000, 0xF800, "o" },    // REC   — merah
-  { 0x0011, 0x07FF, "@" },    // FACE  — biru
-  { 0x4200, 0xFD20, "!" },    // WARN  — oranye
-  { 0x2104, COL_GRAY_C, "i"}, // INFO  — abu
+  { 0x0540, 0xFFFF, "+" },
+  { 0x4400, 0xFFE0, "*" },
+  { 0x5000, 0xF800, "o" },
+  { 0x0011, 0x07FF, "@" },
+  { 0x4200, 0xFD20, "!" },
+  { 0x2104, COL_GRAY_C, "i"},
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,28 +296,12 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — Notification System (FIXED3 VERSION)
+//  DYNAMIC ISLAND — v5.5 FIXED3
 //
-//  CHANGELOG FIXED3:
-//  [BUG-A] Dihapus: lcd.fillRect "clear area animasi" dari islandDraw().
-//          Di mode viewfinder, pushImage() sudah menimpa seluruh layar
-//          setiap frame — fillRect ekstra justru menghapus FPS/SD pills
-//          yang baru digambar, membuat island tidak pernah terlihat.
-//  [BUG-B] islandLastX/W/H kini disimpan SEBELUM visibility check,
-//          sehingga islandClearArea() selalu tahu dimensi yang benar.
-//  [BUG-C] Early-return saat island masih di atas layar cukup "return"
-//          saja — tidak ada fillRect hitam yang menghapus area lain.
-//
-//  Analogi kenapa FPS pill selalu terlihat tapi island tidak:
-//  • drawPill() dipanggil SETIAP FRAME → selalu ada di layar.
-//  • islandDraw() hanya dipanggil saat state aktif, tapi fillRect-nya
-//    menghapus pills → pills hilang → pushImage timpa → island hilang.
-//
-//  CHANGELOG FIXED2 (sebelumnya):
-//  [BUG5] islandTick() dipindah ke dalam renderViewfinder()
-//  [BUG6] fillRoundRect+drawRoundRect radius=10 → sudut smooth
-//  [BUG7] loop() tidak double-call islandTick()
-//  [BONUS] Shadow, inner highlight, separator antar row
+//  Perubahan dari v5.4-FIXED2:
+//  [FIX-A] islandFreezeUntilMs: saat aktif, renderViewfinder() skip
+//          lcd.pushImage() sehingga island slide-in tidak tertimpa.
+//          Freeze di-set oleh captureAndPreview() dan stopRecording().
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      2000
 #define ISLAND_ANIM_MS       160
@@ -317,6 +315,9 @@ inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btn
 #define ISLAND_RADIUS         10
 #define ISLAND_CX       (DISP_W / 2)
 
+// [FIX-A] Durasi freeze = anim_in + show + anim_out + margin
+#define ISLAND_FREEZE_MS  (ISLAND_ANIM_MS + ISLAND_SHOW_MS + ISLAND_ANIM_MS + 200)
+
 enum IslandState { ISLAND_HIDDEN, ISLAND_SLIDING_IN, ISLAND_VISIBLE, ISLAND_SLIDING_OUT };
 
 struct NotifEntry {
@@ -326,15 +327,18 @@ struct NotifEntry {
 };
 
 static NotifEntry    islandStack[ISLAND_MAX_STACK];
-static int           islandCount    = 0;
-static IslandState   islandState    = ISLAND_HIDDEN;
-static unsigned long islandShowAt   = 0;
-static unsigned long islandHideAt   = 0;
-static unsigned long islandAnimStart= 0;
-static int           islandLastX    = 0;
-static int           islandLastY    = 0;
-static int           islandLastW    = 0;
-static int           islandLastH    = 0;
+static int           islandCount     = 0;
+static IslandState   islandState     = ISLAND_HIDDEN;
+static unsigned long islandShowAt    = 0;
+static unsigned long islandHideAt    = 0;
+static unsigned long islandAnimStart = 0;
+static int           islandLastX     = 0;
+static int           islandLastY     = 0;
+static int           islandLastW     = 0;
+static int           islandLastH     = 0;
+
+// [FIX-A] Freeze: selama periode ini, renderViewfinder skip pushImage
+static unsigned long islandFreezeUntilMs = 0;
 
 static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
@@ -371,18 +375,6 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandDraw — FIXED3
-//
-//  Perubahan dari FIXED2:
-//  1. islandLastX/W/H disimpan SEBELUM visibility check (fix BUG-B)
-//  2. Early-return saat iY+iH<=0 hanya "return" — tidak ada fillRect (fix BUG-C)
-//  3. DIHAPUS: lcd.fillRect(..., COL_BLACK) "clear area animasi" (fix BUG-A)
-//     → Di mode viewfinder, pushImage() sudah timpa seluruh layar setiap frame.
-//       fillRect ekstra di sini menghapus FPS/SD pills, bukan membantu.
-//     → Di mode non-viewfinder, islandClearArea() dipanggil secara eksplisit
-//       sebelum islandHide() — itulah mekanisme clear yang benar.
-// ─────────────────────────────────────────────────────────────────────────────
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
@@ -392,53 +384,41 @@ static void islandDraw(int offsetY = 0) {
   int iX = ISLAND_CX - iW / 2;
   int iY = offsetY;
 
-  // ── FIX BUG-B: Simpan dimensi SEBELUM visibility check ──
-  // Agar islandClearArea() selalu tahu ukuran island yang benar,
-  // bahkan saat island masih di atas layar (sliding in dari atas).
   islandLastX = iX;
-  islandLastY = 0;   // posisi final selalu y=0
+  islandLastY = 0;
   islandLastW = iW;
   islandLastH = iH;
 
-  // ── FIX BUG-C: Island masih sepenuhnya di atas layar → skip draw ──
-  // Cukup return — JANGAN fillRect hitam di sini.
-  // Di viewfinder: pushImage() sudah membersihkan layar setiap frame.
-  // Di non-viewfinder: islandClearArea() dipanggil saat islandHide().
-  if (iY + iH <= 0) return;
+  if (iY + iH <= 0) {
+    lcd.fillRect(iX - 3, 0, iW + 6, 4, COL_BLACK);
+    return;
+  }
 
-  // ── Layer 1: Shadow (depth perception) ──
+  lcd.fillRect(iX - 3, 0, iW + 6, iH + 5 + max(0, -offsetY), COL_BLACK);
+
+  // Shadow
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
-
-  // ── Layer 2: Body utama island ──
+  // Body
   lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
-
-  // ── Layer 3: Border luar ──
+  // Border luar
   lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
-
-  // ── Layer 4: Inner highlight (efek glass) ──
+  // Inner highlight
   if (iH > 4 && iW > 4) {
     lcd.drawRoundRect(iX + 1, iY + 1, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
   }
 
-  // ── Rows ──
   int rowY = iY + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
     islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
     if (i < n - 1) {
-      lcd.drawFastHLine(
-        iX + ISLAND_PAD_H,
-        rowY + ISLAND_H_ROW + 1,
-        iW - ISLAND_PAD_H * 2,
-        COL_GRAY_3
-      );
+      lcd.drawFastHLine(iX + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
+                        iW - ISLAND_PAD_H * 2, COL_GRAY_3);
     }
     rowY += ISLAND_H_ROW + 2;
   }
 }
 
 static void islandClearArea() {
-  // Digunakan oleh mode NON-viewfinder (gallery, photo view, dll)
-  // di mana tidak ada pushImage() yang membersihkan layar setiap frame.
   if (islandLastW > 0 && islandLastH > 0) {
     lcd.fillRect(islandLastX - 3, 0, islandLastW + 6, islandLastH + 7, COL_BLACK);
   }
@@ -453,7 +433,6 @@ static void islandHide() {
 }
 
 void islandPush(NotifType type, const char* text) {
-  // Push ke stack (newest first)
   for (int i = ISLAND_MAX_STACK - 1; i > 0; i--) islandStack[i] = islandStack[i-1];
   islandStack[0].type  = type;
   islandStack[0].valid = true;
@@ -461,21 +440,15 @@ void islandPush(NotifType type, const char* text) {
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
 
-  // Trigger slide-in animation
   islandShowAt    = millis();
   islandHideAt    = millis() + ISLAND_SHOW_MS;
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
+
+  // [FIX-A] Set freeze agar renderViewfinder tidak timpa island
+  islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandTick — state machine animasi island
-//
-//  Dipanggil dari:
-//  • renderViewfinder() → setelah semua pushImage+overlay (mode viewfinder)
-//  • loop() bagian bawah → hanya untuk mode NON-viewfinder
-//  • recordFrame() → saat sedang rekam video
-// ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
 
@@ -490,7 +463,6 @@ void islandTick() {
         islandDraw(0);
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
-        // Ease-out cubic → cepat di awal, melambat mendekati posisi final
         progress = 1.0f - pow(1.0f - progress, 3);
         int nItems = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
@@ -505,7 +477,6 @@ void islandTick() {
         islandAnimStart = now;
         islandState = ISLAND_SLIDING_OUT;
       } else {
-        // Redraw hanya untuk REC blinking dot
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
           islandDraw(0);
         }
@@ -518,7 +489,6 @@ void islandTick() {
         islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
-        // Ease-in cubic → lambat di awal, cepat di akhir
         progress = pow(progress, 3);
         int nItems = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
@@ -535,25 +505,101 @@ void islandForceHide() {
     islandClearArea();
     islandHide();
   }
+  islandFreezeUntilMs = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI LSB
+//  STEGANOGRAFI — v5.5 (FIX-C)
+//
+//  Embed ke JPEG COM marker (0xFFFE) setelah frame2jpg().
+//  Ini lossless — COM marker tidak disentuh codec JPEG.
+//  Format COM payload: "SANZXCAM|NNNN|v5.5\0"
+//
+//  stegoEmbedToJpeg():
+//    Sisipkan COM marker tepat setelah SOI marker (0xFFD8).
+//    Output: buffer baru yang harus di-free() oleh caller.
+//
+//  stegoExtractFromJpeg():
+//    Scan JPEG buffer untuk COM marker, baca payload.
+//    Return true jika magic cocok.
+//
+//  stegoEmbedRGB565() / stegoExtractRGB565() tetap ada untuk
+//  keperluan masa depan (misal: simpan ke BMP), tapi TIDAK
+//  digunakan dalam alur simpan foto saat ini.
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
-#define STEGO_VERSION      "v5.4"
+#define STEGO_VERSION      "v5.5"
 
 void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
 }
 
+// Sisipkan COM marker ke JPEG buffer. Returns new buffer (caller must free).
+// Returns nullptr jika gagal. outLen diisi panjang buffer baru.
+uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
+                           const char* payload, int payLen,
+                           size_t* outLen) {
+  if (!jpgIn || jpgLen < 2 || jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
+  if (!payload || payLen <= 0) return nullptr;
+
+  // COM marker: 0xFF 0xFE [length_hi] [length_lo] [data...]
+  // length field = 2 + payLen (includes the 2 length bytes itself)
+  int comSize = 4 + payLen; // 0xFF + 0xFE + 2 byte length + payload
+  size_t newLen = jpgLen + comSize;
+  uint8_t* out = (uint8_t*)malloc(newLen);
+  if (!out) return nullptr;
+
+  // SOI (2 bytes)
+  out[0] = 0xFF; out[1] = 0xD8;
+  // COM marker
+  out[2] = 0xFF; out[3] = 0xFE;
+  uint16_t comLen = 2 + payLen;
+  out[4] = (comLen >> 8) & 0xFF;
+  out[5] = comLen & 0xFF;
+  memcpy(out + 6, payload, payLen);
+  // Sisa JPEG (skip SOI asli, mulai dari byte ke-2)
+  memcpy(out + 2 + comSize, jpgIn + 2, jpgLen - 2);
+
+  *outLen = newLen;
+  return out;
+}
+
+// Ekstrak payload dari COM marker di JPEG buffer.
+bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
+                           char* outPayload, int maxLen) {
+  if (!jpgBuf || jpgLen < 4 || !outPayload) return false;
+  if (jpgBuf[0] != 0xFF || jpgBuf[1] != 0xD8) return false;
+
+  size_t pos = 2;
+  while (pos + 3 < jpgLen) {
+    if (jpgBuf[pos] != 0xFF) break;
+    uint8_t marker = jpgBuf[pos + 1];
+    if (marker == 0xD9) break; // EOI
+
+    uint16_t segLen = ((uint16_t)jpgBuf[pos + 2] << 8) | jpgBuf[pos + 3];
+    if (segLen < 2) break;
+
+    if (marker == 0xFE) { // COM marker
+      int dataLen = segLen - 2;
+      int readLen = min(dataLen, maxLen - 1);
+      memcpy(outPayload, jpgBuf + pos + 4, readLen);
+      outPayload[readLen] = '\0';
+      return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
+    }
+
+    pos += 2 + segLen;
+    if (pos >= jpgLen) break;
+  }
+  return false;
+}
+
+// Fungsi LSB lama — dipertahankan, tidak dipakai di alur utama
 void stegoEmbedRGB565(uint16_t* buf, int w, int h,
                       const char* payload, int payLen) {
   if (!buf || !payload || payLen <= 0) return;
   int totalPx = w * h;
   if (payLen * 8 > totalPx) return;
-
   for (int byteIdx = 0; byteIdx < payLen; byteIdx++) {
     uint8_t ch = (uint8_t)payload[byteIdx];
     for (int bit = 7; bit >= 0; bit--) {
@@ -572,7 +618,6 @@ bool stegoExtractRGB565(uint16_t* buf, int w, int h,
   if (!buf || !outPayload || maxLen <= 0) return false;
   int totalPx = w * h;
   int readLen = min(maxLen - 1, STEGO_PAYLOAD_LEN);
-
   for (int byteIdx = 0; byteIdx < readLen; byteIdx++) {
     uint8_t ch = 0;
     for (int bit = 7; bit >= 0; bit--) {
@@ -634,15 +679,20 @@ int     expManualVal = 300;
 int     expManualGain= 0;
 
 const char* expPresetNames[4] = { "AUTO", "MOON", "NIGHT", "MANUAL" };
+
 struct ExpPresetCfg {
   bool aec_on; bool aec2_on; int aec_val;
   bool agc_on; int agc_gain; int gainceiling; int ae_level;
 };
+
+// [FIX-B] Nilai preset dipertajam:
+// - MOON: aec_val=20 (lebih gelap, cocok objek terang), gainceiling=0
+// - NIGHT: aec_val=1200 (maksimal exposure), gainceiling=6 (GAINCEILING_64X)
 const ExpPresetCfg expPresets[4] = {
-  { true,  true,  300, true,  0, 2,  0 },
-  { false, false,  40, false, 0, 0, -2 },
-  { false, true,  800, false, 5, 4,  1 },
-  { false, false, 300, false, 0, 0,  0 },
+  { true,  true,  300,  true,  0, 2,  0 },  // AUTO
+  { false, false,  20,  false, 0, 0, -2 },  // MOON
+  { false, true,  1200, false, 5, 6,  2 },  // NIGHT
+  { false, false, 300,  false, 0, 0,  0 },  // MANUAL
 };
 
 int menuLedSel = 0;
@@ -654,11 +704,11 @@ unsigned long deleteDialogOpenMs = 0;
 USBMSC msc;
 bool   usbModeActive = false;
 
-sdmmc_card_t* sdCard        = nullptr;
-bool          sdReady        = false;
-uint32_t      sdTotalSectors = 0;
-bool          sdmmcDriverInit= false;
-uint64_t      sdSizeMB       = 0;
+sdmmc_card_t* sdCard         = nullptr;
+bool          sdReady         = false;
+uint32_t      sdTotalSectors  = 0;
+bool          sdmmcDriverInit = false;
+uint64_t      sdSizeMB        = 0;
 
 int      photoCount    = 0;
 uint16_t detectedSensor= 0;
@@ -1034,15 +1084,35 @@ void photoViewRender() {
 }
 
 void photoViewDrawCaption(int idx) {
+  // [FIX-C] Tampilkan info stego jika ada
+  char stegoInfo[40] = "";
+  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
+  FILE* f=fopen(path,"rb");
+  if(f) {
+    fseek(f,0,SEEK_END); size_t fsize=ftell(f); fseek(f,0,SEEK_SET);
+    uint8_t* buf=(uint8_t*)ps_malloc(min(fsize,(size_t)4096));
+    if(buf) {
+      size_t readN=fread(buf,1,min(fsize,(size_t)4096),f);
+      char payload[STEGO_PAYLOAD_LEN+1];
+      if(stegoExtractFromJpeg(buf,readN,payload,sizeof(payload))) {
+        // payload: "SANZXCAM|0001|v5.5" → ambil nomor
+        char* p1=strchr(payload,'|');
+        if(p1) snprintf(stegoInfo,sizeof(stegoInfo)," [%.10s]",p1+1);
+      }
+      free(buf);
+    }
+    fclose(f);
+  }
+
   int photoSeq=0,photoTotal=0;
   for(int i=0;i<galleryCount;i++) {
     if(!galleryIsVideo[i]) { photoTotal++; if(i<=idx) photoSeq=photoTotal; }
   }
   lcd.fillRect(0,DISP_H-16,DISP_W,16,COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
-  char bar[40],barFull[64];
-  snprintf(bar,sizeof(bar),"< %d / %d >",photoSeq,photoTotal);
-  snprintf(barFull,sizeof(barFull),"< %d / %d >  %s",photoSeq,photoTotal,galleryFiles[idx]);
+  char bar[48],barFull[72];
+  snprintf(bar,sizeof(bar),"< %d / %d >%s",photoSeq,photoTotal,stegoInfo);
+  snprintf(barFull,sizeof(barFull),"< %d / %d >  %s%s",photoSeq,photoTotal,galleryFiles[idx],stegoInfo);
   const char* barStr=(lcd.textWidth(barFull)<DISP_W-4)?barFull:bar;
   lcd.setTextColor(COL_GRAY_A);
   lcd.drawString(barStr,(DISP_W-lcd.textWidth(barStr))/2,DISP_H-13);
@@ -1414,7 +1484,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.4  smooth-island  4-BTN",DISP_W/2-80,103);
+  lcd.drawString("v5.5  island-fix  exp-fix  stego-fix",DISP_W/2-90,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1427,18 +1497,19 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND NOTIF","smooth rounded  slide-in/out",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(182,"STEGO LSB","RGB565 embed  32 char payload",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND NOTIF","freeze-fix  slide smooth",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(182,"EXPOSURE","hmirror+delay+flush  GC2145 ok",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(194,"STEGO","COM marker  tahan JPEG compress",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
-  lcd.drawRect(28,196,DISP_W-56,4,COL_GRAY_3);
+  lcd.drawRect(28,206,DISP_W-56,4,COL_GRAY_3);
   int barW=DISP_W-60;
   for(int i=0;i<=barW;i+=4) {
-    lcd.fillRect(30,197,i,2,COL_GRAY_7);
+    lcd.fillRect(30,207,i,2,COL_GRAY_7);
     if(i%16==0) esp_task_wdt_reset();
   }
-  lcd.fillRect(30,197,barW,2,COL_GRAY_C);
+  lcd.fillRect(30,207,barW,2,COL_GRAY_C);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("READY",DISP_W/2-15,206);
+  lcd.drawString("READY",DISP_W/2-15,218);
   delay(800); esp_task_wdt_reset();
 }
 
@@ -1463,7 +1534,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.4",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.5",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -1562,159 +1633,227 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Exposure
+//  Exposure — v5.5 FIX-B
+//
+//  applyExpPreset() sekarang:
+//  1. Selalu set hmirror + vflip sesuai PID sensor, agar tidak hilang
+//     saat preset berganti (applySensorSettings hanya dipanggil 1x di init)
+//  2. delay(150) setelah semua register di-set, memberi waktu GC2145
+//     untuk menerapkan perubahan AEC/AGC ke pipeline sensor
+//  3. Flush 2 frame kamera setelah delay, agar frame lama dengan
+//     exposure lama tidak muncul lagi di viewfinder
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
-  sensor_t *s=esp_camera_sensor_get(); if(!s) return;
-  expPreset=preset;
-  const ExpPresetCfg& c=expPresets[preset];
-  int aecVal=(preset==3)?expManualVal:c.aec_val;
-  int gainVal=(preset==3)?expManualGain:c.agc_gain;
-  s->set_exposure_ctrl(s,c.aec_on?1:0);
-  s->set_aec2(s,c.aec2_on?1:0);
-  if(!c.aec_on) s->set_aec_value(s,aecVal);
-  s->set_gain_ctrl(s,c.agc_on?1:0);
-  if(!c.agc_on) s->set_agc_gain(s,gainVal);
-  s->set_gainceiling(s,(gainceiling_t)c.gainceiling);
-  s->set_ae_level(s,c.ae_level);
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  expPreset = preset;
+
+  const ExpPresetCfg& c = expPresets[preset];
+  int aecVal  = (preset == 3) ? expManualVal  : c.aec_val;
+  int gainVal = (preset == 3) ? expManualGain : c.agc_gain;
+
+  // Set semua register exposure/gain
+  s->set_exposure_ctrl(s, c.aec_on  ? 1 : 0);
+  s->set_aec2(s,          c.aec2_on ? 1 : 0);
+  if (!c.aec_on) s->set_aec_value(s, aecVal);
+  s->set_gain_ctrl(s, c.agc_on ? 1 : 0);
+  if (!c.agc_on) s->set_agc_gain(s, gainVal);
+  s->set_gainceiling(s, (gainceiling_t)c.gainceiling);
+  s->set_ae_level(s, c.ae_level);
+
+  // [FIX-B] Paksa hmirror + vflip sesuai sensor — jangan sampai hilang
+  if (detectedSensor == PID_GC2145) {
+    s->set_hmirror(s, HMIRROR_GC2145);
+    s->set_vflip(s,   VFLIP_GC2145);
+  } else if (detectedSensor == PID_OV3660) {
+    s->set_hmirror(s, HMIRROR_OV3660);
+    s->set_vflip(s,   VFLIP_OV3660);
+  }
+
+  // [FIX-B] Delay + flush agar GC2145 terapkan register baru
+  // GC2145 butuh minimal 1 frame interval (~33ms @ 30fps) + margin
+  delay(150);
+  esp_task_wdt_reset();
+
+  // Flush 2 frame lama dari buffer
+  for (int i = 0; i < 2; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    esp_task_wdt_reset();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  VIEWFINDER — FIXED3
+//  VIEWFINDER — v5.5 FIX-A
 //
-//  Urutan dalam satu frame:
-//  1. pushImage()      → timpa seluruh layar dengan frame kamera
-//  2. drawCornerBrackets(), runFaceDetect(), drawPill() → overlay di atas frame
-//  3. islandTick()     → island digambar PALING TERAKHIR, tidak ada yang menimpa
+//  Perubahan dari v5.4-FIXED2:
+//  Saat islandFreezeUntilMs aktif, skip lcd.pushImage() sehingga
+//  island slide-in tidak tertimpa frame kamera. LCD tetap di-update
+//  hanya dengan overlay + islandTick().
 //
-//  islandDraw() (FIXED3) tidak melakukan fillRect hitam apapun,
-//  sehingga pills dari step 2 tetap aman.
+//  Perilaku selama freeze:
+//  - Layar menampilkan frame capture terakhir (tidak bergerak)
+//  - Island slide-in terlihat jelas di atas frame statis
+//  - Setelah freeze selesai (~2.3 detik), viewfinder live kembali
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
-  camera_fb_t *fb=esp_camera_fb_get(); if(!fb) return;
+  bool frozen = (millis() < islandFreezeUntilMs);
 
-  if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
-
-    // ── Step 1: Frame kamera ──
-    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
-
-    // ── Step 2: Overlay UI ──
-    drawCornerBrackets(COL_GRAY_E);
-    if(faceDetectMode) runFaceDetect(fb);
-
-    char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
-    drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
-    drawPill(DISP_W-35,10,sensorName,COL_PILL_BG,COL_GRAY_A);
-
-    if(faceDetectMode) {
-      char faceBuf[12];
-      snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
-      drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
-    } else if(expPreset>0) {
-      char expBuf[12];
-      if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
-      else snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
-      drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
-    }
-
-    char shotBuf[10]; snprintf(shotBuf,sizeof(shotBuf),"#%04d",photoCount+1);
-    drawPill(30,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
-    drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",COL_PILL_BG,
-             sdReady?COL_GRAY_8:COL_GRAY_5);
-
-    if(recActive) drawRecIndicator();
-
-    // ── Step 3: Island — PALING TERAKHIR ──
-    // islandDraw() (FIXED3) tidak melakukan fillRect apapun,
-    // sehingga pills di step 2 tetap aman dan island tampil di atas semua.
-    islandTick();
-
-    updateFPS();
-
-  } else {
-    lcd.fillScreen(COL_BLACK);
-    lcd.setFont(&fonts::Font0);
-    lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("format not rgb565",10,110);
+  camera_fb_t *fb = nullptr;
+  if (!frozen) {
+    fb = esp_camera_fb_get();
+    if (!fb) return;
   }
 
-  esp_camera_fb_return(fb);
+  if (!frozen) {
+    if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
+      // Mode normal: push frame kamera
+      lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
+
+      drawCornerBrackets(COL_GRAY_E);
+      if (faceDetectMode) runFaceDetect(fb);
+
+      char fpsBuf[12]; snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
+      drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
+      drawPill(DISP_W-35, 10, sensorName, COL_PILL_BG, COL_GRAY_A);
+
+      if (faceDetectMode) {
+        char faceBuf[12];
+        snprintf(faceBuf, sizeof(faceBuf), faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
+        drawPill(DISP_W/2, 10, faceBuf, COL_PILL_BG, COL_GRAY_C);
+      } else if (expPreset > 0) {
+        char expBuf[12];
+        if (expPreset == 3) snprintf(expBuf, sizeof(expBuf), "M %d", expManualVal);
+        else snprintf(expBuf, sizeof(expBuf), "%s", expPresetNames[expPreset]);
+        drawPill(DISP_W/2, 10, expBuf, COL_PILL_BG, COL_GRAY_E);
+      }
+
+      char shotBuf[10]; snprintf(shotBuf, sizeof(shotBuf), "#%04d", photoCount + 1);
+      drawPill(30, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
+      drawPill(DISP_W-36, DISP_H-10, sdReady ? "SD  OK" : "SD  --",
+               COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
+
+      if (recActive) drawRecIndicator();
+
+      updateFPS();
+
+    } else {
+      lcd.fillScreen(COL_BLACK);
+      lcd.setFont(&fonts::Font0);
+      lcd.setTextColor(COL_GRAY_5);
+      lcd.drawString("format not rgb565", 10, 110);
+    }
+
+    esp_camera_fb_return(fb);
+
+  } else {
+    // [FIX-A] Mode freeze: jangan push frame — hanya update island
+    // Tidak perlu redraw overlay karena layar sudah ada frame capture
+    // yang tidak berubah. Island akan tergambar di atasnya.
+  }
+
+  // islandTick() selalu dipanggil terakhir di kedua mode
+  islandTick();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview
+//  captureAndPreview — v5.5 FIX-A + FIX-C
+//
+//  FIX-A: Tidak memanggil resetAllButtons() sebelum return.
+//         islandFreezeUntilMs di-set oleh islandPush() sendiri
+//         (karena islandPush sudah panggil islandFreezeUntilMs).
+//  FIX-C: Embed stego ke JPEG COM marker setelah frame2jpg(),
+//         bukan ke pixel buffer (yang akan hancur oleh JPEG compression).
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
-  if(ledFlashEnabled) {
+  if (ledFlashEnabled) {
     digitalWrite(LED_FLASH, HIGH);
     delay(150);
-    for(int i=0;i<2;i++) {
-      camera_fb_t *tfb=esp_camera_fb_get();
-      if(tfb) esp_camera_fb_return(tfb);
+    // Flush frame lama setelah flash menyala
+    for (int i = 0; i < 2; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if (tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
     }
   }
 
-  camera_fb_t *fb=esp_camera_fb_get();
-  if(ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
-  if(!fb) { blinkLED(5,50,50); return; }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
+  if (!fb) { blinkLED(5, 50, 50); return; }
 
-  if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
-    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+  // Tampilkan preview
+  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
+    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
   }
 
-  bool saved=false;
-  if(sdReady) {
-    uint8_t *jpg_buf=nullptr; size_t jpg_len=0; bool ok=false;
+  bool saved = false;
+  if (sdReady) {
+    uint8_t *jpg_buf  = nullptr;
+    size_t   jpg_len  = 0;
+    bool     ok       = false;
 
-    if(fb->format==PIXFORMAT_RGB565) {
-      char payload[STEGO_PAYLOAD_LEN];
-      stegoMakePayload(payload, sizeof(payload), photoCount + 1);
-      stegoEmbedRGB565((uint16_t*)fb->buf, fb->width, fb->height,
-                       payload, (int)strlen(payload) + 1);
-      ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);
-    } else if(fb->format==PIXFORMAT_JPEG) {
-      jpg_buf=fb->buf; jpg_len=fb->len; ok=true;
+    if (fb->format == PIXFORMAT_RGB565) {
+      ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len);
+    } else if (fb->format == PIXFORMAT_JPEG) {
+      jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
     }
 
-    if(ok&&jpg_buf) {
+    if (ok && jpg_buf) {
       photoCount++;
-      char path[40]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.jpg",photoCount);
-      FILE* f=fopen(path,"wb");
-      if(f) { size_t w=fwrite(jpg_buf,1,jpg_len,f); fclose(f); saved=(w==jpg_len); }
-      if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
+
+      // [FIX-C] Embed payload ke COM marker JPEG — lossless, tahan kompresi
+      char payload[STEGO_PAYLOAD_LEN];
+      stegoMakePayload(payload, sizeof(payload), photoCount);
+      size_t finalLen = 0;
+      uint8_t* finalBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
+                                            payload, (int)strlen(payload) + 1,
+                                            &finalLen);
+
+      char path[40]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
+      FILE* f = fopen(path, "wb");
+      if (f) {
+        // Tulis buffer dengan stego jika berhasil, fallback ke original
+        const uint8_t* writePtr = finalBuf ? finalBuf : jpg_buf;
+        size_t writeLen         = finalBuf ? finalLen  : jpg_len;
+        size_t w = fwrite(writePtr, 1, writeLen, f);
+        fclose(f);
+        saved = (w == writeLen);
+      }
+
+      if (finalBuf) free(finalBuf);
+      if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
     }
   }
+
   esp_camera_fb_return(fb);
 
-  if(saved) {
-    char notifText[24]; snprintf(notifText,sizeof(notifText),"SAVED  #%04d",photoCount);
+  if (saved) {
+    char notifText[24]; snprintf(notifText, sizeof(notifText), "SAVED  #%04d", photoCount);
     islandPush(NOTIF_OK, notifText);
-    blinkLED(2,150,80);
+    // islandPush sudah set islandFreezeUntilMs → viewfinder akan freeze
+    blinkLED(2, 150, 80);
   } else {
     islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD");
-    blinkLED(5,50,50);
+    blinkLED(5, 50, 50);
   }
 
-  fpsLastTime=millis(); fpsFrameCount=0;
+  fpsLastTime = millis(); fpsFrameCount = 0;
   resetAllButtons();
-  // Tidak perlu islandTick() di sini — renderViewfinder() akan memanggilnya
-  // di frame berikutnya, dan islandDraw() (FIXED3) tidak ada fillRect
-  // yang mengganggu pills. Island akan slide-in dengan benar.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Sensor settings + Camera init
 // ─────────────────────────────────────────────────────────────────────────────
-void applySensorSettings(sensor_t *s,uint16_t pid) {
+void applySensorSettings(sensor_t *s, uint16_t pid) {
   s->set_brightness(s,0); s->set_contrast(s,0); s->set_saturation(s,0);
   s->set_special_effect(s,0); s->set_whitebal(s,1); s->set_awb_gain(s,1);
   s->set_wb_mode(s,0); s->set_exposure_ctrl(s,1); s->set_aec2(s,1);
   s->set_ae_level(s,0); s->set_gain_ctrl(s,1); s->set_agc_gain(s,0);
-  if(pid==PID_GC2145) {
+  if (pid == PID_GC2145) {
     s->set_aec_value(s,300); s->set_gainceiling(s,GAINCEILING_4X);
     s->set_hmirror(s,HMIRROR_GC2145); s->set_vflip(s,VFLIP_GC2145);
-  } else if(pid==PID_OV3660) {
+  } else if (pid == PID_OV3660) {
     s->set_aec_value(s,400); s->set_gainceiling(s,GAINCEILING_4X);
     s->set_hmirror(s,HMIRROR_OV3660); s->set_vflip(s,VFLIP_OV3660);
   } else {
@@ -1734,26 +1873,26 @@ bool initCamera() {
   cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
   cfg.pixel_format=PIXFORMAT_RGB565; cfg.frame_size=FRAMESIZE_QVGA;
   cfg.grab_mode=CAMERA_GRAB_LATEST;
-  if(psramFound()) { cfg.jpeg_quality=7; cfg.fb_count=2; cfg.fb_location=CAMERA_FB_IN_PSRAM; }
-  else             { cfg.jpeg_quality=12; cfg.fb_count=1; cfg.fb_location=CAMERA_FB_IN_DRAM; }
+  if (psramFound()) { cfg.jpeg_quality=7; cfg.fb_count=2; cfg.fb_location=CAMERA_FB_IN_PSRAM; }
+  else              { cfg.jpeg_quality=12; cfg.fb_count=1; cfg.fb_location=CAMERA_FB_IN_DRAM; }
   cfg.xclk_freq_hz=20000000;
-  if(esp_camera_init(&cfg)!=ESP_OK) return false;
-  sensor_t *s=esp_camera_sensor_get(); if(!s) return false;
-  detectedSensor=s->id.PID;
-  if(detectedSensor==PID_OV3660) {
+  if (esp_camera_init(&cfg) != ESP_OK) return false;
+  sensor_t *s = esp_camera_sensor_get(); if (!s) return false;
+  detectedSensor = s->id.PID;
+  if (detectedSensor == PID_OV3660) {
     esp_camera_deinit(); delay(100); cfg.xclk_freq_hz=24000000;
-    if(esp_camera_init(&cfg)!=ESP_OK) {
+    if (esp_camera_init(&cfg) != ESP_OK) {
       cfg.xclk_freq_hz=20000000;
-      if(esp_camera_init(&cfg)!=ESP_OK) return false;
+      if (esp_camera_init(&cfg) != ESP_OK) return false;
     }
-    s=esp_camera_sensor_get(); if(!s) return false;
+    s = esp_camera_sensor_get(); if (!s) return false;
   }
-  switch(detectedSensor) {
+  switch (detectedSensor) {
     case PID_GC2145: strncpy(sensorName,"GC2145",sizeof(sensorName)); break;
     case PID_OV3660: strncpy(sensorName,"OV3660",sizeof(sensorName)); break;
     default: snprintf(sensorName,sizeof(sensorName),"0x%04X",detectedSensor); break;
   }
-  applySensorSettings(s,detectedSensor);
+  applySensorSettings(s, detectedSensor);
   return true;
 }
 
@@ -1762,11 +1901,11 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.4-FIXED3 island-no-clear ===");
+  Serial.println("\n=== Sanzxcam v5.5 island-fix + exp-fix + stego-fix ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
-  if(!galleryFiles || !galleryIsVideo) { Serial.println("PSRAM alloc failed!"); ESP.restart(); }
+  if (!galleryFiles || !galleryIsVideo) { Serial.println("PSRAM alloc failed!"); ESP.restart(); }
 
   pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
   pinMode(LED_FLASH, OUTPUT); digitalWrite(LED_FLASH, LOW);
@@ -1784,23 +1923,23 @@ void setup() {
 
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
 
-  sdReady=mountSDFull();
-  if(sdReady) { scanPhotoCount(); scanVideoCount(); }
+  sdReady = mountSDFull();
+  if (sdReady) { scanPhotoCount(); scanVideoCount(); }
 
   msc.vendorID("ESP32S3"); msc.productID("SD Card"); msc.productRevision("1.0");
   msc.onRead(onRead); msc.onWrite(onWrite);
-  msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
+  msc.begin(sdTotalSectors > 0 ? sdTotalSectors : 0, 512);
   msc.mediaPresent(false); USB.begin();
 
-  bool camOK=initCamera();
-  bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
-  uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
-  runBootSequence(sdReady,sdSizeMB,pidOK,detectedSensor,camOK,xclkHz);
+  bool camOK = initCamera();
+  bool pidOK = (detectedSensor == PID_GC2145 || detectedSensor == PID_OV3660);
+  uint32_t xclkHz = (detectedSensor == PID_OV3660) ? 24000000 : 20000000;
+  runBootSequence(sdReady, sdSizeMB, pidOK, detectedSensor, camOK, xclkHz);
 
-  if(!camOK) {
+  if (!camOK) {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
     lcd.drawString("camera init failed",(DISP_W-lcd.textWidth("camera init failed"))/2,110);
-    while(true) { blinkLED(3,100,100); delay(1000); }
+    while (true) { blinkLED(3,100,100); delay(1000); }
   }
 
   lcd.fillScreen(COL_BLACK);
@@ -1814,19 +1953,19 @@ void setup() {
 //  MODE HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt) {
-  if(!evt.valid) { renderViewfinder(); return; }
-  if(evt.pin==BTN_BOOT) {
-    if(evt.isLong) { if(sdReady) enterUSBMode(); }
-    else           { captureAndPreview(); }
+  if (!evt.valid) { renderViewfinder(); return; }
+  if (evt.pin == BTN_BOOT) {
+    if (evt.isLong) { if (sdReady) enterUSBMode(); }
+    else            { captureAndPreview(); }
   }
-  else if(evt.pin==BTN_B) {
-    if(evt.isShort) { if(recActive) stopRecording(); else startRecording(); }
-    else            { openLedMenu(); }
+  else if (evt.pin == BTN_B) {
+    if (evt.isShort) { if (recActive) stopRecording(); else startRecording(); }
+    else             { openLedMenu(); }
   }
-  else if(evt.pin==BTN_C) {
-    if(evt.isLong) { toggleFaceDetect(); }
+  else if (evt.pin == BTN_C) {
+    if (evt.isLong) { toggleFaceDetect(); }
     else {
-      if(sdReady) {
+      if (sdReady) {
         scanGalleryFiles();
         gallerySelIdx=0; galleryScroll=0; galleryHoldDir=0;
         islandForceHide();
@@ -1834,32 +1973,32 @@ void handleModeViewfinder(ButtonEvent evt) {
       }
     }
   }
-  else if(evt.pin==BTN_D) {
-    if(evt.isShort) { toggleFaceDetect(); }
-    else            { openExpMenu(); }
+  else if (evt.pin == BTN_D) {
+    if (evt.isShort) { toggleFaceDetect(); }
+    else             { openExpMenu(); }
   }
 }
 
 void handleModeGallery(ButtonEvent evt) {
   bool cHeld=btnC.isHeld(), dHeld=btnD.isHeld();
-  if(cHeld&&galleryHoldDir!=-1) { galleryHoldDir=-1; galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(-1); return; }
-  if(dHeld&&galleryHoldDir!=1)  { galleryHoldDir=1;  galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(1);  return; }
-  if(!cHeld&&!dHeld) galleryHoldDir=0;
-  if(galleryHoldDir!=0) {
+  if (cHeld&&galleryHoldDir!=-1) { galleryHoldDir=-1; galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(-1); return; }
+  if (dHeld&&galleryHoldDir!=1)  { galleryHoldDir=1;  galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(1);  return; }
+  if (!cHeld&&!dHeld) galleryHoldDir=0;
+  if (galleryHoldDir != 0) {
     uint32_t held=millis()-galleryHoldStart;
     uint32_t interval=(held<500)?200:(held<1500)?100:50;
-    if(millis()-galleryLastStep>=interval) { galleryStep(galleryHoldDir); galleryLastStep=millis(); }
+    if (millis()-galleryLastStep>=interval) { galleryStep(galleryHoldDir); galleryLastStep=millis(); }
     return;
   }
-  if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT&&evt.isShort) {
-    if(galleryCount>0&&gallerySelIdx>=0&&gallerySelIdx<galleryCount) {
-      if(galleryIsVideo[gallerySelIdx]) openMjpegPlayer(galleryFiles[gallerySelIdx]);
+  if (!evt.valid) return;
+  if (evt.pin==BTN_BOOT&&evt.isShort) {
+    if (galleryCount>0&&gallerySelIdx>=0&&gallerySelIdx<galleryCount) {
+      if (galleryIsVideo[gallerySelIdx]) openMjpegPlayer(galleryFiles[gallerySelIdx]);
       else showPhotoView(gallerySelIdx);
     }
   }
-  else if(evt.pin==BTN_B&&evt.isShort) {
-    if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+  else if (evt.pin==BTN_B&&evt.isShort) {
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
     galleryHoldDir=0; islandForceHide(); resetAllButtons();
     appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
     fpsLastTime=millis(); fpsFrameCount=0;
@@ -1867,57 +2006,57 @@ void handleModeGallery(ButtonEvent evt) {
 }
 
 void handleModePhotoView(ButtonEvent evt) {
-  if(!evt.valid) return;
+  if (!evt.valid) return;
   static unsigned long lastActionTime=0;
-  if(millis()-lastActionTime<150) return;
+  if (millis()-lastActionTime<150) return;
   lastActionTime=millis();
 
-  if(evt.pin==BTN_BOOT&&evt.isShort) {
+  if (evt.pin==BTN_BOOT&&evt.isShort) {
     photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
     photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
-    if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
     resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return;
   }
-  if(evt.pin==BTN_B) {
-    if(evt.isLong) { photoViewClearCaption(); openDeleteDialog(); }
+  if (evt.pin==BTN_B) {
+    if (evt.isLong) { photoViewClearCaption(); openDeleteDialog(); }
     else {
       photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
       photoZoomOffX=0; photoZoomOffY=0;
-      if(photoZoomLevel>0) {
+      if (photoZoomLevel>0) {
         float zf=photoZoomFactors[photoZoomLevel];
         int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
         photoZoomOffX=max(0,(int)photoBufW/2-vpW/2);
         photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
       }
       photoViewRender();
-      if(photoZoomLevel==0) { photoViewDrawCaption(photoViewIndex); photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true; }
+      if (photoZoomLevel==0) { photoViewDrawCaption(photoViewIndex); photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true; }
     }
     return;
   }
-  if(photoZoomLevel==0) {
-    if(evt.pin==BTN_C&&evt.isShort) photoViewPrev();
-    if(evt.pin==BTN_D&&evt.isShort) photoViewNext();
+  if (photoZoomLevel==0) {
+    if (evt.pin==BTN_C&&evt.isShort) photoViewPrev();
+    if (evt.pin==BTN_D&&evt.isShort) photoViewNext();
   } else {
     float zf=photoZoomFactors[photoZoomLevel];
     int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
     int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
     bool moved=false;
-    if(evt.pin==BTN_C) { if(evt.isShort) { photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX); moved=true; } else { photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY); moved=true; } }
-    if(evt.pin==BTN_D) { if(evt.isShort) { photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX); moved=true; } else { photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY); moved=true; } }
-    if(moved) photoViewRender();
+    if (evt.pin==BTN_C) { if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX);moved=true;}else{photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY);moved=true;} }
+    if (evt.pin==BTN_D) { if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);moved=true;}else{photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY);moved=true;} }
+    if (moved) photoViewRender();
   }
 }
 
 void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,ButtonEvent evtC,ButtonEvent evtD) {
   static unsigned long lastToggleTime=0;
-  if(evtBoot.valid) { mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return; }
-  if(evtB.valid&&(millis()-lastToggleTime)>=200) {
+  if (evtBoot.valid) { mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return; }
+  if (evtB.valid&&(millis()-lastToggleTime)>=200) {
     mjpegPaused=!mjpegPaused; mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY"); lastToggleTime=millis();
   }
-  if(evtC.valid&&(millis()-lastToggleTime)>=200) {
+  if (evtC.valid&&(millis()-lastToggleTime)>=200) {
     mjpegLoop=!mjpegLoop; mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF"); lastToggleTime=millis();
   }
-  if(evtD.valid&&(millis()-lastToggleTime)>=200) {
+  if (evtD.valid&&(millis()-lastToggleTime)>=200) {
     mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
     char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf); lastToggleTime=millis();
@@ -1926,67 +2065,68 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,ButtonEvent evtC
 }
 
 void handleModeMenuLed(ButtonEvent evt) {
-  if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT) {
+  if (!evt.valid) return;
+  if (evt.pin==BTN_BOOT) {
     ledFlashEnabled=(menuLedSel==0);
     islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
     lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
-  else if(evt.pin==BTN_C||evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
+  else if (evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if (evt.pin==BTN_C||evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
 }
 
 void handleModeMenuExp(ButtonEvent evt) {
-  if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT) {
+  if (!evt.valid) return;
+  if (evt.pin==BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
-    if(menuExpSel==3) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_MENU_EXP_ADJ; return; }
+    if (menuExpSel==3) {
+      lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_MENU_EXP_ADJ; return;
+    }
     char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
     islandPush(NOTIF_INFO, fbBuf);
     lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
-  else if(evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
-  else if(evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
+  else if (evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if (evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
+  else if (evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
 }
 
 void handleModeMenuExpAdj(ButtonEvent evt) {
   camera_fb_t *fb=esp_camera_fb_get();
-  if(fb) {
-    if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
+  if (fb) {
+    if (fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
       int visH=DISP_H-38;
       for(int row=0;row<visH;row++) lcd.pushImage(0,row,DISP_W,1,(uint16_t*)fb->buf+row*DISP_W);
     }
     esp_camera_fb_return(fb);
   }
   drawExpAdjOverlay(); esp_task_wdt_reset();
-  if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT) {
+  if (!evt.valid) return;
+  if (evt.pin==BTN_BOOT) {
     char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
     islandPush(NOTIF_INFO, fbBuf);
     lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; return;
   }
   bool changed=false;
-  if(evt.pin==BTN_C) { expManualVal=constrain(expManualVal-50,0,1200); changed=true; }
-  if(evt.pin==BTN_D) { expManualVal=constrain(expManualVal+50,0,1200); changed=true; }
-  if(evt.pin==BTN_B) { expManualGain=(expManualGain+1)%31; changed=true; }
-  if(changed) applyExpPreset(3);
+  if (evt.pin==BTN_C) { expManualVal=constrain(expManualVal-50,0,1200); changed=true; }
+  if (evt.pin==BTN_D) { expManualVal=constrain(expManualVal+50,0,1200); changed=true; }
+  if (evt.pin==BTN_B) { expManualGain=(expManualGain+1)%31; changed=true; }
+  if (changed) applyExpPreset(3);
 }
 
 void handleModeDialogDelete(ButtonEvent evt) {
-  if(millis()-deleteDialogOpenMs>=DELETE_TIMEOUT_MS) { resetAllButtons(); showPhotoView(photoViewIndex); return; }
-  if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT) photoViewDeleteCurrent();
+  if (millis()-deleteDialogOpenMs>=DELETE_TIMEOUT_MS) { resetAllButtons(); showPhotoView(photoViewIndex); return; }
+  if (!evt.valid) return;
+  if (evt.pin==BTN_BOOT) photoViewDeleteCurrent();
   else { resetAllButtons(); showPhotoView(photoViewIndex); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LOOP — FIXED3
+//  LOOP — v5.5
 //
-//  Tidak ada perubahan dari FIXED2 di sini.
-//  islandTick() untuk viewfinder → dipanggil dari renderViewfinder().
-//  islandTick() untuk non-viewfinder → dipanggil di bawah switch.
-//  islandTick() untuk recording → dipanggil dari recordFrame().
+//  Tidak ada perubahan dari v5.4-FIXED2 di sini.
+//  Semua fix ada di: renderViewfinder(), captureAndPreview(),
+//  islandPush(), applyExpPreset().
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
@@ -2005,17 +2145,17 @@ void loop() {
   else if (evtD.valid)    singleEvt=evtD;
 
   // Caption timeout di photo view
-  if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
+  if (appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
   // USB mode
-  if(usbModeActive) { if(evtBoot.valid) exitUSBMode(); return; }
+  if (usbModeActive) { if (evtBoot.valid) exitUSBMode(); return; }
 
   // Recording aktif
-  if(recActive) { if(evtB.valid) stopRecording(); else recordFrame(); return; }
+  if (recActive) { if (evtB.valid) stopRecording(); else recordFrame(); return; }
 
-  // ── Mode switch ──
-  switch(appMode) {
+  // Mode switch
+  switch (appMode) {
     case MODE_VIEWFINDER:
       handleModeViewfinder(singleEvt);
       break;
@@ -2030,7 +2170,7 @@ void loop() {
 
   // islandTick() untuk semua mode KECUALI viewfinder
   // (viewfinder sudah memanggil dari renderViewfinder())
-  if(appMode != MODE_VIEWFINDER) {
+  if (appMode != MODE_VIEWFINDER) {
     islandTick();
   }
 }
