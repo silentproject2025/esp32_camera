@@ -241,6 +241,7 @@ char (*galleryFiles)[32] = nullptr;
 bool* galleryIsVideo      = nullptr;
 int   galleryCount  = 0;
 int   galleryScroll = 0;
+int   gallerySelIdx = 0;
 char  photoViewPath[48];
 int   photoViewIndex = 0;
 
@@ -618,8 +619,6 @@ void galleryUpdateHighlight(int oldSel, int newSel) {
     lcd.drawRect(0, y, DISP_W-4, GALLERY_ITEM_H-1, COL_GRAY_5);
   }
 }
-
-int gallerySelIdx = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo pixel buffer
