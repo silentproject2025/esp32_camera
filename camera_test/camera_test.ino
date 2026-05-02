@@ -1,112 +1,25 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v5.3-nonblocking
+ * Version: v5.3-nonblocking-FIXED
  *
- * PERUBAHAN BESAR dari v5.2-bugfix:
+ * BUGFIX dari v5.3-nonblocking:
  *
  *  ══════════════════════════════════════════════════════════════════
- *  REWRITE TOTAL: BUTTON HANDLING → FULLY NON-BLOCKING STATE MACHINE
+ *  FIX: Button debouncing & event cooldown
  *  ══════════════════════════════════════════════════════════════════
  *
- *  Masalah utama v5.x:
- *    - waitBtnRelease(), waitAllBtnRelease(), readButtonDuration()
- *      semua BLOCKING — loop() berhenti selama tombol ditekan
- *    - Menu showLedMenu() dan showExpMenu() adalah fungsi blocking
- *      dengan while-loop internal — viewfinder/MJPEG freeze
- *    - Gallery scroll menggunakan while-loop blocking dengan delay()
- *    - Tidak ada satupun tombol yang diukur durasinya secara akurat
- *      tanpa memblokir eksekusi utama
+ *  Masalah yang diperbaiki:
+ *    1. Zoom foto terasa delay & langsung trigger delete dialog
+ *       → Penyebab: Multiple events dari satu press
+ *       → Fix: Cooldown 100ms per button + debounce 80ms
  *
- *  Solusi v5.3:
- *    [1] ButtonManager — state machine per-tombol
- *        Dipanggil setiap iterasi loop(), tidak pernah blocking.
- *        State: IDLE → PRESSED → FIRED
- *        Setelah dilepas, emit ButtonEvent { pin, dur, isLong, isShort }
- *        Satu event per press, tidak ada jitter, tidak ada while.
+ *    2. MJPEG pause/play toggle berulang
+ *       → Penyebab: Event rapid fire tanpa cooldown
+ *       → Fix: Global cooldown 200ms untuk toggle actions
  *
- *    [2] Modal system — mengganti menu blocking
- *        AppMode diperluas: MODE_MENU_LED, MODE_MENU_EXP, MODE_MENU_EXP_ADJ
- *        Loop() dispatch tombol ke handler modal yang sesuai.
- *        Setiap handler hanya memodifikasi state lalu return — tidak ada
- *        while-loop, tidak ada delay() di dalamnya.
- *
- *    [3] Gallery scroll — akselerasi non-blocking
- *        Hold state dilacak per iterasi. Tidak ada while-loop scroll.
- *
- *    [4] Long press MJPEG — non-blocking (sudah ada di v5.2, dipertahankan)
- *        Semua mode handler terpisah dan tidak ada satu pun yang blocking.
- *
- *  Konsekuensi desain:
- *    - Semua fungsi blocking (waitBtnRelease, waitAllBtnRelease,
- *      readButtonDuration) DIHAPUS dari loop(). Masih ada versi ringan
- *      untuk setup() / boot saja karena saat itu belum ada viewfinder.
- *    - delay() HANYA boleh di: captureAndPreview(), startRecording(),
- *      stopRecording(), showSavedFeedback() — karena momen freeze
- *      sebentar di sana masih acceptable (feedback visual ke user).
- *    - blinkLED() tetap blocking karena hanya dipanggil di luar loop aktif.
- *    - Menu delete dialog: diganti non-blocking modal (MODE_DIALOG_DELETE).
- *
- * LOGIC SHORT/LONG PRESS per mode — tidak berubah dari v5.2:
- *
- *  [MODE_VIEWFINDER]
- *    BOOT short  → Capture foto
- *    BOOT long   → Masuk USB Mode
- *    B short     → Start/Stop REC
- *    B long      → Menu LED Flash (buka MODE_MENU_LED)
- *    C short     → Buka Gallery
- *    C long      → Toggle Face Detect
- *    D short     → Toggle Face Detect
- *    D long      → Menu Exposure (buka MODE_MENU_EXP)
- *
- *  [MODE_GALLERY]
- *    BOOT short  → Buka item (foto/video)
- *    B short     → Kembali ke Viewfinder
- *    C held      → Scroll UP (akselerasi non-blocking)
- *    D held      → Scroll DOWN (akselerasi non-blocking)
- *
- *  [MODE_PHOTO_VIEW] zoom == 0
- *    BOOT short  → Kembali ke Gallery
- *    B short     → Zoom masuk (1x→2x→4x)
- *    B long      → Delete foto (buka MODE_DIALOG_DELETE)
- *    C short     → PREV foto
- *    D short     → NEXT foto
- *
- *  [MODE_PHOTO_VIEW] zoom > 0
- *    BOOT short  → Kembali ke Gallery
- *    B short     → Cycle zoom (2x→4x→kembali 1x)
- *    B long      → Delete foto
- *    C short     → Pan KIRI
- *    C long      → Pan ATAS
- *    D short     → Pan KANAN
- *    D long      → Pan BAWAH
- *
- *  [MODE_MJPEG_PLAYER]
- *    BOOT short  → Kembali ke Gallery
- *    B short     → Play / Pause
- *    C short     → Toggle Loop
- *    D short     → Ganti speed (0.5x→1x→2x→0.5x)
- *
- *  [MODE_MENU_LED]
- *    C / D       → Toggle pilihan
- *    BOOT        → Konfirmasi
- *    B           → Batal
- *
- *  [MODE_MENU_EXP]
- *    C           → Pilihan naik
- *    D           → Pilihan turun
- *    BOOT        → Konfirmasi
- *    B           → Batal
- *
- *  [MODE_MENU_EXP_ADJ]  (manual exposure adjustment)
- *    C           → exp turun -50
- *    D           → exp naik +50
- *    B           → gain +1
- *    BOOT        → Selesai
- *
- *  [MODE_DIALOG_DELETE]
- *    BOOT        → Hapus
- *    B/C/D       → Batal
- *    (timeout 8s → Batal)
+ *    3. Long press terdeteksi setelah short press
+ *       → Penyebab: State machine tidak reset dengan baik
+ *       → Fix: Event cooldown di ButtonManager
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -219,7 +132,7 @@ static LGFX lcd;
 #define BTN_C     3
 #define BTN_D    46
 
-#define DEBOUNCE_MS     50
+#define DEBOUNCE_MS     80   // ← DITINGKATKAN dari 50ms
 #define LONG_PRESS_MS 1500
 
 #define PAN_STEP 20
@@ -267,13 +180,8 @@ AppMode prevMode    = MODE_VIEWFINDER;  // untuk kembali dari modal
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  ════════════════════════════════════════════════════════════════════
-//  BUTTON MANAGER — Non-blocking state machine
+//  BUTTON MANAGER — Non-blocking state machine DENGAN COOLDOWN
 //  ════════════════════════════════════════════════════════════════════
-//
-//  Setiap pin tombol dikelola oleh satu instance ButtonManager.
-//  tick() dipanggil setiap iterasi loop() dan tidak pernah blocking.
-//  Ketika tombol dilepas setelah >= DEBOUNCE_MS, event di-set ke pending.
-//  Loop() mengambil event dengan pollEvent() lalu reset.
 // ─────────────────────────────────────────────────────────────────────────────
 struct ButtonEvent {
   uint8_t  pin;
@@ -288,9 +196,10 @@ public:
   enum class State { IDLE, PRESSED };
 
   uint8_t      pin;
-  State        state      = State::IDLE;
-  unsigned long pressTime = 0;
-  ButtonEvent  pendingEvt = {};
+  State        state          = State::IDLE;
+  unsigned long pressTime     = 0;
+  unsigned long lastEventTime = 0;  // ← TAMBAHAN: cooldown timestamp
+  ButtonEvent  pendingEvt     = {};
 
   ButtonManager() {}
   explicit ButtonManager(uint8_t p) : pin(p) {}
@@ -309,12 +218,14 @@ public:
         if (!low) {
           // Tombol dilepas
           uint32_t dur = millis() - pressTime;
-          if (dur >= DEBOUNCE_MS) {
+          // ← FIX: Cooldown 100ms sejak event terakhir
+          if (dur >= DEBOUNCE_MS && (millis() - lastEventTime) >= 100) {
             pendingEvt.pin     = pin;
             pendingEvt.dur     = dur;
             pendingEvt.isLong  = (dur >= LONG_PRESS_MS);
             pendingEvt.isShort = (dur <  LONG_PRESS_MS);
             pendingEvt.valid   = true;
+            lastEventTime = millis();  // ← Update timestamp
           }
           state = State::IDLE;
         }
@@ -346,6 +257,7 @@ public:
     state = State::IDLE;
     pendingEvt.valid = false;
     pressTime = 0;
+    // TIDAK reset lastEventTime agar cooldown tetap berlaku
   }
 };
 
@@ -894,8 +806,6 @@ void photoViewClearCaption() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Delete dialog — draw only (non-blocking)
-//  Dialog ditampilkan, mode diubah ke MODE_DIALOG_DELETE
-//  Konfirmasi ditangani di handleModeDialogDelete()
 // ─────────────────────────────────────────────────────────────────────────────
 void drawDeleteDialog(const char* filename) {
   int dw=200,dh=80;
@@ -1323,7 +1233,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.3nb  4-BTN edition",DISP_W/2-60,103);
+  lcd.drawString("v5.3nb-fix  4-BTN edition",DISP_W/2-70,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1663,7 +1573,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.3-nonblocking 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.3-nonblocking-FIXED 4-BTN ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1712,7 +1622,6 @@ void setup() {
   fpsLastTime=millis(); fpsFrameCount=0;
   blinkLED(3,120,120);
 
-  // Pastikan semua tombol sudah dilepas sebelum masuk loop
   blockingWaitAllRelease(600);
   resetAllButtons();
 }
@@ -1720,7 +1629,6 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  ════════════════════════════════════════════════════════════════════
 //  MODE HANDLERS — masing-masing dipanggil SATU KALI per loop() iteration
-//  Tidak ada while/delay di dalam handler ini
 //  ════════════════════════════════════════════════════════════════════
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1757,14 +1665,10 @@ void handleModeViewfinder(ButtonEvent evt) {
 }
 
 // ── Gallery ───────────────────────────────────────────────────────────────────
-// Gallery menggunakan hold-tracking non-blocking untuk akselerasi scroll
 void handleModeGallery(ButtonEvent evt) {
-  // Hold akselerasi: cek apakah C atau D masih ditekan
-  // Perlu memeriksa held state langsung karena ini bukan event press/release
   bool cHeld = btnC.isHeld();
   bool dHeld = btnD.isHeld();
 
-  // Mulai hold tracking
   if(cHeld && galleryHoldDir != -1) {
     galleryHoldDir = -1;
     galleryHoldStart = millis();
@@ -1783,7 +1687,6 @@ void handleModeGallery(ButtonEvent evt) {
     galleryHoldDir = 0;
   }
 
-  // Akselerasi saat hold berlanjut
   if(galleryHoldDir != 0) {
     uint32_t held = millis() - galleryHoldStart;
     uint32_t interval;
@@ -1797,7 +1700,6 @@ void handleModeGallery(ButtonEvent evt) {
     return;
   }
 
-  // Event tombol normal
   if(!evt.valid) return;
   if(evt.pin == BTN_BOOT && evt.isShort) {
     if(galleryCount>0 && gallerySelIdx>=0 && gallerySelIdx<galleryCount) {
@@ -1821,6 +1723,11 @@ void handleModeGallery(ButtonEvent evt) {
 void handleModePhotoView(ButtonEvent evt) {
   if(!evt.valid) return;
 
+  // ← FIX: Cooldown 150ms antar aksi
+  static unsigned long lastActionTime = 0;
+  if(millis() - lastActionTime < 150) return;
+  lastActionTime = millis();
+
   if(evt.pin == BTN_BOOT && evt.isShort) {
     photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
     photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
@@ -1832,11 +1739,9 @@ void handleModePhotoView(ButtonEvent evt) {
 
   if(evt.pin == BTN_B) {
     if(evt.isLong) {
-      // Buka delete dialog (non-blocking)
       photoViewClearCaption();
       openDeleteDialog();
     } else {
-      // Cycle zoom
       photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
       photoZoomOffX=0; photoZoomOffY=0;
       if(photoZoomLevel>0) {
@@ -1876,30 +1781,37 @@ void handleModePhotoView(ButtonEvent evt) {
 }
 
 // ── MJPEG Player ──────────────────────────────────────────────────────────────
-// Non-blocking: event diproses, player terus jalan setiap iterasi
 void handleModeMjpegPlayer(ButtonEvent evtBoot, ButtonEvent evtB,
                            ButtonEvent evtC,    ButtonEvent evtD) {
-  // Proses aksi tombol jika ada event
+  // ← FIX: Global cooldown 200ms untuk toggle actions
+  static unsigned long lastToggleTime = 0;
+
   if(evtBoot.valid) {
     mjpegClose(); resetAllButtons();
     appMode=MODE_GALLERY; drawGallery();
     return;
   }
-  if(evtB.valid) {
+
+  if(evtB.valid && (millis() - lastToggleTime) >= 200) {
     mjpegPaused=!mjpegPaused;
     mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
+    lastToggleTime = millis();
   }
-  if(evtC.valid) {
+
+  if(evtC.valid && (millis() - lastToggleTime) >= 200) {
     mjpegLoop=!mjpegLoop;
     mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
+    lastToggleTime = millis();
   }
-  if(evtD.valid) {
+
+  if(evtD.valid && (millis() - lastToggleTime) >= 200) {
     mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
     char spBuf[12];
     snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf);
+    lastToggleTime = millis();
   }
-  // Player selalu jalan setiap iterasi (tidak ada return awal)
+
   loopMjpegPlayer();
 }
 
@@ -1907,7 +1819,6 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot, ButtonEvent evtB,
 void handleModeMenuLed(ButtonEvent evt) {
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT) {
-    // Konfirmasi
     ledFlashEnabled=(menuLedSel==0);
     char fbBuf[24];
     snprintf(fbBuf,sizeof(fbBuf),"FLASH: %s",ledFlashEnabled?"ON":"OFF");
@@ -1924,7 +1835,6 @@ void handleModeMenuLed(ButtonEvent evt) {
     appMode=MODE_VIEWFINDER;
   }
   else if(evt.pin==BTN_B) {
-    // Batal
     lcd.fillScreen(COL_BLACK);
     resetAllButtons();
     appMode=MODE_VIEWFINDER;
@@ -1941,7 +1851,6 @@ void handleModeMenuExp(ButtonEvent evt) {
   if(evt.pin==BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
     if(menuExpSel==3) {
-      // Masuk mode adjustment (juga modal, non-blocking)
       lcd.fillScreen(COL_BLACK);
       resetAllButtons();
       appMode=MODE_MENU_EXP_ADJ;
@@ -1973,9 +1882,7 @@ void handleModeMenuExp(ButtonEvent evt) {
 }
 
 // ── Manual Exposure Adjustment (modal) ───────────────────────────────────────
-// Menampilkan live viewfinder crop + overlay, tombol adjust langsung apply
 void handleModeMenuExpAdj(ButtonEvent evt) {
-  // Render live preview setiap iterasi
   camera_fb_t *fb=esp_camera_fb_get();
   if(fb) {
     if(fb->format==PIXFORMAT_RGB565 && fb->width==DISP_W && fb->height==DISP_H) {
@@ -1991,7 +1898,6 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
   if(!evt.valid) return;
   bool changed=false;
   if(evt.pin==BTN_BOOT) {
-    // Selesai
     char fbBuf[24];
     snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
     int fw=lcd.textWidth(fbBuf),fp=fw+14,fpx=(DISP_W-fp)/2;
@@ -2017,18 +1923,15 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
 
 // ── Delete Dialog (modal) ─────────────────────────────────────────────────────
 void handleModeDialogDelete(ButtonEvent evt) {
-  // Timeout check
   if(millis()-deleteDialogOpenMs >= DELETE_TIMEOUT_MS) {
-    // Timeout → batal
     resetAllButtons();
     showPhotoView(photoViewIndex);
     return;
   }
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT) {
-    photoViewDeleteCurrent();  // akan set appMode=MODE_GALLERY
+    photoViewDeleteCurrent();
   } else {
-    // Batal (B/C/D)
     resetAllButtons();
     showPhotoView(photoViewIndex);
   }
@@ -2042,52 +1945,41 @@ void handleModeDialogDelete(ButtonEvent evt) {
 void loop() {
   esp_task_wdt_reset();
 
-  // 1. Tick semua tombol — update state machine, tidak blocking
   tickAllButtons();
 
-  // 2. Kumpulkan event yang mungkin tersedia
   ButtonEvent evtBoot={}, evtB={}, evtC={}, evtD={};
   btnBoot.pollEvent(evtBoot);
   btnB.pollEvent(evtB);
   btnC.pollEvent(evtC);
   btnD.pollEvent(evtD);
 
-  // 3. Pilih event mana yang dipakai (prioritas: satu event per iterasi kecuali MJPEG)
-  //    Untuk mode MJPEG semua event dikirim sekaligus karena player harus jalan terus
-  //    Untuk mode lain, ambil event pertama yang valid (else-if chain)
   ButtonEvent singleEvt = {};
   if      (evtBoot.valid) singleEvt = evtBoot;
   else if (evtB.valid)    singleEvt = evtB;
   else if (evtC.valid)    singleEvt = evtC;
   else if (evtD.valid)    singleEvt = evtD;
 
-  // 4. Auto-clear caption di photo view
   if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs) {
     photoViewClearCaption();
   }
 
-  // 5. USB mode — hanya BOOT keluar
   if(usbModeActive) {
     if(evtBoot.valid) exitUSBMode();
     return;
   }
 
-  // 6. Recording aktif — hanya B menghentikan, sisanya record frame
   if(recActive) {
     if(evtB.valid) stopRecording();
     else           recordFrame();
     return;
   }
 
-  // 7. Dispatch ke mode handler
   switch(appMode) {
     case MODE_VIEWFINDER:
       handleModeViewfinder(singleEvt);
       break;
 
     case MODE_GALLERY:
-      // Gallery butuh akses ke held state C/D secara langsung
-      // singleEvt dikirim untuk BOOT/B
       handleModeGallery(singleEvt);
       break;
 
@@ -2096,7 +1988,6 @@ void loop() {
       break;
 
     case MODE_MJPEG_PLAYER:
-      // Kirim semua event individual agar player tidak terhenti
       handleModeMjpegPlayer(evtBoot, evtB, evtC, evtD);
       break;
 
