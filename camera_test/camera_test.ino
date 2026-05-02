@@ -539,6 +539,8 @@ void islandForceHide() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEGANOGRAFI LSB
+// NOTE: Implementasi LSB ini saat ini tidak fungsional karena data hancur saat kompresi JPEG
+// dan fungsi ekstraksi tidak dipanggil di mana pun dalam aplikasi.
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
