@@ -2,36 +2,10 @@
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
  * Version: v5.4-island-stego
  *
- * FITUR BARU dari v5.3-nonblocking-FIXED:
- *
- *  ══════════════════════════════════════════════════════════════════
- *  1. DYNAMIC ISLAND — Notifikasi non-blocking di atas tengah layar
- *  ══════════════════════════════════════════════════════════════════
- *  - Idle: tidak ada yang tampil (invisible)
- *  - Ada aksi: muncul dari atas, tampil 2 detik, auto-dismiss
- *  - Stack hingga 3 notif sekaligus
- *  - Timer bar tipis sebagai countdown visual
- *  - Tipe: OK (hijau), FLASH (kuning), REC (merah+blink),
- *          FACE (biru), WARN (oranye), INFO (abu)
- *  - Menggantikan semua delay(2000) feedback lama
- *
- *  ══════════════════════════════════════════════════════════════════
- *  2. STEGANOGRAFI LSB — Watermark invisible di setiap foto
- *  ══════════════════════════════════════════════════════════════════
- *  - Embed payload "SANZXCAM|NNNN|v5.4" ke bit LSB channel merah
- *  - Tidak mengubah tampilan foto secara visual
- *  - Bekerja pada buffer RGB565 sebelum frame2jpg()
- *  - Baca dengan script Python (lihat fungsi stegoExtractRGB565)
- *
- *  Python reader di PC:
- *    from PIL import Image
- *    img = Image.open("photo_0001.jpg").convert("RGB")
- *    bits = ""
- *    for y in range(img.height):
- *        for x in range(img.width):
- *            bits += str(img.getpixel((x,y))[0] & 1)
- *    chars = [chr(int(bits[i:i+8],2)) for i in range(0,256,8)]
- *    print("".join(chars).split('\x00')[0])
+ * FIX v5.4-fixed:
+ *  - NotifType enum + NotifStyle struct dipindah ke ATAS sebelum semua
+ *    fungsi dan #define warna, agar terlihat oleh Arduino CLI pre-processor.
+ *  - Enum diberi underlying type uint8_t agar tidak bentrok dengan ESP-IDF.
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -60,6 +34,26 @@
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  *** EARLY TYPE DECLARATIONS ***
+//  Harus di sini — sebelum LGFX, sebelum #define warna, sebelum semua fungsi
+//  Ini fix untuk: 'NotifType' was not declared in this scope
+// ─────────────────────────────────────────────────────────────────────────────
+enum NotifType : uint8_t {
+  NOTIF_OK    = 0,
+  NOTIF_FLASH = 1,
+  NOTIF_REC   = 2,
+  NOTIF_FACE  = 3,
+  NOTIF_WARN  = 4,
+  NOTIF_INFO  = 5,
+};
+
+struct NotifStyle {
+  uint16_t    iconBg;
+  uint16_t    iconFg;
+  const char* sym;
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
@@ -175,6 +169,18 @@ static LGFX lcd;
 #define VFLIP_OV3660   1
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  NOTIF_STYLES — didefinisikan setelah #define warna agar bisa pakai COL_*
+// ─────────────────────────────────────────────────────────────────────────────
+static const NotifStyle NOTIF_STYLES[6] = {
+  { 0x0540, 0xFFFF, "+" },    // OK    — hijau
+  { 0x4400, 0xFFE0, "*" },    // FLASH — kuning
+  { 0x5000, 0xF800, "o" },    // REC   — merah
+  { 0x0011, 0x07FF, "@" },    // FACE  — biru
+  { 0x4200, 0xFD20, "!" },    // WARN  — oranye
+  { 0x2104, COL_GRAY_C, "i"}, // INFO  — abu
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  App Mode
 // ─────────────────────────────────────────────────────────────────────────────
 enum AppMode {
@@ -253,38 +259,8 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ██████╗ ██╗   ██╗███╗   ██╗ █████╗ ███╗   ███╗██╗ ██████╗
-//  ██╔══██╗╚██╗ ██╔╝████╗  ██║██╔══██╗████╗ ████║██║██╔════╝
-//  ██║  ██║ ╚████╔╝ ██╔██╗ ██║███████║██╔████╔██║██║██║
-//  ██║  ██║  ╚██╔╝  ██║╚██╗██║██╔══██║██║╚██╔╝██║██║██║
-//  ██████╔╝   ██║   ██║ ╚████║██║  ██║██║ ╚═╝ ██║██║╚██████╗
-//  ISLAND NOTIFICATION SYSTEM
+//  DYNAMIC ISLAND — Notification System
 // ─────────────────────────────────────────────────────────────────────────────
-
-enum NotifType {
-  NOTIF_OK    = 0,
-  NOTIF_FLASH = 1,
-  NOTIF_REC   = 2,
-  NOTIF_FACE  = 3,
-  NOTIF_WARN  = 4,
-  NOTIF_INFO  = 5,
-};
-
-struct NotifStyle {
-  uint16_t    iconBg;
-  uint16_t    iconFg;
-  const char* sym;
-};
-
-static const NotifStyle NOTIF_STYLES[6] = {
-  { 0x0540, 0xFFFF, "+" },   // OK    — hijau
-  { 0x4400, 0xFFE0, "*" },   // FLASH — kuning
-  { 0x5000, 0xF800, "o" },   // REC   — merah
-  { 0x0011, 0x07FF, "@" },   // FACE  — biru
-  { 0x4200, 0xFD20, "!" },   // WARN  — oranye
-  { 0x2104, COL_GRAY_C, "i"},// INFO  — abu
-};
-
 #define ISLAND_SHOW_MS   2000
 #define ISLAND_MAX_STACK    3
 #define ISLAND_W_SINGLE   180
@@ -302,34 +278,30 @@ struct NotifEntry {
   bool      valid;
 };
 
-// State island — semua di sini, tidak perlu class
-static NotifEntry islandStack[ISLAND_MAX_STACK];
-static int        islandCount    = 0;
-static bool       islandVisible  = false;
-static unsigned long islandShowAt  = 0;
-static unsigned long islandHideAt  = 0;
-static int        islandLastX    = 0;
-static int        islandLastY    = 0;
-static int        islandLastW    = 0;
-static int        islandLastH    = 0;
+static NotifEntry    islandStack[ISLAND_MAX_STACK];
+static int           islandCount    = 0;
+static bool          islandVisible  = false;
+static unsigned long islandShowAt   = 0;
+static unsigned long islandHideAt   = 0;
+static int           islandLastX    = 0;
+static int           islandLastY    = 0;
+static int           islandLastW    = 0;
+static int           islandLastH    = 0;
 
-// ── Gambar satu baris notif ────────────────────────────────────────
 static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
-  NotifEntry& n   = islandStack[idx];
-  const NotifStyle& s = NOTIF_STYLES[(int)n.type];
+  NotifEntry& n        = islandStack[idx];
+  const NotifStyle& s  = NOTIF_STYLES[(int)n.type];
 
   uint16_t rowBg = isFresh ? COL_GRAY_D : COL_BLACK;
   lcd.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
 
-  // Ikon
   int iconY = y + (ISLAND_H_ROW - ISLAND_ICON_SZ) / 2;
   lcd.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(s.iconFg);
   lcd.drawString(s.sym, x + 2, iconY + 1);
 
-  // Teks — truncate jika terlalu panjang
   lcd.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
   char buf[28];
   strncpy(buf, n.text, sizeof(buf) - 1);
@@ -342,7 +314,6 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
   lcd.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
 
-  // Dot blink untuk REC
   if (n.type == NOTIF_REC && isFresh) {
     int dotX = x + w - 4;
     int dotY = y + ISLAND_H_ROW / 2;
@@ -351,7 +322,6 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
-// ── Gambar seluruh island ──────────────────────────────────────────
 static void islandDraw() {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
@@ -364,26 +334,19 @@ static void islandDraw() {
   islandLastX = iX; islandLastY = iY;
   islandLastW = iW; islandLastH = iH;
 
-  // Background — fillRoundRect dengan cover bagian atas
   lcd.fillRoundRect(iX, iY - ISLAND_BAR_H, iW, iH + ISLAND_BAR_H, ISLAND_BAR_H, COL_BLACK);
+  lcd.drawFastVLine(iX,          iY, iH, COL_GRAY_3);
+  lcd.drawFastVLine(iX + iW - 1, iY, iH, COL_GRAY_3);
+  lcd.drawFastHLine(iX, iY + iH - 1, iW, COL_GRAY_3);
 
-  // Border bawah + samping
-  lcd.drawFastVLine(iX,           iY, iH, COL_GRAY_3);
-  lcd.drawFastVLine(iX + iW - 1,  iY, iH, COL_GRAY_3);
-  lcd.drawFastHLine(iX,  iY + iH - 1, iW, COL_GRAY_3);
-
-  // Baris notif
   int rowY = iY + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
     islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
     rowY += ISLAND_H_ROW + 2;
   }
-
-  // Timer bar (penuh saat baru muncul)
   lcd.fillRect(iX + 1, iY + iH - ISLAND_BAR_H, iW - 2, ISLAND_BAR_H, COL_GRAY_5);
 }
 
-// ── Update timer bar & REC dot (dipanggil di tick) ────────────────
 static void islandUpdateBar() {
   if (!islandVisible || islandLastW == 0) return;
   unsigned long elapsed = millis() - islandShowAt;
@@ -395,7 +358,6 @@ static void islandUpdateBar() {
   lcd.fillRect(barX, barY, barW, ISLAND_BAR_H, COL_BLACK);
   if (filled > 0) lcd.fillRect(barX, barY, filled, ISLAND_BAR_H, COL_GRAY_5);
 
-  // Refresh REC dot jika notif paling atas REC
   if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
     int x    = islandLastX + ISLAND_PAD_H;
     int y    = islandLastY + ISLAND_PAD_V;
@@ -407,20 +369,16 @@ static void islandUpdateBar() {
   }
 }
 
-// ── Sembunyikan island ─────────────────────────────────────────────
 static void islandHide() {
-  if (islandLastW > 0 && islandLastH > 0) {
+  if (islandLastW > 0 && islandLastH > 0)
     lcd.fillRect(islandLastX, islandLastY, islandLastW, islandLastH, COL_BLACK);
-  }
   islandVisible = false;
   islandCount   = 0;
   islandLastW   = 0;
   islandLastH   = 0;
 }
 
-// ── Push notif baru ────────────────────────────────────────────────
 void islandPush(NotifType type, const char* text) {
-  // Geser stack ke bawah
   for (int i = ISLAND_MAX_STACK - 1; i > 0; i--) islandStack[i] = islandStack[i-1];
   islandStack[0].type  = type;
   islandStack[0].valid = true;
@@ -428,39 +386,23 @@ void islandPush(NotifType type, const char* text) {
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
 
-  islandShowAt = millis();
-  islandHideAt = millis() + ISLAND_SHOW_MS;
+  islandShowAt  = millis();
+  islandHideAt  = millis() + ISLAND_SHOW_MS;
   islandVisible = true;
   islandDraw();
 }
 
-// ── Tick — panggil di loop() ───────────────────────────────────────
 void islandTick() {
   if (!islandVisible) return;
-  unsigned long now = millis();
-  if (now >= islandHideAt) { islandHide(); return; }
+  if (millis() >= islandHideAt) { islandHide(); return; }
   islandUpdateBar();
 }
 
-// ── Force hide ─────────────────────────────────────────────────────
 void islandForceHide() { if (islandVisible) islandHide(); }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
-//  ███████╗████████╗███████╗ ██████╗  ██████╗
-//  ██╔════╝╚══██╔══╝██╔════╝██╔════╝ ██╔═══██╗
-//  ███████╗   ██║   █████╗  ██║  ███╗██║   ██║
-//  ╚════██║   ██║   ██╔══╝  ██║   ██║██║   ██║
 //  STEGANOGRAFI LSB
 // ─────────────────────────────────────────────────────────────────────────────
-//
-//  Embed teks ke bit LSB channel MERAH pixel RGB565
-//  Format payload: "SANZXCAM|NNNN|v5.4" (max 32 karakter)
-//  Kapasitas: QVGA 320x240 = 76800 pixel → 9600 char, kita pakai 32 char
-//  Visual impact: ±1 nilai warna merah per pixel → tidak terlihat mata
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
 #define STEGO_VERSION      "v5.4"
@@ -469,7 +411,6 @@ void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
 }
 
-// Embed ke buffer RGB565 in-place — panggil SEBELUM frame2jpg()
 void stegoEmbedRGB565(uint16_t* buf, int w, int h,
                       const char* payload, int payLen) {
   if (!buf || !payload || payLen <= 0) return;
@@ -489,7 +430,6 @@ void stegoEmbedRGB565(uint16_t* buf, int w, int h,
   }
 }
 
-// Extract dari buffer RGB565 — untuk verifikasi di device
 bool stegoExtractRGB565(uint16_t* buf, int w, int h,
                         char* outPayload, int maxLen) {
   if (!buf || !outPayload || maxLen <= 0) return false;
@@ -509,7 +449,6 @@ bool stegoExtractRGB565(uint16_t* buf, int w, int h,
   outPayload[maxLen - 1] = '\0';
   return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  State variabel
@@ -1015,7 +954,6 @@ void openDeleteDialog() {
 void photoViewDeleteCurrent() {
   char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[photoViewIndex]);
   bool ok=(remove(path)==0);
-  // Notif hasil hapus via island
   islandPush(ok ? NOTIF_OK : NOTIF_WARN, ok ? "FILE DIHAPUS" : "GAGAL HAPUS");
   if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
   scanGalleryFiles(); scanPhotoCount();
@@ -1291,7 +1229,7 @@ void recordFrame() {
   }
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf); drawRecIndicator();
-    islandTick();  // refresh island saat recording juga
+    islandTick();
   }
   esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
@@ -1535,9 +1473,7 @@ void renderViewfinder() {
 
     if(recActive) drawRecIndicator();
 
-    // Gambar island di atas segalanya setelah push frame
     islandTick();
-
     updateFPS();
   } else {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
@@ -1573,17 +1509,13 @@ void captureAndPreview() {
     uint8_t *jpg_buf=nullptr; size_t jpg_len=0; bool ok=false;
 
     if(fb->format==PIXFORMAT_RGB565) {
-      // ── STEGANOGRAFI: embed watermark sebelum encode JPEG ────────────────
       char payload[STEGO_PAYLOAD_LEN];
       stegoMakePayload(payload, sizeof(payload), photoCount + 1);
       stegoEmbedRGB565((uint16_t*)fb->buf, fb->width, fb->height,
                        payload, (int)strlen(payload) + 1);
-      // ─────────────────────────────────────────────────────────────────────
       ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);
     } else if(fb->format==PIXFORMAT_JPEG) {
       jpg_buf=fb->buf; jpg_len=fb->len; ok=true;
-      // Catatan: format JPEG langsung tidak bisa di-stego di sini
-      // karena sudah ter-encode. Stego hanya bekerja di RGB565.
     }
 
     if(ok&&jpg_buf) {
@@ -1596,7 +1528,6 @@ void captureAndPreview() {
   }
   esp_camera_fb_return(fb);
 
-  // ── DYNAMIC ISLAND: ganti showSavedFeedback + delay(2000) ────────────────
   if(saved) {
     char notifText[24]; snprintf(notifText,sizeof(notifText),"SAVED  #%04d",photoCount);
     islandPush(NOTIF_OK, notifText);
@@ -1605,8 +1536,6 @@ void captureAndPreview() {
     islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD");
     blinkLED(5,50,50);
   }
-  // Tidak ada delay(2000) — viewfinder langsung lanjut!
-  // ─────────────────────────────────────────────────────────────────────────
 
   fpsLastTime=millis(); fpsFrameCount=0;
   resetAllButtons();
@@ -1908,7 +1837,6 @@ void loop() {
   else if (evtC.valid)    singleEvt=evtC;
   else if (evtD.valid)    singleEvt=evtD;
 
-  // Caption timeout di photo view
   if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
@@ -1926,7 +1854,5 @@ void loop() {
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);              break;
   }
 
-  // islandTick() sudah dipanggil di dalam renderViewfinder()
-  // Untuk mode non-viewfinder, panggil di sini juga agar island tetap update
   if(appMode != MODE_VIEWFINDER) islandTick();
 }
