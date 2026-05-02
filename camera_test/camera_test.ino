@@ -123,6 +123,7 @@ static LGFX lcd;
 #define SD_MMC_D0_PIN  40
 
 #define LED_PIN        48
+#define LED_FLASH       2   // ← LED flash utama di GPIO 2
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pin Tombol
@@ -132,7 +133,7 @@ static LGFX lcd;
 #define BTN_C     3
 #define BTN_D    46
 
-#define DEBOUNCE_MS     80   // ← DITINGKATKAN dari 50ms
+#define DEBOUNCE_MS     80
 #define LONG_PRESS_MS 1500
 
 #define PAN_STEP 20
@@ -162,26 +163,23 @@ static LGFX lcd;
 #define VFLIP_OV3660   1
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  App Mode — diperluas untuk modal states
+//  App Mode
 // ─────────────────────────────────────────────────────────────────────────────
 enum AppMode {
   MODE_VIEWFINDER,
   MODE_GALLERY,
   MODE_PHOTO_VIEW,
   MODE_MJPEG_PLAYER,
-  // Modal overlays — mengganti fungsi blocking
   MODE_MENU_LED,
   MODE_MENU_EXP,
   MODE_MENU_EXP_ADJ,
   MODE_DIALOG_DELETE
 };
 AppMode appMode     = MODE_VIEWFINDER;
-AppMode prevMode    = MODE_VIEWFINDER;  // untuk kembali dari modal
+AppMode prevMode    = MODE_VIEWFINDER;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ════════════════════════════════════════════════════════════════════
-//  BUTTON MANAGER — Non-blocking state machine DENGAN COOLDOWN
-//  ════════════════════════════════════════════════════════════════════
+//  BUTTON MANAGER
 // ─────────────────────────────────────────────────────────────────────────────
 struct ButtonEvent {
   uint8_t  pin;
@@ -198,34 +196,28 @@ public:
   uint8_t      pin;
   State        state          = State::IDLE;
   unsigned long pressTime     = 0;
-  unsigned long lastEventTime = 0;  // ← TAMBAHAN: cooldown timestamp
+  unsigned long lastEventTime = 0;
   ButtonEvent  pendingEvt     = {};
 
   ButtonManager() {}
   explicit ButtonManager(uint8_t p) : pin(p) {}
 
-  // Dipanggil setiap loop() — tidak pernah blocking
   void tick() {
     bool low = (digitalRead(pin) == LOW);
     switch (state) {
       case State::IDLE:
-        if (low) {
-          pressTime = millis();
-          state = State::PRESSED;
-        }
+        if (low) { pressTime = millis(); state = State::PRESSED; }
         break;
       case State::PRESSED:
         if (!low) {
-          // Tombol dilepas
           uint32_t dur = millis() - pressTime;
-          // ← FIX: Cooldown 100ms sejak event terakhir
           if (dur >= DEBOUNCE_MS && (millis() - lastEventTime) >= 100) {
             pendingEvt.pin     = pin;
             pendingEvt.dur     = dur;
             pendingEvt.isLong  = (dur >= LONG_PRESS_MS);
             pendingEvt.isShort = (dur <  LONG_PRESS_MS);
             pendingEvt.valid   = true;
-            lastEventTime = millis();  // ← Update timestamp
+            lastEventTime = millis();
           }
           state = State::IDLE;
         }
@@ -233,7 +225,6 @@ public:
     }
   }
 
-  // Kembalikan event jika ada, lalu reset
   bool pollEvent(ButtonEvent& evt) {
     if (!pendingEvt.valid) return false;
     evt = pendingEvt;
@@ -241,46 +232,31 @@ public:
     return true;
   }
 
-  // Apakah tombol sedang ditekan sekarang (untuk hold/akselerasi)
-  bool isHeld() const {
-    return (state == State::PRESSED);
-  }
+  bool isHeld() const { return (state == State::PRESSED); }
 
-  // Berapa lama sudah ditekan (ms), 0 jika tidak ditekan
   uint32_t heldDuration() const {
     if (state != State::PRESSED) return 0;
     return millis() - pressTime;
   }
 
-  // Reset state (dipakai saat mode berganti)
   void reset() {
     state = State::IDLE;
     pendingEvt.valid = false;
     pressTime = 0;
-    // TIDAK reset lastEventTime agar cooldown tetap berlaku
   }
 };
 
-// Satu instance per tombol
 ButtonManager btnBoot(BTN_BOOT);
 ButtonManager btnB   (BTN_B);
 ButtonManager btnC   (BTN_C);
 ButtonManager btnD   (BTN_D);
 
-// Helper: tick semua tombol
 inline void tickAllButtons() {
-  btnBoot.tick();
-  btnB.tick();
-  btnC.tick();
-  btnD.tick();
+  btnBoot.tick(); btnB.tick(); btnC.tick(); btnD.tick();
 }
 
-// Helper: reset semua tombol (dipanggil saat mode berganti)
 inline void resetAllButtons() {
-  btnBoot.reset();
-  btnB.reset();
-  btnC.reset();
-  btnD.reset();
+  btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -306,10 +282,9 @@ int   gallerySelIdx = 0;
 char  photoViewPath[48];
 int   photoViewIndex = 0;
 
-// Gallery scroll akselerasi (non-blocking hold tracking)
 unsigned long galleryHoldStart  = 0;
 unsigned long galleryLastStep   = 0;
-int           galleryHoldDir    = 0;  // -1 C, +1 D, 0 tidak hold
+int           galleryHoldDir    = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo View state
@@ -355,13 +330,9 @@ const ExpPresetCfg expPresets[4] = {
   { false, false, 300, false, 0,  0,  0 },
 };
 
-// ─── Menu LED state (modal) ──────────────────────────────────────────────────
-int  menuLedSel = 0;  // 0 = ON, 1 = OFF
-
-// ─── Menu Exposure state (modal) ─────────────────────────────────────────────
+int  menuLedSel = 0;
 int  menuExpSel = 0;
 
-// ─── Delete dialog state (modal) ─────────────────────────────────────────────
 unsigned long deleteDialogOpenMs = 0;
 #define DELETE_TIMEOUT_MS 8000
 
@@ -464,9 +435,8 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Helper minimal (hanya untuk setup/boot — bukan loop)
+//  Helper
 // ─────────────────────────────────────────────────────────────────────────────
-// Hanya dipakai di setup() dan enterUSBMode() — TIDAK di loop()
 static void blockingWaitAllRelease(uint32_t timeoutMs = 500) {
   unsigned long t0 = millis();
   while (millis() - t0 < timeoutMs) {
@@ -722,7 +692,7 @@ bool photoLoadPixelBuf(int idx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo View render dengan zoom & pan
+//  Photo View render
 // ─────────────────────────────────────────────────────────────────────────────
 void photoViewRender() {
   if(!photoPixelBuf) return;
@@ -805,7 +775,7 @@ void photoViewClearCaption() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Delete dialog — draw only (non-blocking)
+//  Delete dialog
 // ─────────────────────────────────────────────────────────────────────────────
 void drawDeleteDialog(const char* filename) {
   int dw=200,dh=80;
@@ -906,7 +876,7 @@ void photoViewNext() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu LED — draw only
+//  Menu LED
 // ─────────────────────────────────────────────────────────────────────────────
 void drawLedMenu(int sel) {
   int mw=200, mh=90;
@@ -952,7 +922,7 @@ void openLedMenu() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu Exposure — draw only
+//  Menu Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 void drawExpMenu(int sel) {
   int mw=220, mh=130;
@@ -1476,9 +1446,10 @@ void showSavedFeedback(bool saved) {
   }
 }
 
+// ── captureAndPreview — FLASH GPIO 2 ─────────────────────────────────────────
 void captureAndPreview() {
   if(ledFlashEnabled) {
-    digitalWrite(LED_PIN,HIGH);
+    digitalWrite(LED_FLASH, HIGH);  // ← nyalakan LED GPIO 2
     delay(150);
     for(int i=0;i<2;i++) {
       camera_fb_t *tfb=esp_camera_fb_get();
@@ -1486,7 +1457,7 @@ void captureAndPreview() {
     }
   }
   camera_fb_t *fb=esp_camera_fb_get();
-  if(ledFlashEnabled) digitalWrite(LED_PIN,LOW);
+  if(ledFlashEnabled) digitalWrite(LED_FLASH, LOW);  // ← matikan LED GPIO 2
   if(!fb) { blinkLED(5,50,50); return; }
 
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
@@ -1582,8 +1553,8 @@ void setup() {
     ESP.restart();
   }
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
+  pinMode(LED_FLASH, OUTPUT); digitalWrite(LED_FLASH, LOW);  // ← init GPIO 2
 
   pinMode(BTN_BOOT, INPUT_PULLUP);
   pinMode(BTN_B,    INPUT_PULLUP);
@@ -1627,17 +1598,10 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ════════════════════════════════════════════════════════════════════
-//  MODE HANDLERS — masing-masing dipanggil SATU KALI per loop() iteration
-//  ════════════════════════════════════════════════════════════════════
+//  MODE HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
-
-// ── Viewfinder ───────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt) {
-  if(!evt.valid) {
-    renderViewfinder();
-    return;
-  }
+  if(!evt.valid) { renderViewfinder(); return; }
   if(evt.pin == BTN_BOOT) {
     if(evt.isLong) { if(sdReady) enterUSBMode(); }
     else           { captureAndPreview(); }
@@ -1651,8 +1615,7 @@ void handleModeViewfinder(ButtonEvent evt) {
     else {
       if(sdReady) {
         scanGalleryFiles();
-        gallerySelIdx=0; galleryScroll=0;
-        galleryHoldDir=0;
+        gallerySelIdx=0; galleryScroll=0; galleryHoldDir=0;
         resetAllButtons();
         appMode=MODE_GALLERY; drawGallery();
       }
@@ -1664,84 +1627,60 @@ void handleModeViewfinder(ButtonEvent evt) {
   }
 }
 
-// ── Gallery ───────────────────────────────────────────────────────────────────
 void handleModeGallery(ButtonEvent evt) {
   bool cHeld = btnC.isHeld();
   bool dHeld = btnD.isHeld();
 
   if(cHeld && galleryHoldDir != -1) {
-    galleryHoldDir = -1;
-    galleryHoldStart = millis();
-    galleryLastStep  = millis();
-    galleryStep(-1);
-    return;
+    galleryHoldDir=-1; galleryHoldStart=millis(); galleryLastStep=millis();
+    galleryStep(-1); return;
   }
   if(dHeld && galleryHoldDir != 1) {
-    galleryHoldDir = 1;
-    galleryHoldStart = millis();
-    galleryLastStep  = millis();
-    galleryStep(1);
-    return;
+    galleryHoldDir=1; galleryHoldStart=millis(); galleryLastStep=millis();
+    galleryStep(1); return;
   }
-  if(!cHeld && !dHeld) {
-    galleryHoldDir = 0;
-  }
+  if(!cHeld && !dHeld) galleryHoldDir=0;
 
   if(galleryHoldDir != 0) {
-    uint32_t held = millis() - galleryHoldStart;
-    uint32_t interval;
-    if      (held < 500)  interval = 200;
-    else if (held < 1500) interval = 100;
-    else                  interval = 50;
-    if(millis() - galleryLastStep >= interval) {
-      galleryStep(galleryHoldDir);
-      galleryLastStep = millis();
+    uint32_t held=millis()-galleryHoldStart;
+    uint32_t interval=(held<500)?200:(held<1500)?100:50;
+    if(millis()-galleryLastStep >= interval) {
+      galleryStep(galleryHoldDir); galleryLastStep=millis();
     }
     return;
   }
 
   if(!evt.valid) return;
-  if(evt.pin == BTN_BOOT && evt.isShort) {
+  if(evt.pin==BTN_BOOT && evt.isShort) {
     if(galleryCount>0 && gallerySelIdx>=0 && gallerySelIdx<galleryCount) {
-      if(galleryIsVideo[gallerySelIdx]) {
-        openMjpegPlayer(galleryFiles[gallerySelIdx]);
-      } else {
-        showPhotoView(gallerySelIdx);
-      }
+      if(galleryIsVideo[gallerySelIdx]) openMjpegPlayer(galleryFiles[gallerySelIdx]);
+      else showPhotoView(gallerySelIdx);
     }
   }
-  else if(evt.pin == BTN_B && evt.isShort) {
+  else if(evt.pin==BTN_B && evt.isShort) {
     if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-    galleryHoldDir=0;
-    resetAllButtons();
+    galleryHoldDir=0; resetAllButtons();
     appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
     fpsLastTime=millis(); fpsFrameCount=0;
   }
 }
 
-// ── Photo View ────────────────────────────────────────────────────────────────
 void handleModePhotoView(ButtonEvent evt) {
   if(!evt.valid) return;
-
-  // ← FIX: Cooldown 150ms antar aksi
   static unsigned long lastActionTime = 0;
-  if(millis() - lastActionTime < 150) return;
-  lastActionTime = millis();
+  if(millis()-lastActionTime < 150) return;
+  lastActionTime=millis();
 
-  if(evt.pin == BTN_BOOT && evt.isShort) {
+  if(evt.pin==BTN_BOOT && evt.isShort) {
     photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
     photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
     if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-    resetAllButtons();
-    appMode=MODE_GALLERY; drawGallery();
+    resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
     return;
   }
-
-  if(evt.pin == BTN_B) {
-    if(evt.isLong) {
-      photoViewClearCaption();
-      openDeleteDialog();
-    } else {
+  if(evt.pin==BTN_B) {
+    if(evt.isLong) { photoViewClearCaption(); openDeleteDialog(); }
+    else {
       photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
       photoZoomOffX=0; photoZoomOffY=0;
       if(photoZoomLevel>0) {
@@ -1759,7 +1698,6 @@ void handleModePhotoView(ButtonEvent evt) {
     }
     return;
   }
-
   if(photoZoomLevel==0) {
     if(evt.pin==BTN_C && evt.isShort) photoViewPrev();
     if(evt.pin==BTN_D && evt.isShort) photoViewNext();
@@ -1780,112 +1718,63 @@ void handleModePhotoView(ButtonEvent evt) {
   }
 }
 
-// ── MJPEG Player ──────────────────────────────────────────────────────────────
 void handleModeMjpegPlayer(ButtonEvent evtBoot, ButtonEvent evtB,
                            ButtonEvent evtC,    ButtonEvent evtD) {
-  // ← FIX: Global cooldown 200ms untuk toggle actions
   static unsigned long lastToggleTime = 0;
-
-  if(evtBoot.valid) {
-    mjpegClose(); resetAllButtons();
-    appMode=MODE_GALLERY; drawGallery();
-    return;
+  if(evtBoot.valid) { mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return; }
+  if(evtB.valid && (millis()-lastToggleTime)>=200) {
+    mjpegPaused=!mjpegPaused; mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
+    lastToggleTime=millis();
   }
-
-  if(evtB.valid && (millis() - lastToggleTime) >= 200) {
-    mjpegPaused=!mjpegPaused;
-    mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");
-    lastToggleTime = millis();
+  if(evtC.valid && (millis()-lastToggleTime)>=200) {
+    mjpegLoop=!mjpegLoop; mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
+    lastToggleTime=millis();
   }
-
-  if(evtC.valid && (millis() - lastToggleTime) >= 200) {
-    mjpegLoop=!mjpegLoop;
-    mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");
-    lastToggleTime = millis();
-  }
-
-  if(evtD.valid && (millis() - lastToggleTime) >= 200) {
+  if(evtD.valid && (millis()-lastToggleTime)>=200) {
     mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
-    char spBuf[12];
-    snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
-    mjpegShowNotif(spBuf);
-    lastToggleTime = millis();
+    char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
+    mjpegShowNotif(spBuf); lastToggleTime=millis();
   }
-
   loopMjpegPlayer();
 }
 
-// ── Menu LED (modal) ──────────────────────────────────────────────────────────
 void handleModeMenuLed(ButtonEvent evt) {
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT) {
     ledFlashEnabled=(menuLedSel==0);
-    char fbBuf[24];
-    snprintf(fbBuf,sizeof(fbBuf),"FLASH: %s",ledFlashEnabled?"ON":"OFF");
-    lcd.setFont(&fonts::Font0);
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"FLASH: %s",ledFlashEnabled?"ON":"OFF");
     int fw=lcd.textWidth(fbBuf),fp=fw+14,fpx=(DISP_W-fp)/2;
     lcd.fillRoundRect(fpx,DISP_H/2-8,fp,15,7,ledFlashEnabled?COL_WHITE:COL_GRAY_3);
     lcd.setTextColor(ledFlashEnabled?COL_BLACK:COL_GRAY_5);
     lcd.drawString(fbBuf,fpx+7,DISP_H/2-5);
     delay(800);
-    flashNotifUntilMs=millis()+2000;
-    flashNotifVisible=true;
-    lcd.fillScreen(COL_BLACK);
-    resetAllButtons();
-    appMode=MODE_VIEWFINDER;
+    flashNotifUntilMs=millis()+2000; flashNotifVisible=true;
+    lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B) {
-    lcd.fillScreen(COL_BLACK);
-    resetAllButtons();
-    appMode=MODE_VIEWFINDER;
-  }
-  else if(evt.pin==BTN_C || evt.pin==BTN_D) {
-    menuLedSel=(menuLedSel==0)?1:0;
-    drawLedMenu(menuLedSel);
-  }
+  else if(evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if(evt.pin==BTN_C || evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
 }
 
-// ── Menu Exposure (modal) ─────────────────────────────────────────────────────
 void handleModeMenuExp(ButtonEvent evt) {
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
-    if(menuExpSel==3) {
-      lcd.fillScreen(COL_BLACK);
-      resetAllButtons();
-      appMode=MODE_MENU_EXP_ADJ;
-      return;
-    }
-    char fbBuf[24];
-    snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
+    if(menuExpSel==3) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_MENU_EXP_ADJ; return; }
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
     int fw=lcd.textWidth(fbBuf),fp=fw+14,fpx=(DISP_W-fp)/2;
     lcd.fillRoundRect(fpx,DISP_H/2-8,fp,15,7,COL_WHITE);
     lcd.setTextColor(COL_BLACK); lcd.drawString(fbBuf,fpx+7,DISP_H/2-5);
-    delay(800);
-    lcd.fillScreen(COL_BLACK);
-    resetAllButtons();
-    appMode=MODE_VIEWFINDER;
+    delay(800); lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B) {
-    lcd.fillScreen(COL_BLACK);
-    resetAllButtons();
-    appMode=MODE_VIEWFINDER;
-  }
-  else if(evt.pin==BTN_C) {
-    menuExpSel=(menuExpSel+3)%4;
-    drawExpMenu(menuExpSel);
-  }
-  else if(evt.pin==BTN_D) {
-    menuExpSel=(menuExpSel+1)%4;
-    drawExpMenu(menuExpSel);
-  }
+  else if(evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if(evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
+  else if(evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
 }
 
-// ── Manual Exposure Adjustment (modal) ───────────────────────────────────────
 void handleModeMenuExpAdj(ButtonEvent evt) {
   camera_fb_t *fb=esp_camera_fb_get();
   if(fb) {
-    if(fb->format==PIXFORMAT_RGB565 && fb->width==DISP_W && fb->height==DISP_H) {
+    if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
       int visH=DISP_H-38;
       for(int row=0;row<visH;row++)
         lcd.pushImage(0,row,DISP_W,1,(uint16_t*)fb->buf+row*DISP_W);
@@ -1894,57 +1783,36 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
   }
   drawExpAdjOverlay();
   esp_task_wdt_reset();
-
   if(!evt.valid) return;
   bool changed=false;
   if(evt.pin==BTN_BOOT) {
-    char fbBuf[24];
-    snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
     int fw=lcd.textWidth(fbBuf),fp=fw+14,fpx=(DISP_W-fp)/2;
     lcd.fillRoundRect(fpx,DISP_H/2-8,fp,15,7,COL_WHITE);
     lcd.setTextColor(COL_BLACK); lcd.drawString(fbBuf,fpx+7,DISP_H/2-5);
-    delay(800);
-    lcd.fillScreen(COL_BLACK);
-    resetAllButtons();
-    appMode=MODE_VIEWFINDER;
+    delay(800); lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
     return;
   }
-  else if(evt.pin==BTN_C) {
-    expManualVal=constrain(expManualVal-50,0,1200); changed=true;
-  }
-  else if(evt.pin==BTN_D) {
-    expManualVal=constrain(expManualVal+50,0,1200); changed=true;
-  }
-  else if(evt.pin==BTN_B) {
-    expManualGain=(expManualGain+1)%31; changed=true;
-  }
+  else if(evt.pin==BTN_C) { expManualVal=constrain(expManualVal-50,0,1200); changed=true; }
+  else if(evt.pin==BTN_D) { expManualVal=constrain(expManualVal+50,0,1200); changed=true; }
+  else if(evt.pin==BTN_B) { expManualGain=(expManualGain+1)%31; changed=true; }
   if(changed) applyExpPreset(3);
 }
 
-// ── Delete Dialog (modal) ─────────────────────────────────────────────────────
 void handleModeDialogDelete(ButtonEvent evt) {
   if(millis()-deleteDialogOpenMs >= DELETE_TIMEOUT_MS) {
-    resetAllButtons();
-    showPhotoView(photoViewIndex);
-    return;
+    resetAllButtons(); showPhotoView(photoViewIndex); return;
   }
   if(!evt.valid) return;
-  if(evt.pin==BTN_BOOT) {
-    photoViewDeleteCurrent();
-  } else {
-    resetAllButtons();
-    showPhotoView(photoViewIndex);
-  }
+  if(evt.pin==BTN_BOOT) photoViewDeleteCurrent();
+  else { resetAllButtons(); showPhotoView(photoViewIndex); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ════════════════════════════════════════════════════════════════════
-//  LOOP — pusat dispatch non-blocking
-//  ════════════════════════════════════════════════════════════════════
+//  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
-
   tickAllButtons();
 
   ButtonEvent evtBoot={}, evtB={}, evtC={}, evtD={};
@@ -1953,58 +1821,26 @@ void loop() {
   btnC.pollEvent(evtC);
   btnD.pollEvent(evtD);
 
-  ButtonEvent singleEvt = {};
-  if      (evtBoot.valid) singleEvt = evtBoot;
-  else if (evtB.valid)    singleEvt = evtB;
-  else if (evtC.valid)    singleEvt = evtC;
-  else if (evtD.valid)    singleEvt = evtD;
+  ButtonEvent singleEvt={};
+  if      (evtBoot.valid) singleEvt=evtBoot;
+  else if (evtB.valid)    singleEvt=evtB;
+  else if (evtC.valid)    singleEvt=evtC;
+  else if (evtD.valid)    singleEvt=evtD;
 
-  if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs) {
+  if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
-  }
 
-  if(usbModeActive) {
-    if(evtBoot.valid) exitUSBMode();
-    return;
-  }
-
-  if(recActive) {
-    if(evtB.valid) stopRecording();
-    else           recordFrame();
-    return;
-  }
+  if(usbModeActive) { if(evtBoot.valid) exitUSBMode(); return; }
+  if(recActive)     { if(evtB.valid) stopRecording(); else recordFrame(); return; }
 
   switch(appMode) {
-    case MODE_VIEWFINDER:
-      handleModeViewfinder(singleEvt);
-      break;
-
-    case MODE_GALLERY:
-      handleModeGallery(singleEvt);
-      break;
-
-    case MODE_PHOTO_VIEW:
-      handleModePhotoView(singleEvt);
-      break;
-
-    case MODE_MJPEG_PLAYER:
-      handleModeMjpegPlayer(evtBoot, evtB, evtC, evtD);
-      break;
-
-    case MODE_MENU_LED:
-      handleModeMenuLed(singleEvt);
-      break;
-
-    case MODE_MENU_EXP:
-      handleModeMenuExp(singleEvt);
-      break;
-
-    case MODE_MENU_EXP_ADJ:
-      handleModeMenuExpAdj(singleEvt);
-      break;
-
-    case MODE_DIALOG_DELETE:
-      handleModeDialogDelete(singleEvt);
-      break;
+    case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                        break;
+    case MODE_GALLERY:       handleModeGallery(singleEvt);                           break;
+    case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                         break;
+    case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD);         break;
+    case MODE_MENU_LED:      handleModeMenuLed(singleEvt);                           break;
+    case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                           break;
+    case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                       break;
+    case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                      break;
   }
 }
