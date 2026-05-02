@@ -1,33 +1,19 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM) - VIEWFINDER + SD CARD CAPTURE
- * Version: v5.2-bugfix
+ * Version: v5.2-v50style
  *
- * FIX dari v5.1-fix-patched:
- *
- *  BUG 1 FIX — Photo View: tombol B short malah munculkan dialog delete
- *    Root cause: Di loop() utama, t0=millis() diset SETELAH btnPressed() mendeteksi
- *    tombol, tapi waitBtnRelease() sudah memblokir. Durasi yang diukur adalah
- *    waktu dari deteksi s/d lepas, sehingga tidak akurat untuk long press.
- *    Saat user menekan B untuk zoom, jika ada hesitasi sedikit >1500ms, dikira long press.
- *    FIX: Gunakan readButtonDuration() style — catat waktu dari awal LOW, tunggu
- *    lepas di dalam blok yang sama, sehingga durasi akurat.
- *
- *  BUG 2 FIX — MJPEG Player: freeze/hang setelah ~1 detik
- *    Root cause: Saat tombol apapun ditekan di MODE_MJPEG_PLAYER, kode masuk ke
- *    waitBtnRelease() yang bisa memblokir hingga 2000ms. Selama itu loopMjpegPlayer()
- *    tidak dipanggil → MjpegClass stream state rusak → readMjpegBuf() gagal → freeze.
- *    FIX: Di MODE_MJPEG_PLAYER, deteksi tombol dilakukan non-blocking:
- *    catat waktu press, terus jalankan loopMjpegPlayer() sambil tunggu lepas,
- *    baru proses aksi setelah tombol dilepas.
- *
- *  BUG 3 FIX — Exposure menu: C/D hanya jalan 1x, BOOT tidak respons
- *    Root cause: (a) waitAllBtnRelease() di awal showExpMenu tidak cukup lama,
- *    tombol D dari long press masih terbaca → langsung trigger sel++.
- *    (b) Pengecekan BTN_C, BTN_D, BTN_BOOT, BTN_B menggunakan if berurutan
- *    tanpa else — jika satu trigger dan delay+waitBtnRelease selesai cepat,
- *    tombol lain bisa ikut terbaca dalam iterasi yang sama.
- *    FIX: Tambah delay 200ms tambahan setelah waitAllBtnRelease(), gunakan
- *    else-if chain di semua menu loops, dan perbaiki konsistensi di showLedMenu juga.
+ * Basis: v5.2-bugfix
+ * Perubahan dari v5.2-bugfix:
+ *   - Semua button handling di menu dan photo view dikonversi ke pola v5.0:
+ *     DARI: delay(DEBOUNCE_MS); waitBtnRelease(pin);
+ *     KE:   while(btnPressed(pin)) { delay(10); esp_task_wdt_reset(); }
+ *   - Fungsi waitBtnRelease() tetap ada (dipakai di beberapa tempat)
+ *   - waitAllBtnRelease() tetap dipakai di awal menu
+ *   - showExpMenu(), showLedMenu() loop polling pakai pola v5.0
+ *   - Manual adj loop di showExpMenu() pakai pola v5.0
+ *   - MODE_PHOTO_VIEW di loop() tetap pakai readButtonDuration() untuk
+ *     akurasi short/long press B (delete vs zoom) — ini FIX BUG1 v5.2
+ *     yang penting dan tidak boleh dihilangkan
  *
  * LOGIC SHORT/LONG PRESS per mode:
  *
@@ -391,6 +377,8 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 // ─────────────────────────────────────────────────────────────────────────────
 //  Button helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Baca durasi tekan — blokir sampai lepas. Dipakai di USB mode & loop utama.
 unsigned long readButtonDuration(uint8_t pin) {
   if (digitalRead(pin) != LOW) return 0;
   unsigned long t0 = millis();
@@ -399,12 +387,14 @@ unsigned long readButtonDuration(uint8_t pin) {
   return (dur >= DEBOUNCE_MS) ? dur : 0;
 }
 
+// Cek tombol ditekan (non-blocking, dengan debounce kecil)
 bool btnPressed(uint8_t pin) {
-  if(digitalRead(pin) == HIGH) return false;
+  if (digitalRead(pin) == HIGH) return false;
   delay(10);
   return digitalRead(pin) == LOW;
 }
 
+// Tunggu tombol dilepas (dipakai di beberapa tempat spesifik)
 void waitBtnRelease(uint8_t pin) {
   unsigned long start = millis();
   while (btnPressed(pin) && (millis() - start < 2000)) {
@@ -413,6 +403,7 @@ void waitBtnRelease(uint8_t pin) {
   }
 }
 
+// Tunggu semua tombol dilepas + extra 200ms untuk settle bounce
 void waitAllBtnRelease() {
   unsigned long start = millis();
   while ((btnPressed(BTN_BOOT) || btnPressed(BTN_B) ||
@@ -421,7 +412,7 @@ void waitAllBtnRelease() {
     delay(10);
     esp_task_wdt_reset();
   }
-  delay(200); // ← FIX BUG3: tambah 200ms ekstra agar bouncing tombol sepenuhnya hilang
+  delay(200);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -759,17 +750,19 @@ bool photoViewDeleteDialog(const char* filename) {
   int h2w=lcd.textWidth(hint2);
   lcd.drawString(hint2,dx+(dw-h2w)/2,dy+60);
 
-  // Tunggu semua tombol dilepas dulu sebelum mulai polling
+  // Tunggu semua tombol lepas sebelum polling
   waitAllBtnRelease();
 
   unsigned long waitStart=millis();
   while(millis()-waitStart<8000) {
     if(btnPressed(BTN_BOOT)) {
-      waitBtnRelease(BTN_BOOT);
+      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
       return true;
     }
     if(btnPressed(BTN_B)||btnPressed(BTN_C)||btnPressed(BTN_D)) {
-      waitAllBtnRelease();
+      while(btnPressed(BTN_B)||btnPressed(BTN_C)||btnPressed(BTN_D)) {
+        delay(10); esp_task_wdt_reset();
+      }
       return false;
     }
     delay(10); esp_task_wdt_reset();
@@ -1199,10 +1192,10 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu LED Flash
+//  Menu LED Flash — pola v5.0: while(btnPressed) inline
 // ─────────────────────────────────────────────────────────────────────────────
 void showLedMenu() {
-  waitAllBtnRelease(); // sudah include 200ms ekstra
+  waitAllBtnRelease();
 
   int mw = 200, mh = 90;
   int mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
@@ -1245,18 +1238,23 @@ void showLedMenu() {
 
   redraw();
 
+  // ← Pola v5.0: while(btnPressed) inline di setiap tombol
   while(!done && !cancelled) {
     esp_task_wdt_reset();
-    // ← FIX BUG3: gunakan else-if chain agar hanya satu tombol per iterasi
     if(btnPressed(BTN_BOOT)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); done = true;
-    } else if(btnPressed(BTN_B)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_B); cancelled = true;
-    } else if(btnPressed(BTN_C)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
+      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      done = true;
+    }
+    if(btnPressed(BTN_B)) {
+      while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+      cancelled = true;
+    }
+    if(btnPressed(BTN_C)) {
+      while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
       sel = (sel == 0) ? 1 : 0; redraw();
-    } else if(btnPressed(BTN_D)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
+    }
+    if(btnPressed(BTN_D)) {
+      while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
       sel = (sel == 0) ? 1 : 0; redraw();
     }
     delay(10);
@@ -1280,7 +1278,7 @@ void showLedMenu() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Exposure menu
+//  Exposure menu — pola v5.0: while(btnPressed) inline
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
@@ -1299,7 +1297,7 @@ void applyExpPreset(uint8_t preset) {
 }
 
 void showExpMenu() {
-  waitAllBtnRelease(); // sudah include 200ms ekstra
+  waitAllBtnRelease();
 
   int mw=220, mh=130;
   int mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
@@ -1338,19 +1336,26 @@ void showExpMenu() {
 
   redrawItems();
 
+  // ← Pola v5.0: while(btnPressed) inline
   while(!done && !cancelled) {
     esp_task_wdt_reset();
-    // ← FIX BUG3: else-if chain, BOOT dicek pertama agar selalu responsif
+    if(btnPressed(BTN_C)) {
+      while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
+      sel = (sel + 3) % 4;
+      redrawItems();
+    }
+    if(btnPressed(BTN_D)) {
+      while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
+      sel = (sel + 1) % 4;
+      redrawItems();
+    }
     if(btnPressed(BTN_BOOT)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); done = true;
-    } else if(btnPressed(BTN_B)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_B); cancelled = true;
-    } else if(btnPressed(BTN_C)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
-      sel = (sel + 3) % 4; redrawItems();
-    } else if(btnPressed(BTN_D)) {
-      delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
-      sel = (sel + 1) % 4; redrawItems();
+      while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+      done = true;
+    }
+    if(btnPressed(BTN_B)) {
+      while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
+      cancelled = true;
     }
     delay(10);
   }
@@ -1400,19 +1405,24 @@ void showExpMenu() {
         }
         drawAdjOverlay();
         esp_task_wdt_reset();
-        // ← FIX BUG3: else-if di manual exposure adj juga
+
+        // ← Pola v5.0 juga di manual adjust
         bool changed = false;
-        if(btnPressed(BTN_BOOT)) {
-          delay(DEBOUNCE_MS); waitBtnRelease(BTN_BOOT); adjDone = true;
-        } else if(btnPressed(BTN_C)) {
-          delay(DEBOUNCE_MS); waitBtnRelease(BTN_C);
+        if(btnPressed(BTN_C)) {
+          while(btnPressed(BTN_C)) { delay(10); esp_task_wdt_reset(); }
           expManualVal = constrain(expManualVal - 50, 0, 1200); changed = true;
-        } else if(btnPressed(BTN_D)) {
-          delay(DEBOUNCE_MS); waitBtnRelease(BTN_D);
+        }
+        if(btnPressed(BTN_D)) {
+          while(btnPressed(BTN_D)) { delay(10); esp_task_wdt_reset(); }
           expManualVal = constrain(expManualVal + 50, 0, 1200); changed = true;
-        } else if(btnPressed(BTN_B)) {
-          delay(DEBOUNCE_MS); waitBtnRelease(BTN_B);
+        }
+        if(btnPressed(BTN_B)) {
+          while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
           expManualGain = (expManualGain + 1) % 31; changed = true;
+        }
+        if(btnPressed(BTN_BOOT)) {
+          while(btnPressed(BTN_BOOT)) { delay(10); esp_task_wdt_reset(); }
+          adjDone = true;
         }
         if(changed) applyExpPreset(3);
       }
@@ -1587,7 +1597,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.2-bugfix 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.2-v50style ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1664,7 +1674,7 @@ void loop() {
     if(btnPressed(BTN_B)) {
       delay(40);
       if(btnPressed(BTN_B)) {
-        waitBtnRelease(BTN_B);
+        while(btnPressed(BTN_B)) { delay(10); esp_task_wdt_reset(); }
         stopRecording(); return;
       }
     }
@@ -1672,11 +1682,10 @@ void loop() {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  MODE MJPEG PLAYER — non-blocking button handling
-  //  FIX BUG2: jangan blokir loopMjpegPlayer() saat tombol ditekan
+  //  MODE MJPEG PLAYER — non-blocking button handling (dari v5.2, tetap dipakai)
+  //  Karena player harus terus jalan saat tombol ditekan
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode == MODE_MJPEG_PLAYER) {
-    // Cek apakah ada tombol yang ditekan
     int mjpegBtn = -1;
     if      (btnPressed(BTN_BOOT)) mjpegBtn = BTN_BOOT;
     else if (btnPressed(BTN_B))    mjpegBtn = BTN_B;
@@ -1684,19 +1693,14 @@ void loop() {
     else if (btnPressed(BTN_D))    mjpegBtn = BTN_D;
 
     if(mjpegBtn != -1) {
-      // Catat waktu awal press
       unsigned long pressStart = millis();
-      // Tunggu tombol dilepas SAMBIL tetap jalankan player
       while(btnPressed((uint8_t)mjpegBtn)) {
-        loopMjpegPlayer();        // ← player terus jalan
+        loopMjpegPlayer();
         esp_task_wdt_reset();
-        if(millis() - pressStart > 3000) break; // safety timeout
+        if(millis() - pressStart > 3000) break;
       }
       unsigned long dur = millis() - pressStart;
-      if(dur < DEBOUNCE_MS) {
-        // Bounce, abaikan
-      } else {
-        // Proses aksi
+      if(dur >= DEBOUNCE_MS) {
         if(mjpegBtn == BTN_BOOT) {
           mjpegClose(); appMode=MODE_GALLERY; drawGallery();
           return;
@@ -1782,12 +1786,11 @@ void loop() {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  FIX BUG1: Ukur durasi press dengan benar
-  //  Catat t0 SEBELUM waitBtnRelease, bukan setelah btnPressed
-  //  Karena btnPressed() sudah mengkonfirmasi tombol LOW, t0 akurat dari sini
+  //  Ukur durasi press — catat t0 SEBELUM tunggu lepas (FIX BUG1 v5.2)
+  //  Penting untuk akurasi short/long press BTN_B di MODE_PHOTO_VIEW
   // ─────────────────────────────────────────────────────────────────────────
   unsigned long t0 = millis();
-  waitBtnRelease((uint8_t)pressedPin);
+  while(btnPressed((uint8_t)pressedPin)) { delay(5); esp_task_wdt_reset(); }
   unsigned long dur = millis() - t0;
   if(dur < DEBOUNCE_MS) return;
 
@@ -1847,7 +1850,7 @@ void loop() {
 
   // ─────────────────────────────────────────────────────────────────────────
   //  MODE_PHOTO_VIEW
-  //  FIX BUG1: long press B sekarang memerlukan benar-benar >=1500ms tahan
+  //  Short/long press B diukur akurat via t0 di atas (FIX BUG1 v5.2)
   // ─────────────────────────────────────────────────────────────────────────
   if(appMode==MODE_PHOTO_VIEW) {
     if(pressedPin==BTN_BOOT && isShort) {
