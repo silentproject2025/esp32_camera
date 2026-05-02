@@ -1,23 +1,36 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.4-island-stego-smooth-FIXED2
+ * Version: v5.4-island-stego-smooth-FIXED3
  *
- * FIX v5.4-FIXED2 (di atas FIXED sebelumnya):
- *  - [BUG5] islandTick() dipindah ke DALAM renderViewfinder(), dipanggil
- *            setelah semua pushImage+overlay → island tidak lagi tertimpa frame baru
+ * FIX v5.4-FIXED3 (fix island tidak muncul setelah capture/stop-rec):
+ *
+ *  ROOT CAUSE:
+ *  FPS pill dan SD pill selalu terlihat karena drawPill() dipanggil SETIAP FRAME
+ *  di dalam renderViewfinder(). Island tidak muncul karena dua bug di islandDraw():
+ *
+ *  [BUG-A] islandDraw() memanggil lcd.fillRect(..., COL_BLACK) untuk
+ *          "membersihkan area animasi" — ini menghapus FPS pill, SD pill,
+ *          dan semua overlay yang baru digambar di atas pushImage().
+ *          pushImage() frame berikutnya menimpa semuanya, island hilang.
+ *
+ *  [BUG-B] Early-return saat iY+iH<=0 melakukan fillRect hitam kecil,
+ *          sebelum islandLastW/H di-set — sehingga islandClearArea()
+ *          tidak tahu dimensi island dan tidak berfungsi.
+ *
+ *  FIX:
+ *  • islandDraw(): hapus lcd.fillRect "clear area animasi" — tidak diperlukan
+ *    karena pushImage() sudah menimpa seluruh layar setiap frame di viewfinder.
+ *  • islandDraw(): simpan islandLastX/W/H SEBELUM visibility check.
+ *  • islandDraw(): early-return cukup "return" saja, tanpa fillRect hitam.
+ *  • islandClearArea() tetap ada untuk mode NON-viewfinder (gallery, photo view)
+ *    di mana tidak ada pushImage() yang membersihkan layar setiap frame.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FIX v5.4-FIXED2 (sebelumnya):
+ *  - [BUG5] islandTick() dipindah ke DALAM renderViewfinder()
  *  - [BUG6] islandDraw() menggunakan fillRoundRect+drawRoundRect (radius=10)
- *            menggantikan drawFastVLine/HLine → sudut smooth, bukan kotak
  *  - [BUG7] loop() hanya memanggil islandTick() untuk mode NON-viewfinder
- *            (viewfinder sudah memanggil sendiri) → tidak ada double-call
- *  - [BONUS] Inner highlight ring pada island untuk efek glass/depth
- *  - [BONUS] Shadow tipis di belakang island untuk depth perception
- *  - [BONUS] Separator line antar row dalam island stack
- *
- * FIX v5.4-smooth-FIXED (sebelumnya):
- *  - [BUG1] islandLastY selalu 0 (posisi final)
- *  - [BUG2] islandTick() tidak double-call
- *  - [BUG3] islandDraw() early-return jika masih di atas layar
- *  - [BUG4] clearArea menggunakan iH final
+ *  - [BONUS] Inner highlight ring, shadow, separator line
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY: ILI9341 2.4" 320x240 landscape
@@ -269,23 +282,28 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — Notification System (FIXED2 VERSION)
+//  DYNAMIC ISLAND — Notification System (FIXED3 VERSION)
 //
-//  CHANGELOG FIX2:
-//  1. islandDraw() sekarang menggunakan fillRoundRect+drawRoundRect (radius=10)
-//     → sudut smooth, bukan kotak pertak dari drawFastVLine/HLine
-//  2. Shadow layer tipis di belakang island untuk depth perception
-//  3. Inner highlight ring (efek glass/frosted)
-//  4. Separator line antar notif row dalam stack
-//  5. islandTick() DIPINDAH ke renderViewfinder() — dipanggil setelah
-//     semua pushImage+overlay, sehingga island tidak tertimpa frame berikutnya
-//  6. loop() hanya panggil islandTick() untuk mode NON-viewfinder
+//  CHANGELOG FIXED3:
+//  [BUG-A] Dihapus: lcd.fillRect "clear area animasi" dari islandDraw().
+//          Di mode viewfinder, pushImage() sudah menimpa seluruh layar
+//          setiap frame — fillRect ekstra justru menghapus FPS/SD pills
+//          yang baru digambar, membuat island tidak pernah terlihat.
+//  [BUG-B] islandLastX/W/H kini disimpan SEBELUM visibility check,
+//          sehingga islandClearArea() selalu tahu dimensi yang benar.
+//  [BUG-C] Early-return saat island masih di atas layar cukup "return"
+//          saja — tidak ada fillRect hitam yang menghapus area lain.
 //
-//  CHANGELOG FIX (sebelumnya):
-//  1. islandLastY selalu 0 (posisi FINAL island)
-//  2. islandTick() hanya 1x per frame
-//  3. islandDraw() skip jika masih sepenuhnya di atas layar
-//  4. clearArea menggunakan iH final
+//  Analogi kenapa FPS pill selalu terlihat tapi island tidak:
+//  • drawPill() dipanggil SETIAP FRAME → selalu ada di layar.
+//  • islandDraw() hanya dipanggil saat state aktif, tapi fillRect-nya
+//    menghapus pills → pills hilang → pushImage timpa → island hilang.
+//
+//  CHANGELOG FIXED2 (sebelumnya):
+//  [BUG5] islandTick() dipindah ke dalam renderViewfinder()
+//  [BUG6] fillRoundRect+drawRoundRect radius=10 → sudut smooth
+//  [BUG7] loop() tidak double-call islandTick()
+//  [BONUS] Shadow, inner highlight, separator antar row
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      2000
 #define ISLAND_ANIM_MS       160
@@ -296,7 +314,7 @@ inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btn
 #define ISLAND_PAD_V           5
 #define ISLAND_PAD_H          10
 #define ISLAND_ICON_SZ        10
-#define ISLAND_RADIUS         10   // ← sudut rounded (baru)
+#define ISLAND_RADIUS         10
 #define ISLAND_CX       (DISP_W / 2)
 
 enum IslandState { ISLAND_HIDDEN, ISLAND_SLIDING_IN, ISLAND_VISIBLE, ISLAND_SLIDING_OUT };
@@ -354,12 +372,16 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandDraw — FIXED2
-//  Perubahan utama:
-//  • fillRoundRect + drawRoundRect dengan ISLAND_RADIUS=10 → sudut smooth
-//  • Shadow layer (1px lebih besar, warna gelap tipis) → depth
-//  • Inner highlight ring → efek glass
-//  • Separator antar row → visual hierarchy jelas
+//  islandDraw — FIXED3
+//
+//  Perubahan dari FIXED2:
+//  1. islandLastX/W/H disimpan SEBELUM visibility check (fix BUG-B)
+//  2. Early-return saat iY+iH<=0 hanya "return" — tidak ada fillRect (fix BUG-C)
+//  3. DIHAPUS: lcd.fillRect(..., COL_BLACK) "clear area animasi" (fix BUG-A)
+//     → Di mode viewfinder, pushImage() sudah timpa seluruh layar setiap frame.
+//       fillRect ekstra di sini menghapus FPS/SD pills, bukan membantu.
+//     → Di mode non-viewfinder, islandClearArea() dipanggil secara eksplisit
+//       sebelum islandHide() — itulah mekanisme clear yang benar.
 // ─────────────────────────────────────────────────────────────────────────────
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
@@ -370,33 +392,30 @@ static void islandDraw(int offsetY = 0) {
   int iX = ISLAND_CX - iW / 2;
   int iY = offsetY;
 
-  // Simpan posisi FINAL (y=0) untuk clearArea
+  // ── FIX BUG-B: Simpan dimensi SEBELUM visibility check ──
+  // Agar islandClearArea() selalu tahu ukuran island yang benar,
+  // bahkan saat island masih di atas layar (sliding in dari atas).
   islandLastX = iX;
-  islandLastY = 0;
+  islandLastY = 0;   // posisi final selalu y=0
   islandLastW = iW;
   islandLastH = iH;
 
-  // Island masih sepenuhnya di atas layar → bersihkan dan keluar
-  if (iY + iH <= 0) {
-    lcd.fillRect(iX - 3, 0, iW + 6, 4, COL_BLACK);
-    return;
-  }
+  // ── FIX BUG-C: Island masih sepenuhnya di atas layar → skip draw ──
+  // Cukup return — JANGAN fillRect hitam di sini.
+  // Di viewfinder: pushImage() sudah membersihkan layar setiap frame.
+  // Di non-viewfinder: islandClearArea() dipanggil saat islandHide().
+  if (iY + iH <= 0) return;
 
-  // Bersihkan area animasi: dari y=0 sampai bawah island + margin
-  lcd.fillRect(iX - 3, 0, iW + 6, iH + 5 + max(0, -offsetY), COL_BLACK);
-
-  // ── Layer 1: Shadow (1px lebih besar, warna sedikit terang dari black) ──
-  // Memberikan depth agar island "mengambang" di atas viewfinder
+  // ── Layer 1: Shadow (depth perception) ──
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
 
   // ── Layer 2: Body utama island ──
   lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
 
-  // ── Layer 3: Border luar (terang, setengah opacity) ──
+  // ── Layer 3: Border luar ──
   lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
 
-  // ── Layer 4: Inner highlight (1px di dalam border, lebih gelap) ──
-  // Efek glass/frosted — memberi kesan material tipis
+  // ── Layer 4: Inner highlight (efek glass) ──
   if (iH > 4 && iW > 4) {
     lcd.drawRoundRect(iX + 1, iY + 1, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
   }
@@ -405,8 +424,6 @@ static void islandDraw(int offsetY = 0) {
   int rowY = iY + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
     islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
-
-    // Separator tipis antar row (kecuali baris terakhir)
     if (i < n - 1) {
       lcd.drawFastHLine(
         iX + ISLAND_PAD_H,
@@ -420,8 +437,9 @@ static void islandDraw(int offsetY = 0) {
 }
 
 static void islandClearArea() {
+  // Digunakan oleh mode NON-viewfinder (gallery, photo view, dll)
+  // di mana tidak ada pushImage() yang membersihkan layar setiap frame.
   if (islandLastW > 0 && islandLastH > 0) {
-    // islandLastY selalu 0 → bersihkan dari atas layar
     lcd.fillRect(islandLastX - 3, 0, islandLastW + 6, islandLastH + 7, COL_BLACK);
   }
 }
@@ -457,8 +475,6 @@ void islandPush(NotifType type, const char* text) {
 //  • renderViewfinder() → setelah semua pushImage+overlay (mode viewfinder)
 //  • loop() bagian bawah → hanya untuk mode NON-viewfinder
 //  • recordFrame() → saat sedang rekam video
-//
-//  TIDAK boleh dipanggil 2x dalam satu frame yang sama.
 // ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
@@ -474,7 +490,7 @@ void islandTick() {
         islandDraw(0);
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
-        // Ease-out cubic → gerak cepat di awal, melambat mendekati posisi final
+        // Ease-out cubic → cepat di awal, melambat mendekati posisi final
         progress = 1.0f - pow(1.0f - progress, 3);
         int nItems = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
@@ -1351,7 +1367,7 @@ void recordFrame() {
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawRecIndicator();
-    islandTick();  // boleh dipanggil di sini karena recordFrame punya timing sendiri
+    islandTick();
   }
   esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
@@ -1564,23 +1580,25 @@ void applyExpPreset(uint8_t preset) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  VIEWFINDER — FIXED2
+//  VIEWFINDER — FIXED3
 //
-//  Perubahan kunci:
-//  • islandTick() dipanggil di AKHIR fungsi ini, setelah semua overlay
-//  • Urutan: pushImage → overlay → islandTick()
-//  • Dengan urutan ini island TIDAK akan tertimpa pushImage frame berikutnya
-//    karena island digambar paling terakhir dalam satu frame yang sama
+//  Urutan dalam satu frame:
+//  1. pushImage()      → timpa seluruh layar dengan frame kamera
+//  2. drawCornerBrackets(), runFaceDetect(), drawPill() → overlay di atas frame
+//  3. islandTick()     → island digambar PALING TERAKHIR, tidak ada yang menimpa
+//
+//  islandDraw() (FIXED3) tidak melakukan fillRect hitam apapun,
+//  sehingga pills dari step 2 tetap aman.
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   camera_fb_t *fb=esp_camera_fb_get(); if(!fb) return;
 
   if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
 
-    // ── Step 1: Push frame kamera ke layar (ini menimpa SELURUH layar) ──
+    // ── Step 1: Frame kamera ──
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
 
-    // ── Step 2: Overlay — semua elemen UI di atas frame ──
+    // ── Step 2: Overlay UI ──
     drawCornerBrackets(COL_GRAY_E);
     if(faceDetectMode) runFaceDetect(fb);
 
@@ -1606,11 +1624,9 @@ void renderViewfinder() {
 
     if(recActive) drawRecIndicator();
 
-    // ── Step 3: islandTick() TERAKHIR — di atas semua overlay ──
-    // Ini adalah fix utama: island digambar SETELAH pushImage+overlay,
-    // sehingga tidak tertimpa oleh frame kamera di iterasi ini.
-    // Loop berikutnya akan: pushImage (timpa semuanya) → overlay → islandTick
-    // sehingga island selalu terlihat di setiap frame.
+    // ── Step 3: Island — PALING TERAKHIR ──
+    // islandDraw() (FIXED3) tidak melakukan fillRect apapun,
+    // sehingga pills di step 2 tetap aman dan island tampil di atas semua.
     islandTick();
 
     updateFPS();
@@ -1682,6 +1698,9 @@ void captureAndPreview() {
 
   fpsLastTime=millis(); fpsFrameCount=0;
   resetAllButtons();
+  // Tidak perlu islandTick() di sini — renderViewfinder() akan memanggilnya
+  // di frame berikutnya, dan islandDraw() (FIXED3) tidak ada fillRect
+  // yang mengganggu pills. Island akan slide-in dengan benar.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1743,7 +1762,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.4-FIXED2 smooth-island rounded 4-BTN ===");
+  Serial.println("\n=== Sanzxcam v5.4-FIXED3 island-no-clear ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -1962,12 +1981,12 @@ void handleModeDialogDelete(ButtonEvent evt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LOOP — FIXED2
+//  LOOP — FIXED3
 //
-//  Perubahan kunci:
-//  • islandTick() untuk MODE_VIEWFINDER sudah dipanggil dari renderViewfinder()
-//  • Di sini hanya dipanggil untuk mode NON-viewfinder (gallery, photo view, dll)
-//  • recActive handler: islandTick() sudah ada di recordFrame()
+//  Tidak ada perubahan dari FIXED2 di sini.
+//  islandTick() untuk viewfinder → dipanggil dari renderViewfinder().
+//  islandTick() untuk non-viewfinder → dipanggil di bawah switch.
+//  islandTick() untuk recording → dipanggil dari recordFrame().
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
@@ -1989,19 +2008,17 @@ void loop() {
   if(appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
-  // USB mode — hanya cek tombol keluar
+  // USB mode
   if(usbModeActive) { if(evtBoot.valid) exitUSBMode(); return; }
 
-  // Recording aktif — islandTick() sudah ada di dalam recordFrame()
+  // Recording aktif
   if(recActive) { if(evtB.valid) stopRecording(); else recordFrame(); return; }
 
   // ── Mode switch ──
   switch(appMode) {
     case MODE_VIEWFINDER:
-      // renderViewfinder() sudah memanggil islandTick() di dalamnya
       handleModeViewfinder(singleEvt);
       break;
-
     case MODE_GALLERY:       handleModeGallery(singleEvt);                   break;
     case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                 break;
     case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
@@ -2011,9 +2028,8 @@ void loop() {
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);              break;
   }
 
-  // ── islandTick() untuk semua mode KECUALI viewfinder ──
-  // Mode viewfinder sudah memanggil islandTick() dari renderViewfinder()
-  // untuk menghindari double-call dan memastikan island di atas pushImage
+  // islandTick() untuk semua mode KECUALI viewfinder
+  // (viewfinder sudah memanggil dari renderViewfinder())
   if(appMode != MODE_VIEWFINDER) {
     islandTick();
   }
