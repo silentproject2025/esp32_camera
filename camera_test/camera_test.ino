@@ -303,8 +303,8 @@ inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btn
 //          lcd.pushImage() sehingga island slide-in tidak tertimpa.
 //          Freeze di-set oleh captureAndPreview() dan stopRecording().
 // ─────────────────────────────────────────────────────────────────────────────
-#define ISLAND_SHOW_MS      2000
-#define ISLAND_ANIM_MS       160
+#define ISLAND_SHOW_MS      1000
+#define ISLAND_ANIM_MS       150
 #define ISLAND_MAX_STACK       3
 #define ISLAND_W_SINGLE      188
 #define ISLAND_W_STACK       216
