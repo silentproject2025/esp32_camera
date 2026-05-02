@@ -262,7 +262,7 @@ inline void resetAllButtons() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  LED Flash state
 // ─────────────────────────────────────────────────────────────────────────────
-bool ledFlashEnabled = true;
+bool ledFlashEnabled = false;
 
 unsigned long flashNotifUntilMs = 0;
 bool          flashNotifVisible  = false;
