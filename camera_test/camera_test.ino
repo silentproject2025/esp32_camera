@@ -1,6 +1,6 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.6-island-fix4 + stego-fix
+ * Version: v5.6-island-fix5 + stego-fix
  *
  * ═══════════════════════════════════════════════════════════════
  *  CHANGELOG v5.6-island-fix2 (fixes di atas v5.6):
@@ -450,14 +450,15 @@ static void islandClearArea() {
   }
 }
 
-// [FIX-D] islandHide: skip fillRect jika islandNoClear aktif
+// islandHide: dipanggil di akhir animasi slide-out — island sudah di luar
+// layar, tidak ada yang perlu di-clear. Reset state saja.
+// islandClearArea() TIDAK dipanggil di sini — island sudah tidak terlihat.
 static void islandHide() {
-  if (!islandNoClear) islandClearArea();
-  islandState   = ISLAND_HIDDEN;
-  islandCount   = 0;
-  islandLastW   = 0;
-  islandLastH   = 0;
-  islandPrevBottom = -1; // reset tracking
+  islandState      = ISLAND_HIDDEN;
+  islandCount      = 0;
+  islandLastW      = 0;
+  islandLastH      = 0;
+  islandPrevBottom = -1;
 }
 
 void islandPush(NotifType type, const char* text) {
@@ -1551,7 +1552,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.6  island-fix4  stego-fix",DISP_W/2-72,103);
+  lcd.drawString("v5.6  island-fix5  stego-fix",DISP_W/2-72,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1564,7 +1565,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND","fix4: no fillRect, edge-only clear",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND","fix5: hide no-clear, edge-only",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(182,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(194,"EXTRACT","padding skip  null guard  8KB",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
@@ -1949,7 +1950,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.6-island-fix4 + stego-fix ===");
+  Serial.println("\n=== Sanzxcam v5.6-island-fix5 + stego-fix ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
