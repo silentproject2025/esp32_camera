@@ -1,42 +1,52 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.6-island-fix9
+ * Version: v5.7
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.6-island-fix9 (fixes di atas v5.6-island-fix8):
+ *  CHANGELOG v5.7 (fixes di atas v5.6-island-fix9):
  *
- *  [FIX-I] Eliminasi kotak hitam saat island muncul & keluar
+ *  [ISLAND-FIX] Animasi island benar-benar smooth tanpa kotak hitam
  *
- *  Root cause:
- *  1. Frame pertama SLIDING_IN: islandErase() dipanggil saat
- *     islandDrawnOnce=false (belum ada piksel island di layar).
- *     fillRect langsung dieksekusi → kotak hitam muncul barengan
- *     dengan island di frame pertama animasi slide-in.
+ *  Root cause final:
+ *  islandErase() dipanggil sebelum islandDraw() setiap frame →
+ *  fillRect hitam muncul sejenak sebelum island digambar ulang.
+ *  Di viewfinder, frame kamera sudah menimpa seluruh layar setiap
+ *  loop — erase manual tidak diperlukan sama sekali.
  *
- *  2. Akhir SLIDING_OUT: saat elapsed >= ISLAND_ANIM_MS,
- *     islandErase() dipanggil lagi padahal island sudah di luar
- *     layar (offsetY = -iH, tidak ada piksel tersisa).
- *     fillRect menghasilkan kotak hitam yang tertinggal ~100-200ms
- *     sebelum islandHide() dipanggil.
+ *  Fix:
+ *  [ISLAND-1] islandNoClear = true SELALU di renderViewfinder()
+ *             (bukan hanya saat !frozen seperti sebelumnya).
+ *  [ISLAND-2] Hapus islandErase() dari SLIDING_IN dan SLIDING_OUT.
+ *             Frame kamera yang bersihkan bekas island lama.
+ *  [ISLAND-3] islandErase() tanpa parameter — pakai islandLastX/Y/W/H
+ *             bukan parameter iX/iW/iH dari caller (yang bisa beda
+ *             dengan apa yang sudah ada di layar).
+ *  [ISLAND-4] islandDraw() simpan Last* SEBELUM early return
+ *             (iY + iH <= 0) agar erase frame berikutnya presisi.
  *
- *  Fix (3 perubahan):
- *  [FIX-I-1] Tambahkan flag islandDrawnOnce.
- *             islandErase() skip jika !islandDrawnOnce.
- *             islandHide() reset islandDrawnOnce = false.
- *  [FIX-I-2] islandDraw() set islandDrawnOnce = true setelah draw.
- *  [FIX-I-3] SLIDING_OUT frame terakhir: langsung islandHide()
- *             tanpa islandErase() — island sudah di luar layar,
- *             tidak ada piksel yang perlu dihapus.
+ *  [EXIF] Inject APP1 EXIF ke JPEG hasil capture
+ *
+ *  Alur capture: frame2jpg → stegoEmbedToJpeg → exifInjectToJpeg
+ *  Tags yang diinject:
+ *    0x010F  Make            = "SANZXCAM"
+ *    0x0110  Model           = sensorName (GC2145 / OV3660)
+ *    0x0131  Software        = "v5.7"
+ *    0x010E  ImageDescription= "photo_NNNN"
+ *    0x9003  DateTimeOriginal= millis-based timestamp placeholder
+ *    0x9000  ExifVersion     = "0220"
+ *  Implementasi manual (no library), pure byte array ~200 byte.
+ *  Little-endian TIFF header sesuai EXIF spec.
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.6-island-fix8:
- *  [FIX-H] islandLastY disimpan setiap islandDraw, erase dari min(lastY,0)
- *  [FIX-F] Hapus fillRect lebar dari islandDraw()
- *  [FIX-G] islandTick() panggil islandErase sebelum islandDraw
- *  [FIX-D] islandNoClear: skip fillRect saat viewfinder tidak frozen
- *  [FIX-E] Steganografi: payLen tanpa \0, fallback malloc, null guard
- *  [FIX-B] applyExpPreset() jaga hmirror/vflip + delay + flush
- *  [FIX-C] Stego embed ke COM marker JPEG
+ *  TETAP dari v5.6-island-fix9:
+ *  [FIX-I-1] islandDrawnOnce flag
+ *  [FIX-I-3] SLIDING_OUT terakhir langsung islandHide()
+ *  [FIX-H]   islandLastY disimpan setiap islandDraw
+ *  [FIX-F]   Tidak ada fillRect lebar di islandDraw
+ *  [FIX-D]   islandNoClear skip fillRect saat viewfinder aktif
+ *  [FIX-E]   Steganografi: payLen tanpa \0, fallback malloc
+ *  [FIX-B]   applyExpPreset() jaga hmirror/vflip + delay + flush
+ *  [FIX-C]   Stego embed ke COM marker JPEG
  *  Shadow + highlight + separator di island (smooth)
  * ═══════════════════════════════════════════════════════════════
  *
@@ -290,28 +300,13 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — v5.6-island-fix9
+//  DYNAMIC ISLAND — v5.7
 //
-//  [FIX-I] Tiga perubahan kecil menghilangkan kotak hitam sepenuhnya:
-//
-//  [FIX-I-1] islandDrawnOnce: flag bahwa piksel island sudah ada di layar.
-//             islandErase() skip fillRect jika !islandDrawnOnce.
-//             islandHide() reset flag ke false.
-//
-//  [FIX-I-2] islandDraw() set islandDrawnOnce = true setelah menggambar.
-//             Ini memastikan erase hanya terjadi setelah ada sesuatu
-//             yang perlu dihapus.
-//
-//  [FIX-I-3] SLIDING_OUT frame terakhir: langsung islandHide() tanpa
-//             islandErase(). Island sudah di luar layar (offsetY = -iH),
-//             tidak ada piksel tersisa. Memanggil fillRect di sini adalah
-//             sumber persis kotak hitam tertinggal.
-//
-//  TETAP dari fix8:
-//  [FIX-H] islandLastY disimpan setiap islandDraw, erase mulai min(lastY,0)
-//  [FIX-D] islandNoClear: skip erase saat viewfinder push frame aktif
-//  [FIX-F] Tidak ada fillRect lebar di islandDraw
-//  [FIX-G] islandTick() panggil erase sebelum draw
+//  [ISLAND-1] islandNoClear = true selalu di viewfinder
+//  [ISLAND-2] Tidak ada islandErase() di SLIDING_IN / SLIDING_OUT
+//             Frame kamera yang bersihkan bekas island
+//  [ISLAND-3] islandErase() tanpa parameter, pakai islandLast*
+//  [ISLAND-4] islandDraw() simpan Last* sebelum early return
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
 #define ISLAND_ANIM_MS       150
@@ -342,15 +337,15 @@ static unsigned long islandShowAt    = 0;
 static unsigned long islandHideAt    = 0;
 static unsigned long islandAnimStart = 0;
 static int           islandLastX     = 0;
-static int           islandLastY     = 0;   // [FIX-H] posisi Y terakhir digambar
+static int           islandLastY     = 0;
 static int           islandLastW     = 0;
 static int           islandLastH     = 0;
-static bool          islandDrawnOnce = false; // [FIX-I-1] ada piksel island di layar?
+static bool          islandDrawnOnce = false;
 
 static unsigned long islandFreezeUntilMs = 0;
 
-// islandNoClear: true saat viewfinder push frame aktif (tidak frozen).
-// Frame kamera menimpa seluruh layar setiap loop → tidak perlu fillRect.
+// islandNoClear: true di viewfinder — frame kamera timpa layar tiap loop,
+// fillRect hitam tidak diperlukan dan justru bikin flicker.
 static bool islandNoClear = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,27 +392,33 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandErase — [FIX-I-1] Guard islandDrawnOnce
+//  islandErase — [ISLAND-3] tanpa parameter, pakai islandLast*
 //
-//  Skip fillRect jika island belum pernah digambar (islandDrawnOnce=false).
-//  Ini mencegah kotak hitam di frame pertama SLIDING_IN.
-//
-//  [FIX-H] eraseY = min(islandLastY, 0) → cover area piksel negatif
-//  saat island sedang slide-in/out dengan offsetY negatif.
+//  Hanya dipanggil di mode non-viewfinder (gallery, photo view, dll)
+//  dimana tidak ada frame kamera yang menimpa layar.
+//  Di viewfinder: islandNoClear = true → fungsi ini selalu skip.
 // ─────────────────────────────────────────────────────────────────────────────
-static void islandErase(int iX, int iW, int iH) {
-  if (islandNoClear)    return; // viewfinder push frame aktif → skip
-  if (!islandDrawnOnce) return; // [FIX-I-1] belum ada piksel island → skip
+static void islandErase() {
+  if (islandNoClear)    return;
+  if (!islandDrawnOnce) return;
+  if (islandLastW <= 0 || islandLastH <= 0) return;
 
-  int eraseY = min(islandLastY, 0);
-  int eraseH = iH + 4 - eraseY;
+  int eraseX = islandLastX - 3;
+  int eraseY = islandLastY;
+  int eraseW = islandLastW + 6;
+  int eraseH = islandLastH + 4;
+
+  // Clamp ke layar
+  if (eraseY < 0) { eraseH += eraseY; eraseY = 0; }
   if (eraseH <= 0) return;
-  lcd.fillRect(iX - 3, 0, iW + 6, eraseH, COL_BLACK);
+  if (eraseX < 0) { eraseW += eraseX; eraseX = 0; }
+  if (eraseW <= 0) return;
+
+  lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandDraw — [FIX-I-2] Set islandDrawnOnce = true setelah draw
-//  [FIX-H] Simpan islandLastY = iY setiap frame
+//  islandDraw — [ISLAND-4] simpan Last* sebelum early return
 // ─────────────────────────────────────────────────────────────────────────────
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
@@ -427,7 +428,7 @@ static void islandDraw(int offsetY = 0) {
   islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
 
-  // [FIX-H] Simpan posisi Y aktual untuk islandErase presisi
+  // [ISLAND-4] Simpan Last* SEBELUM early return agar erase berikutnya presisi
   islandLastX = iX;
   islandLastY = iY;
   islandLastW = iW;
@@ -452,20 +453,19 @@ static void islandDraw(int offsetY = 0) {
     rowY += ISLAND_H_ROW + 2;
   }
 
-  islandDrawnOnce = true; // [FIX-I-2] ada piksel island di layar sekarang
+  islandDrawnOnce = true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandHide — [FIX-I-1] Reset islandDrawnOnce
-//  [FIX-H] Reset islandLastY
+//  islandHide
 // ─────────────────────────────────────────────────────────────────────────────
 static void islandHide() {
   islandState     = ISLAND_HIDDEN;
   islandCount     = 0;
   islandLastW     = 0;
   islandLastH     = 0;
-  islandLastY     = 0;   // [FIX-H]
-  islandDrawnOnce = false; // [FIX-I-1] reset: tidak ada piksel island di layar
+  islandLastY     = 0;
+  islandDrawnOnce = false;
 }
 
 void islandPush(NotifType type, const char* text) {
@@ -485,18 +485,17 @@ void islandPush(NotifType type, const char* text) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandTick — v5.6-island-fix9
+//  islandTick — v5.7
 //
-//  [FIX-I-3] SLIDING_OUT frame terakhir: langsung islandHide() tanpa
-//  islandErase(). Island sudah di luar layar (offsetY sudah = -iH),
-//  tidak ada piksel yang tersisa. fillRect di sini = kotak hitam tertinggal.
+//  [ISLAND-2] SLIDING_IN dan SLIDING_OUT tidak memanggil islandErase().
+//  Di viewfinder: islandNoClear=true → erase diskip otomatis.
+//  Di mode lain: erase dipanggil hanya di VISIBLE (redraw blink REC).
 //
-//  Pola per-state:
-//    SLIDING_IN  non-terakhir : erase(lastY) → draw(offsetY<0)
-//    SLIDING_IN  terakhir     : erase(lastY) → draw(0)
-//    VISIBLE                  : draw(0) hanya jika NOTIF_REC (blink)
-//    SLIDING_OUT non-terakhir : erase(lastY) → draw(offsetY<0)
-//    SLIDING_OUT terakhir     : islandHide() saja  ← [FIX-I-3]
+//  Pola:
+//    SLIDING_IN  : draw(offsetY) saja — tidak ada erase
+//    VISIBLE     : draw(0) hanya jika NOTIF_REC blink
+//    SLIDING_OUT : draw(offsetY) saja — tidak ada erase
+//    SLIDING_OUT terakhir: islandHide() langsung
 // ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
@@ -512,15 +511,15 @@ void islandTick() {
       islandCalcDims(nItems, iW, iH, iX);
 
       if (elapsed >= ISLAND_ANIM_MS) {
-        islandErase(iX, iW, iH);
+        // [ISLAND-2] tidak ada islandErase() di sini
         islandDraw(0);
         islandState = ISLAND_VISIBLE;
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = 1.0f - pow(1.0f - progress, 3);
         int offsetY = (int)(-iH * (1.0f - progress));
-        islandErase(iX, iW, iH); // skip frame pertama karena !islandDrawnOnce [FIX-I-1]
-        islandDraw(offsetY);     // set islandDrawnOnce=true [FIX-I-2]
+        // [ISLAND-2] tidak ada islandErase() di sini
+        islandDraw(offsetY);
       }
       break;
     }
@@ -532,6 +531,7 @@ void islandTick() {
       } else {
         // Statis — hanya redraw kalau NOTIF_REC (dot blink)
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
+          islandErase(); // erase dulu (di non-viewfinder ini perlu)
           islandDraw(0);
         }
       }
@@ -544,16 +544,13 @@ void islandTick() {
       islandCalcDims(nItems, iW, iH, iX);
 
       if (elapsed >= ISLAND_ANIM_MS) {
-        // [FIX-I-3] Island sudah sepenuhnya di luar layar (offsetY = -iH).
-        // TIDAK ada piksel island yang tersisa di layar.
-        // Memanggil islandErase() di sini menghasilkan kotak hitam tertinggal.
-        // Langsung hide — bersih, tidak ada artefak.
+        // Island sudah di luar layar, langsung hide
         islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = pow(progress, 3);
         int offsetY = (int)(-iH * progress);
-        islandErase(iX, iW, iH);
+        // [ISLAND-2] tidak ada islandErase() di sini
         islandDraw(offsetY);
       }
       break;
@@ -561,40 +558,33 @@ void islandTick() {
   }
 }
 
-// islandForceHide: paksa sembunyi saat mode switch.
+// islandForceHide: paksa sembunyi saat mode switch
 void islandForceHide() {
-  islandNoClear = false;
-  if (islandState != ISLAND_HIDDEN && islandLastW > 0 && islandDrawnOnce) {
-    islandErase(islandLastX, islandLastW, islandLastH);
+  islandNoClear = false; // reset dulu agar erase bisa jalan
+  if (islandState != ISLAND_HIDDEN && islandDrawnOnce) {
+    islandErase(); // [ISLAND-3] tanpa parameter
   }
   islandHide();
   islandFreezeUntilMs = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI — v5.6 (FIX-E, tidak berubah)
+//  STEGANOGRAFI — v5.6 (tidak berubah)
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
-#define STEGO_VERSION      "v5.6"
+#define STEGO_VERSION      "v5.7"
 
 void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
 }
 
-// [FIX-E] stegoEmbedToJpeg — payLen = strlen(payload), TANPA \0
 uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
                            const char* payload, int payLen,
                            size_t* outLen) {
   if (!jpgIn || jpgLen < 4 || !outLen) return nullptr;
-  if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) {
-    Serial.println("[STEGO] embed: bukan JPEG (SOI tidak valid)");
-    return nullptr;
-  }
-  if (!payload || payLen <= 0 || payLen > 500) {
-    Serial.printf("[STEGO] embed: payLen tidak valid (%d)\n", payLen);
-    return nullptr;
-  }
+  if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
+  if (!payload || payLen <= 0 || payLen > 500) return nullptr;
 
   int    comTotal = 4 + payLen;
   size_t newLen   = jpgLen + (size_t)comTotal;
@@ -602,17 +592,11 @@ uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   uint8_t* out = (uint8_t*)ps_malloc(newLen);
   if (!out) {
     out = (uint8_t*)malloc(newLen);
-    if (!out) {
-      Serial.printf("[STEGO] embed: alokasi %u byte gagal\n", (unsigned)newLen);
-      return nullptr;
-    }
-    Serial.println("[STEGO] embed: ps_malloc gagal, pakai malloc biasa");
+    if (!out) return nullptr;
   }
 
-  out[0] = 0xFF;
-  out[1] = 0xD8;
-  out[2] = 0xFF;
-  out[3] = 0xFE;
+  out[0] = 0xFF; out[1] = 0xD8;
+  out[2] = 0xFF; out[3] = 0xFE;
 
   uint16_t comLen = (uint16_t)(2 + payLen);
   out[4] = (uint8_t)((comLen >> 8) & 0xFF);
@@ -622,13 +606,9 @@ uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   memcpy(out + 6 + payLen, jpgIn + 2, jpgLen - 2);
 
   *outLen = newLen;
-
-  Serial.printf("[STEGO] embed OK: payload='%.*s' payLen=%d comLen=%d totalJpeg=%u\n",
-                payLen, payload, payLen, (int)comLen, (unsigned)newLen);
   return out;
 }
 
-// [FIX-E] stegoExtractFromJpeg — handle padding 0xFF, null terminator eksplisit
 bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
                            char* outPayload, int maxLen) {
   if (!jpgBuf || jpgLen < 6 || !outPayload || maxLen < 2) return false;
@@ -637,42 +617,29 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
   size_t pos = 2;
   while (pos + 3 < jpgLen) {
     if (jpgBuf[pos] != 0xFF) break;
-
     uint8_t marker = jpgBuf[pos + 1];
     if (marker == 0xFF) { pos++; continue; }
-
     if (marker == 0xD8) { pos += 2; continue; }
     if (marker == 0xD9) break;
-
     if (marker >= 0xD0 && marker <= 0xD7) { pos += 2; continue; }
-
     if (pos + 3 >= jpgLen) break;
     uint16_t segLen = ((uint16_t)jpgBuf[pos + 2] << 8) | jpgBuf[pos + 3];
     if (segLen < 2) break;
-
     if (marker == 0xFE) {
       int dataLen = (int)segLen - 2;
       if (dataLen <= 0) { pos += 2 + segLen; continue; }
-
       int readLen = (dataLen < maxLen - 1) ? dataLen : maxLen - 1;
       memcpy(outPayload, jpgBuf + pos + 4, (size_t)readLen);
       outPayload[readLen] = '\0';
-
-      bool match = (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
-      Serial.printf("[STEGO] extract: dataLen=%d payload='%s' magic=%s\n",
-                    dataLen, outPayload, match ? "OK" : "MISS");
-      return match;
+      return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
     }
-
     size_t skip = 2 + (size_t)segLen;
     if (pos + skip > jpgLen) break;
     pos += skip;
   }
-
   return false;
 }
 
-// Fungsi LSB lama — dipertahankan
 void stegoEmbedRGB565(uint16_t* buf, int w, int h,
                       const char* payload, int payLen) {
   if (!buf || !payload || payLen <= 0) return;
@@ -708,6 +675,208 @@ bool stegoExtractRGB565(uint16_t* buf, int w, int h,
   }
   outPayload[maxLen - 1] = '\0';
   return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  EXIF INJECT — v5.7
+//
+//  Inject APP1 EXIF marker ke JPEG hasil capture.
+//  Implementasi manual, pure byte array, tanpa library eksternal.
+//  Format: TIFF little-endian, IFD0 + ExifIFD pointer.
+//
+//  Tags yang diinject:
+//    IFD0:
+//      0x010E  ImageDescription  = "photo_NNNN"
+//      0x010F  Make              = "SANZXCAM"
+//      0x0110  Model             = sensorName
+//      0x0131  Software          = "v5.7"
+//      0x8769  ExifIFDPointer    = offset ke ExifIFD
+//    ExifIFD:
+//      0x9000  ExifVersion       = "0220" (4 bytes, type UNDEFINED)
+//      0x9003  DateTimeOriginal  = "YYYY:MM:DD HH:MM:SS" (millis-based)
+//
+//  Dipanggil setelah stegoEmbedToJpeg, hasilnya adalah JPEG final.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Helper tulis little-endian
+static inline void exifL16(uint8_t* b, uint16_t v) {
+  b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
+}
+static inline void exifL32(uint8_t* b, uint32_t v) {
+  b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
+  b[2] = (v >> 16) & 0xFF; b[3] = (v >> 24) & 0xFF;
+}
+
+// Tulis satu IFD entry (12 byte)
+// tag, type, count, val_or_offset (semua little-endian)
+static void exifEntry(uint8_t* b, uint16_t tag, uint16_t type,
+                      uint32_t count, uint32_t valOrOff) {
+  exifL16(b + 0, tag);
+  exifL16(b + 2, type);
+  exifL32(b + 4, count);
+  exifL32(b + 8, valOrOff);
+}
+
+// Buat string timestamp dari millis (format EXIF: "YYYY:MM:DD HH:MM:SS")
+// Karena tidak ada RTC, pakai millis() sebagai detik relatif sejak boot
+static void exifMakeTimestamp(char* buf, size_t bufLen) {
+  unsigned long totalSec = millis() / 1000;
+  unsigned long sec  = totalSec % 60;
+  unsigned long min  = (totalSec / 60) % 60;
+  unsigned long hour = (totalSec / 3600) % 24;
+  // Tanggal placeholder — tidak ada RTC
+  snprintf(buf, bufLen, "2025:01:01 %02lu:%02lu:%02lu", hour, min, sec);
+}
+
+// exifInjectToJpeg
+// Input : jpgIn/jpgLen = JPEG yang sudah berisi stego COM marker
+// Output: JPEG baru dengan APP1 EXIF disisipkan setelah SOI (0xFFD8)
+//         sebelum COM marker
+// Caller wajib free() hasilnya
+uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
+                           int photoNum, const char* sensorStr,
+                           size_t* outLen) {
+  if (!jpgIn || jpgLen < 4 || !outLen) return nullptr;
+  if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
+
+  // ── String data untuk IFD ──────────────────────────────────────────────
+  char strDesc[16], strMake[12], strModel[12], strSoftware[8], strDt[24];
+  snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
+  snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
+  snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.7");
+  exifMakeTimestamp(strDt, sizeof(strDt));
+
+  // Panjang string termasuk null terminator
+  int lenDesc     = (int)strlen(strDesc)     + 1;
+  int lenMake     = (int)strlen(strMake)     + 1;
+  int lenModel    = (int)strlen(strModel)    + 1;
+  int lenSoftware = (int)strlen(strSoftware) + 1;
+  int lenDt       = 20; // EXIF DateTime selalu 20 char termasuk \0
+
+  // ── Layout TIFF ────────────────────────────────────────────────────────
+  // Semua offset dihitung dari awal header TIFF (setelah "Exif\0\0")
+  //
+  // Offset  0 :  TIFF header (8 byte): "II", 0x002A, offset IFD0 = 8
+  // Offset  8 :  IFD0 — 5 entry × 12 byte = 60 byte + 2 byte count + 4 byte next IFD
+  //              Total IFD0 = 2 + 60 + 4 = 66 byte
+  //              IFD0 selesai di offset 8 + 66 = 74
+  // Offset 74 :  ExifIFD — 2 entry × 12 byte = 24 byte + 2 + 4 = 30 byte
+  //              ExifIFD selesai di offset 74 + 30 = 104
+  // Offset 104:  Data area (string data)
+
+  const uint32_t offTiff      = 0;    // relatif ke awal TIFF
+  const uint32_t offIFD0      = 8;
+  const int      nIFD0        = 5;    // Make, Model, Software, ImageDesc, ExifIFDPtr
+  const uint32_t offExifIFD   = offIFD0 + 2 + nIFD0 * 12 + 4; // = 74
+  const int      nExifIFD     = 2;    // ExifVersion, DateTimeOriginal
+  const uint32_t offDataArea  = offExifIFD + 2 + nExifIFD * 12 + 4; // = 104
+
+  // Offset masing-masing string di data area (relatif ke awal TIFF)
+  uint32_t offDesc     = offDataArea;
+  uint32_t offMake     = offDesc     + (uint32_t)lenDesc;
+  uint32_t offModel    = offMake     + (uint32_t)lenMake;
+  uint32_t offSoftware = offModel    + (uint32_t)lenModel;
+  uint32_t offDt       = offSoftware + (uint32_t)lenSoftware;
+
+  uint32_t tiffSize = offDt + (uint32_t)lenDt;
+
+  // ── Ukuran APP1 ────────────────────────────────────────────────────────
+  // APP1 = marker(2) + length(2) + "Exif\0\0"(6) + TIFF data
+  uint32_t app1DataSize = 6 + tiffSize; // "Exif\0\0" + tiff
+  uint16_t app1Len = (uint16_t)(2 + app1DataSize); // length field termasuk dirinya sendiri
+
+  size_t totalSize = 2 + 2 + 2 + app1DataSize + (jpgLen - 2);
+  // SOI(2) + APP1marker(2) + APP1len(2) + APP1data + sisa JPEG setelah SOI
+
+  uint8_t* out = (uint8_t*)ps_malloc(totalSize);
+  if (!out) {
+    out = (uint8_t*)malloc(totalSize);
+    if (!out) {
+      Serial.printf("[EXIF] alokasi %u byte gagal\n", (unsigned)totalSize);
+      return nullptr;
+    }
+  }
+
+  size_t pos = 0;
+
+  // SOI
+  out[pos++] = 0xFF; out[pos++] = 0xD8;
+
+  // APP1 marker
+  out[pos++] = 0xFF; out[pos++] = 0xE1;
+
+  // APP1 length (big-endian)
+  out[pos++] = (app1Len >> 8) & 0xFF;
+  out[pos++] = app1Len & 0xFF;
+
+  // "Exif\0\0"
+  out[pos++] = 'E'; out[pos++] = 'x'; out[pos++] = 'i'; out[pos++] = 'f';
+  out[pos++] = 0x00; out[pos++] = 0x00;
+
+  // ── TIFF header (little-endian) ────────────────────────────────────────
+  uint8_t* tiff = out + pos; // pointer ke awal TIFF untuk kemudahan offset
+  size_t   tp   = 0;         // posisi relatif dalam TIFF
+
+  // Byte order: "II" = little endian
+  tiff[tp++] = 'I'; tiff[tp++] = 'I';
+  // Magic: 0x002A
+  tiff[tp++] = 0x2A; tiff[tp++] = 0x00;
+  // Offset IFD0 (dari awal TIFF) = 8
+  exifL32(tiff + tp, offIFD0); tp += 4;
+
+  // ── IFD0 ──────────────────────────────────────────────────────────────
+  // Entry count
+  exifL16(tiff + tp, (uint16_t)nIFD0); tp += 2;
+
+  // Tag 0x010E ImageDescription (type=2=ASCII)
+  exifEntry(tiff + tp, 0x010E, 2, (uint32_t)lenDesc, offDesc);     tp += 12;
+  // Tag 0x010F Make
+  exifEntry(tiff + tp, 0x010F, 2, (uint32_t)lenMake, offMake);     tp += 12;
+  // Tag 0x0110 Model
+  exifEntry(tiff + tp, 0x0110, 2, (uint32_t)lenModel, offModel);   tp += 12;
+  // Tag 0x0131 Software
+  exifEntry(tiff + tp, 0x0131, 2, (uint32_t)lenSoftware, offSoftware); tp += 12;
+  // Tag 0x8769 ExifIFD pointer (type=4=LONG)
+  exifEntry(tiff + tp, 0x8769, 4, 1, offExifIFD);                  tp += 12;
+
+  // Next IFD offset = 0 (tidak ada IFD1)
+  exifL32(tiff + tp, 0); tp += 4;
+
+  // ── ExifIFD ───────────────────────────────────────────────────────────
+  exifL16(tiff + tp, (uint16_t)nExifIFD); tp += 2;
+
+  // Tag 0x9000 ExifVersion (type=7=UNDEFINED, count=4, value inline "0220")
+  exifEntry(tiff + tp, 0x9000, 7, 4, 0x30323230); tp += 12; // "0220" as LE uint32
+
+  // Tag 0x9003 DateTimeOriginal (type=2=ASCII, count=20)
+  exifEntry(tiff + tp, 0x9003, 2, (uint32_t)lenDt, offDt); tp += 12;
+
+  // Next IFD = 0
+  exifL32(tiff + tp, 0); tp += 4;
+
+  // ── Data area ─────────────────────────────────────────────────────────
+  // tp sekarang = offDataArea
+  memcpy(tiff + tp, strDesc,     (size_t)lenDesc);     tp += lenDesc;
+  memcpy(tiff + tp, strMake,     (size_t)lenMake);     tp += lenMake;
+  memcpy(tiff + tp, strModel,    (size_t)lenModel);    tp += lenModel;
+  memcpy(tiff + tp, strSoftware, (size_t)lenSoftware); tp += lenSoftware;
+  // DateTime: pad/truncate ke 20 char
+  memset(tiff + tp, 0, (size_t)lenDt);
+  memcpy(tiff + tp, strDt, min((int)strlen(strDt), lenDt - 1));
+  tp += lenDt;
+
+  pos += tp; // maju pos sebesar TIFF yang sudah ditulis
+
+  // Sisa JPEG setelah SOI (skip 2 byte SOI asli)
+  memcpy(out + pos, jpgIn + 2, jpgLen - 2);
+  pos += jpgLen - 2;
+
+  *outLen = pos;
+
+  Serial.printf("[EXIF] inject OK: photo_%04d sensor=%s dt=%s app1=%u totalJpeg=%u\n",
+                photoNum, strModel, strDt, (unsigned)app1Len, (unsigned)pos);
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1186,8 +1355,6 @@ void photoViewDrawCaption(int idx) {
             }
           }
           free(buf);
-        } else {
-          Serial.println("[STEGO] extract: alokasi buf gagal");
         }
       }
       fclose(f);
@@ -1575,7 +1742,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.6  island-fix9",DISP_W/2-48,103);
+  lcd.drawString("v5.7  exif+island-smooth",DISP_W/2-60,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1588,9 +1755,9 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND","fix9: drawnOnce guard, no stale erase",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(182,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(194,"EXTRACT","padding skip  null guard  8KB",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND","no-erase slide  noClear=true always",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(182,"EXIF","APP1 inject: Make Model Sw Desc DT",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(194,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
   lcd.drawRect(28,206,DISP_W-56,4,COL_GRAY_3);
   int barW=DISP_W-60;
@@ -1625,7 +1792,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.6",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.7",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -1724,7 +1891,7 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Exposure (FIX-B)
+//  Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
@@ -1763,12 +1930,14 @@ void applyExpPreset(uint8_t preset) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  VIEWFINDER
-//  [FIX-D] islandNoClear = !frozen setiap frame
+//  [ISLAND-1] islandNoClear = true SELALU — tidak ada erase di viewfinder
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   bool frozen = (millis() < islandFreezeUntilMs);
 
-  islandNoClear = !frozen;
+  // [ISLAND-1] Frame kamera menimpa seluruh layar setiap loop.
+  // fillRect hitam dari islandErase tidak pernah diperlukan di sini.
+  islandNoClear = true;
 
   camera_fb_t *fb = nullptr;
   if (!frozen) {
@@ -1822,6 +1991,7 @@ void renderViewfinder() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview
+//  Alur: frame2jpg → stegoEmbedToJpeg → exifInjectToJpeg → fwrite
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
@@ -1858,35 +2028,54 @@ void captureAndPreview() {
     if (ok && jpg_buf && jpg_len > 0) {
       photoCount++;
 
+      // ── Step 1: Stego COM marker ──────────────────────────────────────
       char payload[STEGO_PAYLOAD_LEN];
       stegoMakePayload(payload, sizeof(payload), photoCount);
       int payLen = (int)strlen(payload);
 
-      size_t finalLen = 0;
-      uint8_t* finalBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
+      size_t stegoLen = 0;
+      uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
                                             payload, payLen,
-                                            &finalLen);
-      if (!finalBuf) {
-        Serial.printf("[STEGO] WARN: embed gagal untuk photo_%04d, simpan tanpa stego\n", photoCount);
+                                            &stegoLen);
+      if (!stegoBuf) {
+        Serial.printf("[STEGO] WARN: embed gagal photo_%04d\n", photoCount);
+        // lanjut tanpa stego
+        stegoBuf = jpg_buf;
+        stegoLen = jpg_len;
       }
 
+      // ── Step 2: EXIF inject ───────────────────────────────────────────
+      size_t finalLen = 0;
+      uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen,
+                                            photoCount, sensorName,
+                                            &finalLen);
+      if (!finalBuf) {
+        Serial.printf("[EXIF] WARN: inject gagal photo_%04d, simpan tanpa EXIF\n", photoCount);
+        finalBuf = stegoBuf;
+        finalLen = stegoLen;
+      }
+
+      // ── Step 3: Tulis ke SD ───────────────────────────────────────────
       char path[40];
       snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
       FILE* f = fopen(path, "wb");
       if (f) {
-        const uint8_t* writePtr = finalBuf ? finalBuf : jpg_buf;
-        size_t         writeLen = finalBuf ? finalLen  : jpg_len;
-        size_t w = fwrite(writePtr, 1, writeLen, f);
+        size_t w = fwrite(finalBuf, 1, finalLen, f);
         fclose(f);
-        saved = (w == writeLen);
+        saved = (w == finalLen);
         if (saved) {
-          Serial.printf("[CAPTURE] photo_%04d.jpg  %u bytes  stego=%s\n",
-                        photoCount, (unsigned)writeLen, finalBuf ? "YES" : "NO");
+          Serial.printf("[CAPTURE] photo_%04d.jpg  %u bytes  stego=%s exif=%s\n",
+                        photoCount, (unsigned)finalLen,
+                        (stegoBuf != jpg_buf) ? "YES" : "NO",
+                        (finalBuf != stegoBuf) ? "YES" : "NO");
         }
       }
 
-      if (finalBuf) free(finalBuf);
+      // ── Cleanup ───────────────────────────────────────────────────────
+      if (finalBuf != stegoBuf) free(finalBuf);
+      if (stegoBuf != jpg_buf)  free(stegoBuf);
       if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+
     } else {
       Serial.println("[CAPTURE] frame2jpg gagal");
     }
@@ -1967,7 +2156,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.6-island-fix9 ===");
+  Serial.println("\n=== Sanzxcam v5.7 ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -2035,6 +2224,7 @@ void handleModeViewfinder(ButtonEvent evt) {
         scanGalleryFiles();
         gallerySelIdx=0; galleryScroll=0; galleryHoldDir=0;
         islandForceHide();
+        islandNoClear = false; // masuk mode non-viewfinder → erase boleh jalan
         resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
       }
     }
@@ -2066,6 +2256,7 @@ void handleModeGallery(ButtonEvent evt) {
   else if (evt.pin==BTN_B&&evt.isShort) {
     if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
     galleryHoldDir=0; islandForceHide(); resetAllButtons();
+    islandNoClear = true; // kembali ke viewfinder
     appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
     fpsLastTime=millis(); fpsFrameCount=0;
   }
@@ -2135,9 +2326,15 @@ void handleModeMenuLed(ButtonEvent evt) {
   if (evt.pin==BTN_BOOT) {
     ledFlashEnabled=(menuLedSel==0);
     islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
-    lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true;
+    appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if (evt.pin==BTN_B) {
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true;
+    appMode=MODE_VIEWFINDER;
+  }
   else if (evt.pin==BTN_C||evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
 }
 
@@ -2150,9 +2347,15 @@ void handleModeMenuExp(ButtonEvent evt) {
     }
     char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
     islandPush(NOTIF_INFO, fbBuf);
-    lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER;
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true;
+    appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_B) { lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; }
+  else if (evt.pin==BTN_B) {
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true;
+    appMode=MODE_VIEWFINDER;
+  }
   else if (evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
   else if (evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
 }
@@ -2171,7 +2374,9 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
   if (evt.pin==BTN_BOOT) {
     char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
     islandPush(NOTIF_INFO, fbBuf);
-    lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_VIEWFINDER; return;
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true;
+    appMode=MODE_VIEWFINDER; return;
   }
   bool changed=false;
   if (evt.pin==BTN_C) { expManualVal=constrain(expManualVal-50,0,1200); changed=true; }
@@ -2188,7 +2393,7 @@ void handleModeDialogDelete(ButtonEvent evt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LOOP — v5.6-island-fix9
+//  LOOP — v5.7
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
@@ -2227,6 +2432,7 @@ void loop() {
   }
 
   if (appMode != MODE_VIEWFINDER) {
+    islandNoClear = false; // di luar viewfinder, erase boleh jalan
     islandTick();
   }
 }
