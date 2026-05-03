@@ -24,11 +24,12 @@
  *      BGR888 final, iterasi y=H-1..0 (sama dengan urutan file BMP).
  *      stegoBmpExtract() tidak perlu diubah — sudah benar.
  *
- *    Perubahan kode:
- *      - saveBMP(): tambah parameter stegoPayload + stegoPayLen
- *      - stegoBmpEmbed(): DIHAPUS (tidak dipakai lagi)
- *      - captureAndPreview(): hapus panggilan stegoBmpEmbed(),
- *        pass payload langsung ke saveBMP()
+ *  [BOOT-GLITCH] Boot animation baru:
+ *    - Fase 1: Splash dengan efek glitch — teks acak → SANZXCAM,
+ *      chromatic aberration (ghost merah & biru), glitch bars
+ *    - Fase 2: Full screen boot log dengan 4 section:
+ *      CAMERA, STORAGE, SYSTEM, BUILD
+ *      Log rows muncul satu-satu, diakhiri progress bar + READY
  *
  * ═══════════════════════════════════════════════════════════════
  *  TETAP dari v5.9:
@@ -431,7 +432,9 @@ void islandPush(NotifType type, const char* text) {
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
   islandShowAt    = millis();
-  islandHideAt    = millis() + ISLAND_SHOW_MS;
+  // Durasi berbeda per tipe notif
+  int showMs = (type == NOTIF_WARN) ? 2000 : (type == NOTIF_INFO) ? 800 : 1000;
+  islandHideAt    = millis() + showMs;
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
@@ -554,16 +557,9 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  STEGANOGRAFI BMP — v5.9-fix
-//
-//  stegoBmpEmbed() DIHAPUS — embed sekarang dilakukan di dalam saveBMP()
-//  langsung ke byte Blue BGR888 sebelum fwrite, urutan y=H-1..0 sama
-//  dengan yang dibaca stegoBmpExtract().
-//
-//  stegoBmpExtract() TIDAK BERUBAH — sudah benar dari v5.9.
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_BMP_MAX_PAYLOAD 64
 
-// Ekstrak payload dari file BMP (tidak berubah dari v5.9)
 bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
   if (!path || !outPayload || maxLen < 2) return false;
   FILE* f = fopen(path, "rb");
@@ -601,17 +597,13 @@ bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
   uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
   if (!rowBuf) { fclose(f); return false; }
 
-  // BMP bottom-up: row 0 gambar = baris terakhir di file (offset tertinggi)
-  // saveBMP() tulis y=H-1 pertama → ada di offset awal data
-  // Artinya: row=bmpH-1 di file = y=H-1 kamera = pixel pertama yang di-embed
-  // Baca dari row=bmpH-1 turun ke 0 → urutan pixel sama dengan embed
   for (int row = bmpH - 1; row >= 0 && bitIdx < totalPayloadBits; row--) {
     long offset = rowDataStart + (long)row * rowSize;
     fseek(f, offset, SEEK_SET);
     if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize) break;
 
     for (int x = 0; x < bmpW && bitIdx < totalPayloadBits; x++) {
-      uint8_t bit = rowBuf[x * 3 + 0] & 0x01;  // LSB of Blue (byte 0 = B dalam BGR)
+      uint8_t bit = rowBuf[x * 3 + 0] & 0x01;
       int bitPos = 7 - (bitIdx % 8);
       curChar |= (bit << bitPos);
       bitIdx++;
@@ -729,16 +721,6 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BMP SAVE — v5.9-fix
-//
-//  PERUBAHAN dari v5.9:
-//    - Tambah parameter: stegoPayload (const char*) dan stegoPayLen (int)
-//    - Embed stego dilakukan di SINI, langsung ke byte Blue BGR888,
-//      iterasi y=H-1..0 (sama persis dengan urutan read di stegoBmpExtract)
-//    - Tidak ada lagi stegoBmpEmbed() terpisah
-//
-//  TETAP dari v5.9:
-//    - byte-swap RGB565 big-endian → little-endian sebelum konversi
-//    - Format output: BMP 24-bit BGR888, bottom-up
 // ─────────────────────────────────────────────────────────────────────────────
 bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
              const char* stegoPayload = nullptr, int stegoPayLen = 0) {
@@ -779,9 +761,8 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
 
   fwrite(hdr, 1, 54, f);
 
-  // Hitung total bit stego yang akan di-embed
   int totalStegoBits = (stegoPayload && stegoPayLen > 0) ? stegoPayLen * 8 : 0;
-  int stegoPixelIdx  = 0;  // pixel index global, dihitung dalam urutan y=H-1..0, x=0..W-1
+  int stegoPixelIdx  = 0;
 
   static uint8_t rowBuf[320 * 3 + 4];
 
@@ -791,27 +772,20 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
 
     for (int x = 0; x < w; x++) {
       uint16_t raw = srcRow[x];
-
-      // byte-swap dari big-endian (ESP32 camera) ke little-endian standar RGB565
       uint16_t px = (raw << 8) | (raw >> 8);
 
       uint8_t r = ((px >> 11) & 0x1F) << 3;
       uint8_t g = ((px >>  5) & 0x3F) << 2;
       uint8_t b = ( px        & 0x1F) << 3;
 
-      // ── STEGO EMBED: langsung ke LSB byte Blue BGR888 ─────────────────
-      // stegoPixelIdx=0 → y=H-1, x=0  (baris pertama di file BMP)
-      // stegoBmpExtract() baca row=bmpH-1 dulu → urutan IDENTIK
       if (stegoPixelIdx < totalStegoBits) {
         int charIdx = stegoPixelIdx / 8;
-        int bitPos  = 7 - (stegoPixelIdx % 8);  // MSB first
+        int bitPos  = 7 - (stegoPixelIdx % 8);
         uint8_t bit = ((uint8_t)stegoPayload[charIdx] >> bitPos) & 0x01;
         b = (b & 0xFE) | bit;
         stegoPixelIdx++;
       }
-      // ──────────────────────────────────────────────────────────────────
 
-      // BMP: BGR order
       rowBuf[x * 3 + 0] = b;
       rowBuf[x * 3 + 1] = g;
       rowBuf[x * 3 + 2] = r;
@@ -826,7 +800,7 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BMP LOAD — tidak berubah dari v5.9
+//  BMP LOAD
 // ─────────────────────────────────────────────────────────────────────────────
 uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
   FILE* f = fopen(path, "rb");
@@ -847,14 +821,8 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
   if (bmpH < 0) { topDown = true; bmpH = -bmpH; }
 
   uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
-  if (bpp != 24) {
-    Serial.printf("[BMP] bpp=%d tidak didukung\n", bpp);
-    fclose(f); return nullptr;
-  }
-
-  if (bmpW <= 0 || bmpH <= 0 || bmpW > 4096 || bmpH > 4096) {
-    fclose(f); return nullptr;
-  }
+  if (bpp != 24) { fclose(f); return nullptr; }
+  if (bmpW <= 0 || bmpH <= 0 || bmpW > 4096 || bmpH > 4096) { fclose(f); return nullptr; }
 
   size_t pixCount = (size_t)bmpW * (size_t)bmpH;
   uint16_t* buf = (uint16_t*)ps_malloc(pixCount * sizeof(uint16_t));
@@ -878,13 +846,9 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
       uint8_t b = rowBuf[x * 3 + 0];
       uint8_t g = rowBuf[x * 3 + 1];
       uint8_t r = rowBuf[x * 3 + 2];
-
-      // RGB888 → RGB565 little-endian
       uint16_t px_le = ((uint16_t)(r & 0xF8) << 8)
                      | ((uint16_t)(g & 0xFC) << 3)
                      | ((uint16_t)(b >> 3));
-
-      // swap ke big-endian untuk lcd.pushImage()
       destLine[x] = (px_le << 8) | (px_le >> 8);
     }
 
@@ -1214,19 +1178,20 @@ void scanGalleryFiles() {
   }
   closedir(dir);
 
-  for (int i = 0; i < galleryCount - 1; i++) {
-    for (int j = 0; j < galleryCount - i - 1; j++) {
-      if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
-        char tmp[32];
-        strncpy(tmp, galleryFiles[j], 31);
-        strncpy(galleryFiles[j], galleryFiles[j+1], 31);
-        strncpy(galleryFiles[j+1], tmp, 31);
-        GalleryFileType tTmp = galleryFileType[j];
-        galleryFileType[j]   = galleryFileType[j+1];
-        galleryFileType[j+1] = tTmp;
-      }
+  // Insertion sort — lebih efisien untuk data hampir urut
+  for (int i = 1; i < galleryCount; i++) {
+    char tmpN[32];
+    strncpy(tmpN, galleryFiles[i], 31); tmpN[31] = '\0';
+    GalleryFileType tmpT = galleryFileType[i];
+    int j = i - 1;
+    while (j >= 0 && strcmp(galleryFiles[j], tmpN) > 0) {
+      strncpy(galleryFiles[j+1], galleryFiles[j], 31);
+      galleryFileType[j+1] = galleryFileType[j];
+      j--;
+      if (j % 20 == 0) esp_task_wdt_reset();
     }
-    esp_task_wdt_reset();
+    strncpy(galleryFiles[j+1], tmpN, 31);
+    galleryFileType[j+1] = tmpT;
   }
 }
 
@@ -1235,11 +1200,20 @@ void drawGallery() {
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
+
+  // Header dengan info halaman
+  int currentPage = galleryScroll / GALLERY_ITEMS_PAGE + 1;
+  int totalPage   = max(1, (galleryCount + GALLERY_ITEMS_PAGE - 1) / GALLERY_ITEMS_PAGE);
   char hdr[32];
   snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
   lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("B=BACK", DISP_W - 46, 6);
+  // Nomor halaman di kiri atas
+  char pageInfo[8];
+  snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString(pageInfo, 4, 6);
 
   if (galleryCount == 0) {
     lcd.setTextColor(COL_GRAY_5);
@@ -1433,7 +1407,16 @@ void photoViewDrawCaption(int idx) {
           char payload[STEGO_PAYLOAD_LEN + 1];
           if (stegoExtractFromJpeg(buf, readN, payload, sizeof(payload))) {
             char* p1 = strchr(payload, '|');
-            if (p1) snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
+            char* p2 = p1 ? strchr(p1+1, '|') : nullptr;
+            if (p1 && p2) {
+              char num[8], ver[12];
+              int numLen = p2 - p1 - 1;
+              strncpy(num, p1+1, numLen); num[numLen] = '\0';
+              strncpy(ver, p2+1, sizeof(ver)-1); ver[sizeof(ver)-1] = '\0';
+              snprintf(stegoInfo, sizeof(stegoInfo), " [#%s %s]", num, ver);
+            } else if (p1) {
+              snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1+1);
+            }
           }
           free(buf);
         }
@@ -1444,7 +1427,16 @@ void photoViewDrawCaption(int idx) {
     char payload[STEGO_BMP_MAX_PAYLOAD + 1];
     if (stegoBmpExtract(path, payload, sizeof(payload))) {
       char* p1 = strchr(payload, '|');
-      if (p1) snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
+      char* p2 = p1 ? strchr(p1+1, '|') : nullptr;
+      if (p1 && p2) {
+        char num[8], ver[12];
+        int numLen = p2 - p1 - 1;
+        strncpy(num, p1+1, numLen); num[numLen] = '\0';
+        strncpy(ver, p2+1, sizeof(ver)-1); ver[sizeof(ver)-1] = '\0';
+        snprintf(stegoInfo, sizeof(stegoInfo), " [#%s %s]", num, ver);
+      } else if (p1) {
+        snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1+1);
+      }
     }
   }
 
@@ -1610,28 +1602,22 @@ void drawFormatMenu(int sel) {
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-
   lcd.setTextColor(COL_GRAY_E);
   const char* title = "FORMAT FOTO  GC2145";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("pilih format simpan foto:", mx + 10, my + 24);
-
   const char* labels[2] = {
     "BMP  - raw RGB, warna asli, stego",
     "JPG  - kompresi, stego+EXIF"
   };
-
   for (int i = 0; i < 2; i++) {
     int iy = my + 38 + i * 26;
     bool isSelected    = (i == (int)gc2145CaptureFormat);
     bool isHighlighted = (i == sel);
-
     lcd.fillRect(mx + 8, iy, mw - 16, 20,
                  isHighlighted ? COL_GRAY_5 : COL_GRAY_D);
-
     int cbX = mx + 14, cbY = iy + 6;
     lcd.drawRect(cbX, cbY, 10, 10,
                  isHighlighted ? COL_WHITE : COL_GRAY_7);
@@ -1643,12 +1629,10 @@ void drawFormatMenu(int sel) {
       lcd.drawPixel(cbX + 4, cbY + 7,
                     isHighlighted ? COL_WHITE : COL_GRAY_E);
     }
-
     lcd.setTextColor(isHighlighted ? COL_WHITE :
                      (isSelected   ? COL_GRAY_E : COL_GRAY_7));
     lcd.drawString(labels[i], cbX + 14, iy + 6);
   }
-
   lcd.setTextColor(COL_GRAY_3);
   const char* hint = "C/D=pilih  BOOT=ok  B=batal";
   lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 13);
@@ -1819,10 +1803,14 @@ void drawRecIndicator() {
   char timeBuf[10];
   snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu", elapsed / 60, elapsed % 60);
   bool blink = (millis() / 500) % 2;
-  lcd.fillRect(4, 4, 76, 14, COL_BLACK);
+  lcd.fillRect(4, 4, 90, 22, COL_BLACK);
   lcd.fillCircle(10, 11, 4, blink ? COL_WHITE : COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString(timeBuf, 18, 6);
+  lcd.drawString(timeBuf, 18, 4);
+  // Tambah frame count
+  char fBuf[10]; snprintf(fBuf, sizeof(fBuf), "%df", recFrameCount);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString(fBuf, 18, 14);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1885,60 +1873,276 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Boot screen
+//  BOOT ANIMATION — v5.9-fix
+//  Fase 1: Splash dengan efek glitch (teks acak → SANZXCAM, chromatic
+//          aberration, glitch bars horizontal)
+//  Fase 2: Full screen boot log dengan 4 section:
+//          CAMERA, STORAGE, SYSTEM, BUILD
 // ─────────────────────────────────────────────────────────────────────────────
-void drawCameraIcon(int cx, int cy, uint16_t col) {
-  lcd.drawRoundRect(cx-22,cy-14,44,30,4,col);
-  lcd.drawCircle(cx,cy-1,10,col);
-  lcd.drawCircle(cx,cy-1,5,COL_GRAY_5);
-  lcd.drawRect(cx-16,cy-18,12,5,col);
-  lcd.drawPixel(cx+4,cy-5,COL_GRAY_7);
+
+// Karakter acak untuk efek glitch
+static const char GLITCH_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
+static const int  GLITCH_CHAR_COUNT = sizeof(GLITCH_CHARS) - 1;
+
+char glitchRandChar() {
+  return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)];
 }
 
-void bootLogLine(int y, const char* label, const char* status, uint16_t statusCol = COL_GRAY_E) {
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label, 28, y);
-  int lx = 28 + lcd.textWidth(label) + 3;
-  for (int dx = lx; dx < 268; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_3);
-  lcd.setTextColor(statusCol); lcd.drawString(status, 272, y);
-}
+// Gambar teks scramble di tengah layar — huruf acak → target
+void glitchScrambleText(const char* target, int cx, int cy,
+                        uint16_t col, int steps, int stepDelayMs) {
+  int len = strlen(target);
+  char buf[16]; memset(buf, 0, sizeof(buf));
 
-void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xclkOK, uint32_t xclkHz) {
-  lcd.fillScreen(COL_BLACK);
-  lcd.drawFastHLine(0,0,DISP_W,COL_GRAY_3);
-  lcd.drawFastHLine(0,DISP_H-1,DISP_W,COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
-  drawCameraIcon(DISP_W/2,55,COL_GRAY_7);
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString("SANZXCAM",DISP_W/2-57,85);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.9-fix  stego-bmp fixed",DISP_W/2-60,103);
-  lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
-  esp_task_wdt_reset(); delay(200);
+  for (int step = 0; step <= len; step++) {
+    for (int i = 0; i < len; i++) {
+      buf[i] = (i < step) ? target[i] : glitchRandChar();
+    }
+    buf[len] = '\0';
 
-  char buf[40];
-  snprintf(buf, sizeof(buf), sdOK ? "OK  %lluMB" : "NOT FOUND", sdMB);
-  bootLogLine(122,"SD CARD",buf,sdOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(134,"CAM PROBE","20MHz",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  if (pidOK) snprintf(buf, sizeof(buf), "0x%04X  %s", pid, sensorName);
-  else        snprintf(buf, sizeof(buf), "0x%04X  ???", pid);
-  bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  snprintf(buf, sizeof(buf), "%uMHz  OK", xclkHz/1000000);
-  bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"BMP COLOR","byte-swap RGB565 OK",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(182,"STEGO-BMP","embed in saveBMP() FIXED",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(194,"FORMAT SEL","C-long=menu JPG/BMP GC2145",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+    // Erase area
+    lcd.fillRect(cx - 70, cy - 8, 140, 16, COL_BLACK);
+    lcd.setFont(&fonts::FreeSansBold9pt7b);
+    int tw = lcd.textWidth(buf);
+    lcd.setTextColor(col);
+    lcd.drawString(buf, cx - tw / 2, cy - 7);
 
-  lcd.drawRect(28,206,DISP_W-56,4,COL_GRAY_3);
-  int barW = DISP_W - 60;
-  for (int i = 0; i <= barW; i += 4) {
-    lcd.fillRect(30, 207, i, 2, COL_GRAY_7);
-    if (i % 16 == 0) esp_task_wdt_reset();
+    for (int r = 0; r < stepDelayMs / 10; r++) {
+      delay(10); esp_task_wdt_reset();
+    }
   }
-  lcd.fillRect(30, 207, barW, 2, COL_GRAY_C);
+}
+
+// Gambar glitch bars horizontal acak
+void glitchBarsFlash(int count, int delayMs) {
+  for (int i = 0; i < count; i++) {
+    int barY = random(DISP_H);
+    int barX = random(DISP_W - 60);
+    int barW = random(30, 120);
+    int barH = (random(10) > 7) ? 5 : 2;
+    uint16_t barCol = (random(3) == 0) ? COL_GRAY_5 : COL_GRAY_3;
+    lcd.fillRect(barX, barY, barW, barH, barCol);
+    delay(delayMs); esp_task_wdt_reset();
+    lcd.fillRect(barX, barY, barW, barH, COL_BLACK);
+  }
+}
+
+// Gambar chromatic aberration ghost
+void glitchChromatic(const char* text, int cx, int cy, int offsetX, uint16_t colR, uint16_t colB) {
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  int tw = lcd.textWidth(text);
+  // Ghost merah (geser kiri)
+  lcd.setTextColor(colR);
+  lcd.drawString(text, cx - tw / 2 - offsetX, cy - 7);
+  // Ghost biru (geser kanan)
+  lcd.setTextColor(colB);
+  lcd.drawString(text, cx - tw / 2 + offsetX, cy - 7);
+}
+
+// Satu baris log di boot log full screen
+void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString(label, 8, y);
+  // Titik-titik
+  int lx = 8 + lcd.textWidth(label) + 2;
+  for (int dx = lx; dx < 230; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_2);
+  lcd.setTextColor(valCol);
+  lcd.drawString(value, 234, y);
+  esp_task_wdt_reset();
+}
+
+// Section header
+void bootLogSection(int y, const char* title) {
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString(title, 8, y);
+  lcd.drawFastHLine(8, y + 9, DISP_W - 16, COL_GRAY_2);
+}
+
+void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
+                     bool xclkOK, uint32_t xclkHz) {
+
+  // ── FASE 1: SPLASH GLITCH ────────────────────────────────────────────────
+  lcd.fillScreen(COL_BLACK);
+
+  int cx = DISP_W / 2;
+  int cy = DISP_H / 2 - 10;
+
+  // Teks acak pertama kali
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  char scramBuf[10];
+  for (int i = 0; i < 8; i++) scramBuf[i] = glitchRandChar();
+  scramBuf[8] = '\0';
+  int tw0 = lcd.textWidth(scramBuf);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString(scramBuf, cx - tw0 / 2, cy - 7);
+  delay(80); esp_task_wdt_reset();
+
+  // Glitch bars awal
+  glitchBarsFlash(6, 15);
+
+  // Scramble teks → SANZXCAM
+  glitchScrambleText("SANZXCAM", cx, cy, COL_GRAY_C, 8, 30);
+
+  // Chromatic aberration
+  glitchChromatic("SANZXCAM", cx, cy, 3, 0xF000, 0x001F);
+  delay(60); esp_task_wdt_reset();
+
+  // Teks utama kembali normal di atas ghost
+  lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  lcd.setTextColor(COL_GRAY_E);
+  int tw1 = lcd.textWidth("SANZXCAM");
+  lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
+
+  // Glitch bars lagi
+  glitchBarsFlash(4, 20);
+
+  // Subtitle muncul
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_5);
+  const char* sub = "ESP32-S3  CAMERA SYSTEM";
+  lcd.drawString(sub, cx - lcd.textWidth(sub) / 2, cy + 10);
+  lcd.setTextColor(COL_GRAY_3);
+  const char* ver = "v5.9-fix";
+  lcd.drawString(ver, cx - lcd.textWidth(ver) / 2, cy + 22);
+
+  // Divider
+  lcd.drawFastHLine(cx - 80, cy + 32, 160, COL_GRAY_2);
+
+  delay(100); esp_task_wdt_reset();
+
+  // Satu glitch akhir sebelum transisi
+  glitchBarsFlash(3, 25);
+  glitchChromatic("SANZXCAM", cx, cy, 2, 0xA000, 0x000F);
+  delay(40); esp_task_wdt_reset();
+
+  // Restore teks setelah ghost
+  lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  lcd.setTextColor(COL_GRAY_E);
+  lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
+
+  delay(300); esp_task_wdt_reset();
+
+  // Fade out: wipe ke hitam
+  for (int stripe = 0; stripe < DISP_H; stripe += 8) {
+    lcd.fillRect(0, stripe, DISP_W, 8, COL_BLACK);
+    delay(4); esp_task_wdt_reset();
+  }
+
+  // ── FASE 2: BOOT LOG FULL SCREEN ─────────────────────────────────────────
+  lcd.fillScreen(COL_BLACK);
+
+  // Header bar
+  lcd.fillRect(0, 0, DISP_W, 14, COL_GRAY_D);
+  lcd.drawFastHLine(0, 14, DISP_W, COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_7);
+  lcd.drawString("SANZXCAM", 8, 3);
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString("v5.9-fix", DISP_W - 44, 3);
+  lcd.setTextColor(COL_GRAY_2);
+  lcd.drawString("boot sequence", cx - 32, 3);
+
+  delay(80); esp_task_wdt_reset();
+
+  // ── SECTION: CAMERA ──────────────────────────────────────────────────────
+  int y = 20;
+  bootLogSection(y, "CAMERA"); y += 13;
+
+  bootLogRow(y, "SENSOR PID",
+             pidOK ? (pid == PID_GC2145 ? "0x2145  GC2145" : "0x3660  OV3660") : "NOT FOUND",
+             pidOK ? COL_GRAY_E : COL_GRAY_5);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  char xclkBuf[20];
+  snprintf(xclkBuf, sizeof(xclkBuf), "%uMHz  %s", xclkHz / 1000000, xclkOK ? "OK" : "ERR");
+  bootLogRow(y, "XCLK", xclkBuf, xclkOK ? COL_GRAY_E : COL_GRAY_5);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  bootLogRow(y, "RESOLUTION", "320x240  QVGA", COL_GRAY_7);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  bootLogRow(y, "FORMAT",
+             (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP)
+             ? "RGB565  BMP" : "RGB565  JPG",
+             COL_GRAY_7);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  // ── SECTION: STORAGE ─────────────────────────────────────────────────────
+  y += 4;
+  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  bootLogSection(y, "STORAGE"); y += 13;
+
+  char sdBuf[20];
+  if (sdOK) snprintf(sdBuf, sizeof(sdBuf), "OK  %lluMB", sdMB);
+  else       snprintf(sdBuf, sizeof(sdBuf), "NOT FOUND");
+  bootLogRow(y, "SD CARD", sdBuf, sdOK ? COL_GRAY_E : COL_GRAY_5);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  if (sdOK) {
+    bootLogRow(y, "FILESYSTEM", "FAT32", COL_GRAY_7);
+    delay(100); y += 10; esp_task_wdt_reset();
+
+    char photoBuf[16];
+    snprintf(photoBuf, sizeof(photoBuf), "%04d files", photoCount);
+    bootLogRow(y, "PHOTOS", photoBuf, COL_GRAY_7);
+    delay(100); y += 10; esp_task_wdt_reset();
+  }
+
+  // ── SECTION: SYSTEM ──────────────────────────────────────────────────────
+  y += 4;
+  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  bootLogSection(y, "SYSTEM"); y += 13;
+
+  bootLogRow(y, "CPU FREQ", "240MHz  OK", COL_GRAY_E);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  bootLogRow(y, "PSRAM", psramFound() ? "8MB  OK" : "NOT FOUND",
+             psramFound() ? COL_GRAY_E : COL_GRAY_5);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  char heapBuf[16];
+  snprintf(heapBuf, sizeof(heapBuf), "%uKB", (unsigned)(ESP.getFreeHeap() / 1024));
+  bootLogRow(y, "HEAP FREE", heapBuf, COL_GRAY_7);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  // ── SECTION: BUILD ───────────────────────────────────────────────────────
+  y += 4;
+  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  bootLogSection(y, "BUILD"); y += 13;
+
+  bootLogRow(y, "VERSION", "v5.9-fix", COL_GRAY_7);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  bootLogRow(y, "STEGO-BMP", "embed in saveBMP OK", COL_GRAY_E);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  bootLogRow(y, "FEATURES", "EXIF+STEGO+FACE+REC", COL_GRAY_7);
+  delay(100); y += 10; esp_task_wdt_reset();
+
+  // ── PROGRESS BAR ─────────────────────────────────────────────────────────
+  y += 4;
+  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 4;
+
+  int barX = 8, barW = DISP_W - 16, barH = 3;
+  lcd.fillRect(barX, y, barW, barH, COL_GRAY_2);
+  lcd.drawRect(barX, y, barW, barH, COL_GRAY_3);
+
+  for (int i = 0; i <= barW; i += 3) {
+    lcd.fillRect(barX, y + 1, i, barH - 2, COL_GRAY_7);
+    if (i % 15 == 0) { delay(8); esp_task_wdt_reset(); }
+  }
+  lcd.fillRect(barX, y + 1, barW, barH - 2, COL_GRAY_C);
+
+  y += barH + 4;
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("READY", DISP_W/2 - 15, 218);
-  delay(800); esp_task_wdt_reset();
+  const char* readyMsg = "READY";
+  lcd.drawString(readyMsg, cx - lcd.textWidth(readyMsg) / 2, y);
+
+  delay(600); esp_task_wdt_reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2027,7 +2231,9 @@ void updateFPS() {
   fpsFrameCount++;
   unsigned long elapsed = millis() - fpsLastTime;
   if (elapsed >= 500) {
-    fpsValue = fpsFrameCount * 1000.0f / elapsed;
+    // Exponential smoothing agar FPS tidak lompat-lompat
+    float newFps = fpsFrameCount * 1000.0f / elapsed;
+    fpsValue = fpsValue * 0.7f + newFps * 0.3f;
     fpsFrameCount = 0; fpsLastTime = millis();
   }
 }
@@ -2108,12 +2314,20 @@ void renderViewfinder() {
   if (!frozen) {
     if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
       lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-      drawCornerBrackets(COL_GRAY_E);
+
+      // Corner brackets: merah saat REC, putih saat face detect, abu normal
+      uint16_t bktCol = recActive ? 0xF800 : (faceDetectMode ? COL_WHITE : COL_GRAY_E);
+      drawCornerBrackets(bktCol);
+
       if (faceDetectMode) runFaceDetect(fb);
 
       char fpsBuf[12]; snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
       drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
-      drawPill(DISP_W-35, 10, sensorName, COL_PILL_BG, COL_GRAY_A);
+
+      // Sensor pill — tambah tanda flash jika aktif
+      char sensorPill[20];
+      snprintf(sensorPill, sizeof(sensorPill), "%s%s", sensorName, ledFlashEnabled ? " *" : "");
+      drawPill(DISP_W-42, 10, sensorPill, COL_PILL_BG, COL_GRAY_A);
 
       if (faceDetectMode) {
         char faceBuf[12];
@@ -2154,15 +2368,6 @@ void renderViewfinder() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview — v5.9-fix
-//
-//  PERUBAHAN dari v5.9:
-//    - Hapus panggilan stegoBmpEmbed() yang terpisah
-//    - Pass payload langsung ke saveBMP() sebagai parameter
-//    - saveBMP() yang akan embed ke BGR888 dengan urutan pixel yang benar
-//
-//  TETAP dari v5.9:
-//    - GC2145 + GFMT_BMP → saveBMP()
-//    - GC2145 + GFMT_JPG / sensor lain → JPG + stego COM + EXIF
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
@@ -2179,7 +2384,6 @@ void captureAndPreview() {
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) { blinkLED(5, 50, 50); return; }
 
-  // Preview
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -2194,26 +2398,16 @@ void captureAndPreview() {
                         fb->format == PIXFORMAT_RGB565 &&
                         fb->width == DISP_W && fb->height == DISP_H);
 
-    // ── GC2145 + pilih BMP ────────────────────────────────────────────────
     if (isGC2145rgb && gc2145CaptureFormat == GFMT_BMP) {
-
       char path[48];
       snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
-
-      // Buat payload stego
       char payload[STEGO_BMP_MAX_PAYLOAD];
       stegoMakePayload(payload, sizeof(payload), photoCount);
       int payLen = (int)strlen(payload);
-
-      // FIX: pass payload ke saveBMP(), embed dilakukan di dalam saveBMP()
-      // Tidak ada lagi stegoBmpEmbed() terpisah
       saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, payLen);
-
       Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  stego=%s  %s\n",
                     photoCount, fb->width, fb->height, payload,
                     saved ? "OK" : "GAGAL");
-
-    // ── GC2145 + pilih JPG, atau sensor lain: JPG + stego + EXIF ─────────
     } else {
       uint8_t *jpg_buf  = nullptr;
       size_t   jpg_len  = 0;
@@ -2338,7 +2532,7 @@ bool initCamera() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.9-fix ===");
-  Serial.println("[FIX] stegoBmpEmbed dihapus, embed sekarang di dalam saveBMP()");
+  Serial.println("[BOOT-GLITCH] boot animation baru aktif");
 
   galleryFiles    = (char(*)[32])    ps_malloc(GALLERY_MAX_FILES * 32);
   galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
@@ -2467,6 +2661,20 @@ void handleModeGallery(ButtonEvent evt) {
 }
 
 void handleModePhotoView(ButtonEvent evt) {
+  // Hold pan saat zoom aktif
+  static unsigned long lastPanTime = 0;
+  bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
+  if (photoZoomLevel > 0 && (cHeld || dHeld) && millis() - lastPanTime > 120) {
+    float zf = photoZoomFactors[photoZoomLevel];
+    int maxOffX = max(0, (int)photoBufW - (int)(DISP_W / zf));
+    int maxOffY = max(0, (int)photoBufH - (int)(DISP_H / zf));
+    if (cHeld) photoZoomOffX = constrain(photoZoomOffX - PAN_STEP, 0, maxOffX);
+    if (dHeld) photoZoomOffX = constrain(photoZoomOffX + PAN_STEP, 0, maxOffX);
+    photoViewRender();
+    lastPanTime = millis();
+    return;
+  }
+
   if (!evt.valid) return;
   static unsigned long lastActionTime = 0;
   if (millis() - lastActionTime < 150) return;
@@ -2616,14 +2824,25 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
     islandNoClear = true; appMode = MODE_VIEWFINDER; return;
   }
   bool changed = false;
-  if (evt.pin == BTN_C) { expManualVal  = constrain(expManualVal  - 50, 0, 1200); changed = true; }
-  if (evt.pin == BTN_D) { expManualVal  = constrain(expManualVal  + 50, 0, 1200); changed = true; }
-  if (evt.pin == BTN_B) { expManualGain = (expManualGain + 1) % 31;               changed = true; }
+  // Step adaptif: halus di shadow, cepat di highlight
+  int step = (expManualVal < 100) ? 10 : (expManualVal < 400) ? 25 : 50;
+  if (evt.pin == BTN_C) { expManualVal  = constrain(expManualVal  - step, 0, 1200); changed = true; }
+  if (evt.pin == BTN_D) { expManualVal  = constrain(expManualVal  + step, 0, 1200); changed = true; }
+  if (evt.pin == BTN_B) { expManualGain = (expManualGain + 1) % 31;                 changed = true; }
   if (changed) applyExpPreset(3);
 }
 
 void handleModeDialogDelete(ButtonEvent evt) {
-  if (millis() - deleteDialogOpenMs >= DELETE_TIMEOUT_MS) {
+  // Progress bar timeout
+  unsigned long elapsed = millis() - deleteDialogOpenMs;
+  if (elapsed < DELETE_TIMEOUT_MS) {
+    int dw = 200, dx = (DISP_W - dw) / 2, dy = (DISP_H - 80) / 2;
+    int barW = 180;
+    int prog = barW - (int)((long)barW * elapsed / DELETE_TIMEOUT_MS);
+    prog = constrain(prog, 0, barW);
+    lcd.fillRect(dx + 10, dy + 70, barW, 3, COL_GRAY_3);
+    lcd.fillRect(dx + 10, dy + 70, prog, 3, COL_GRAY_7);
+  } else {
     resetAllButtons(); showPhotoView(photoViewIndex); return;
   }
   if (!evt.valid) return;
