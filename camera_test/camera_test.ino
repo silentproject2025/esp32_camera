@@ -1,36 +1,36 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.8
+ * Version: v5.9
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.8 (di atas v5.7):
+ *  CHANGELOG v5.9 (di atas v5.8):
  *
+ *  [FIX-BMP-COLOR] Perbaikan warna BMP di PC/laptop
+ *    - saveBMP(): tambah byte-swap RGB565 sebelum konversi ke BGR888
+ *      ESP32 LCD menyimpan RGB565 dalam format big-endian (byte-swapped)
+ *      sehingga perlu di-swap kembali: uint16_t px = (raw<<8)|(raw>>8)
+ *    - loadBMP(): output RGB565 di-swap untuk lcd.pushImage() (swap back)
+ *
+ *  [FORMAT-SELECT] Menu pilih format foto GC2145: JPG atau BMP
+ *    - C long press (menggantikan face detect toggle) → drawFormatMenu()
+ *    - GC2145 mendukung dua mode: GFMT_BMP dan GFMT_JPG
+ *    - gc2145CaptureFormat: GC2145Format enum (GFMT_BMP / GFMT_JPG)
+ *    - Viewfinder pill format update: "BMP" atau "JPG" sesuai pilihan
+ *    - D button short press: toggle face detect (ganti dari C short)
+ *    - D button long press: exposure menu (sama seperti sebelumnya)
+ *
+ *  [STEGO-BMP] Steganografi untuk file BMP
+ *    - stegoBmpEmbed(): embed payload ke LSB channel B setiap pixel
+ *      Payload: STEGO_MAGIC|NNNN|v5.9 (sama dengan format JPG)
+ *      Kapasitas: (w*h) bit tersedia, payload max 64 karakter × 8 bit
+ *    - stegoBmpExtract(): baca payload dari LSB B channel
+ *    - captureAndPreview(): panggil stegoBmpEmbed() sebelum saveBMP()
+ *    - photoViewDrawCaption(): branch BMP → stegoBmpExtract() untuk info
+ *
+ * ═══════════════════════════════════════════════════════════════
+ *  TETAP dari v5.8:
  *  [BMP] Simpan foto GC2145 langsung sebagai BMP (tanpa JPEG encode)
- *    - saveBMP(): tulis BMP24 header + konversi RGB565→RGB888 bottom-up
- *    - GC2145 → .bmp, sensor lain → .jpg (JPEG+stego+EXIF seperti sebelumnya)
- *    - Notif island: "SAVED BMP #NNNN" / "SAVED JPG #NNNN"
- *
  *  [GALLERY] Gallery manager mendukung tiga tipe file: JPG / BMP / VIDEO
- *    - GalleryFileType enum (GFILE_JPG / GFILE_BMP / GFILE_VIDEO)
- *      menggantikan bool galleryIsVideo[]
- *    - galleryFiles[] dialokasikan dari PSRAM seperti sebelumnya
- *    - scanGalleryFiles(): deteksi .bmp + .jpg + .mjpeg
- *    - scanPhotoCount(): hitung photo_.bmp dan photo_.jpg
- *    - drawGallery(): ikon berbeda untuk JPG / BMP / VIDEO
- *    - galleryUpdateHighlight(): pakai GalleryFileType
- *    - galleryStep(): skip video, tidak skip BMP/JPG (keduanya viewable)
- *    - handleModeGallery(): BOOT buka JPG→photoView, BMP→photoView,
- *      VIDEO→mjpegPlayer
- *    - photoLoadPixelBuf(): branch BMP decode (baca langsung tanpa library)
- *    - photoViewDrawCaption(): stego info hanya untuk JPG
- *    - photoViewPrev/Next(): skip video, tidak skip BMP
- *    - showPhotoView(): guard isPhoto (bukan video)
- *    - openDeleteDialog(): path pakai galleryFiles[photoViewIndex]
- *
- *  [SETUP] galleryFileType dialokasikan dari PSRAM (ganti galleryIsVideo)
- *
- * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.7:
  *  [ISLAND-1..4] animasi island smooth tanpa kotak hitam
  *  [EXIF] inject APP1 EXIF ke JPEG (Make/Model/Software/Desc/DT)
  *  [STEGO] embed payload ke COM marker JPEG
@@ -224,10 +224,20 @@ enum AppMode {
   MODE_MENU_LED,
   MODE_MENU_EXP,
   MODE_MENU_EXP_ADJ,
-  MODE_DIALOG_DELETE
+  MODE_DIALOG_DELETE,
+  MODE_MENU_FORMAT     // v5.9: menu pilih format JPG/BMP untuk GC2145
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GC2145 Capture Format — v5.9
+// ─────────────────────────────────────────────────────────────────────────────
+enum GC2145Format : uint8_t {
+  GFMT_BMP = 0,
+  GFMT_JPG = 1,
+};
+GC2145Format gc2145CaptureFormat = GFMT_BMP;  // default: BMP
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
@@ -292,7 +302,7 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND (tidak berubah dari v5.7)
+//  DYNAMIC ISLAND (tidak berubah dari v5.8)
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
 #define ISLAND_ANIM_MS       150
@@ -488,11 +498,11 @@ void islandForceHide() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI (tidak berubah dari v5.7)
+//  STEGANOGRAFI JPEG (tidak berubah dari v5.8)
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
-#define STEGO_VERSION      "v5.8"
+#define STEGO_VERSION      "v5.9"
 
 void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
@@ -550,7 +560,154 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  EXIF INJECT (tidak berubah dari v5.7, hanya versi string diupdate)
+//  STEGANOGRAFI BMP — v5.9
+//
+//  Embed payload ke bit LSB channel Blue dari setiap pixel RGB888 di BMP.
+//  1 bit per pixel, 8 pixel per karakter payload.
+//
+//  Format payload: STEGO_MAGIC|NNNN|v5.9  (sama dengan JPEG)
+//
+//  stegoBmpEmbed():
+//    - Bekerja langsung pada buffer RGB565 (setelah byte-swap)
+//    - Setiap bit payload di-embed ke LSB byte Blue pixel ke-n
+//    - Kapasitas: w*h bit → max ~4800 karakter untuk 320x240
+//
+//  stegoBmpExtract():
+//    - Baca file BMP, skip header 54 byte
+//    - Kumpulkan LSB byte Blue dari setiap pixel (offset 0 = B dalam BGR)
+//    - Rekonstruksi karakter sampai ditemukan null terminator atau magic mismatch
+// ─────────────────────────────────────────────────────────────────────────────
+#define STEGO_BMP_MAX_PAYLOAD 64
+
+// Embed payload ke LSB Blue channel dalam buffer RGB565 (byte-swapped)
+// Buffer adalah raw camera frame: tiap uint16_t dalam big-endian (swap)
+// Format RGB565 setelah swap: [RRRRR GGG] [GGG BBBBB]
+// Blue = 5 LSB dari byte kedua setelah swap = byte[0] dari raw uint16_t
+void stegoBmpEmbed(uint8_t* rgb565Buf, int w, int h,
+                   const char* payload, int payLen) {
+  if (!rgb565Buf || !payload || payLen <= 0) return;
+  int totalPixels = w * h;
+  int totalBits   = payLen * 8;
+  if (totalBits > totalPixels) return;  // tidak cukup pixel
+
+  // rgb565Buf adalah buffer big-endian (byte-swapped) dari kamera
+  // Setiap pixel = 2 byte: [byte_hi, byte_lo]
+  // Setelah swap: uint16_t px = (byte_lo << 8) | byte_hi (little-endian)
+  // RGB565 little-endian: bit15..11=R, bit10..5=G, bit4..0=B
+  // Blue 5 bit ada di bit4..0 = LSB dari word
+  // Dalam big-endian buffer: Blue LSB ada di bit0 dari byte_lo (index [i*2+1] jika big-endian... )
+  //
+  // ESP32 camera output: byte_hi = upper byte (R dan upper G)
+  //                      byte_lo = lower byte (lower G dan B)
+  // Blue bit0 adalah LSB dari byte_lo = rgb565Buf[pixelIndex*2 + 1] & 0x01
+  //
+  // Kita embed ke bit0 dari byte_lo (Blue LSB)
+
+  int bitIdx = 0;
+  for (int p = 0; p < totalPixels && bitIdx < totalBits; p++) {
+    int charIdx = bitIdx / 8;
+    int bitPos  = 7 - (bitIdx % 8);  // MSB first
+    uint8_t bit = (payload[charIdx] >> bitPos) & 0x01;
+
+    // byte_lo = rgb565Buf[p*2 + 1] (byte rendah, berisi lower G dan B)
+    // Embed ke bit0 (Blue LSB)
+    rgb565Buf[p * 2 + 1] = (rgb565Buf[p * 2 + 1] & 0xFE) | bit;
+    bitIdx++;
+  }
+}
+
+// Ekstrak payload dari file BMP
+bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
+  if (!path || !outPayload || maxLen < 2) return false;
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+
+  // Skip BMP file header (14 byte) + DIB header (40 byte) = 54 byte
+  // tapi ambil pixel data offset dari header
+  uint8_t hdr[54];
+  if (fread(hdr, 1, 54, f) != 54) { fclose(f); return false; }
+  if (hdr[0] != 'B' || hdr[1] != 'M') { fclose(f); return false; }
+
+  uint32_t dataOffset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8)
+                      | ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
+  int32_t bmpW = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19] << 8)
+                          | ((uint32_t)hdr[20] << 16) | ((uint32_t)hdr[21] << 24));
+  int32_t bmpH = (int32_t)((uint32_t)hdr[22] | ((uint32_t)hdr[23] << 8)
+                          | ((uint32_t)hdr[24] << 16) | ((uint32_t)hdr[25] << 24));
+  if (bmpH < 0) bmpH = -bmpH;
+  if (bmpW <= 0 || bmpH <= 0) { fclose(f); return false; }
+
+  uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
+  if (bpp != 24) { fclose(f); return false; }
+
+  fseek(f, (long)dataOffset, SEEK_SET);
+
+  int rowSize = ((bmpW * 3 + 3) / 4) * 4;
+  int totalPayloadBits = (maxLen - 1) * 8;
+
+  // Rekonstruksi payload dari LSB channel Blue (byte 0 dalam BGR triplet)
+  memset(outPayload, 0, maxLen);
+  int bitIdx = 0;
+  int charIdx = 0;
+  uint8_t curChar = 0;
+
+  // Baca baris dari bawah ke atas (BMP bottom-up) tapi bit order tidak berubah
+  // karena kita embed dari baris 0 (yang tersimpan di akhir file BMP)
+  // Perlu baca terbalik karena saveBMP() menulis bottom-up
+  // Saat embed: pixel index p=0 → row y=0 dari frame kamera
+  // Di file BMP: row y=0 disimpan di akhir (bottom-up)
+  // Jadi baca dari akhir file ke awal untuk mendapat pixel yang sama
+
+  // Hitung total row
+  long rowDataStart = (long)dataOffset;
+  long fileSize = 0;
+  {
+    long cur = ftell(f);
+    fseek(f, 0, SEEK_END);
+    fileSize = ftell(f);
+    fseek(f, cur, SEEK_SET);
+  }
+
+  uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
+  if (!rowBuf) { fclose(f); return false; }
+
+  // BMP bottom-up: row 0 gambar ada di offset akhir
+  // Embed dilakukan ke urutan pixel p=0,1,2,... = row 0,1,2,...
+  // Di BMP, row 0 gambar = baris terakhir di file
+  // Jadi baca dari baris terakhir dulu
+
+  bool found = false;
+  for (int row = bmpH - 1; row >= 0 && bitIdx < totalPayloadBits; row--) {
+    long offset = rowDataStart + (long)row * rowSize;
+    fseek(f, offset, SEEK_SET);
+    if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize) break;
+
+    for (int x = 0; x < bmpW && bitIdx < totalPayloadBits; x++) {
+      // BGR: byte 0 = B
+      uint8_t bit = rowBuf[x * 3 + 0] & 0x01;  // LSB of Blue
+      int bitPos = 7 - (bitIdx % 8);
+      curChar |= (bit << bitPos);
+      bitIdx++;
+      if (bitIdx % 8 == 0) {
+        outPayload[charIdx] = curChar;
+        if (curChar == '\0') { found = true; break; }
+        charIdx++;
+        curChar = 0;
+        if (charIdx >= maxLen - 1) { found = true; break; }
+      }
+    }
+    if (found) break;
+  }
+  outPayload[maxLen - 1] = '\0';
+
+  free(rowBuf);
+  fclose(f);
+
+  return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  EXIF INJECT (tidak berubah dari v5.8, versi string diupdate)
 // ─────────────────────────────────────────────────────────────────────────────
 static inline void exifL16(uint8_t* b, uint16_t v) {
   b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
@@ -585,7 +742,7 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
   snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
   snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
-  snprintf(strSoftware, sizeof(strSoftware), "v5.8");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.9");
   exifMakeTimestamp(strDt, sizeof(strDt));
   int lenDesc     = (int)strlen(strDesc)     + 1;
   int lenMake     = (int)strlen(strMake)     + 1;
@@ -646,93 +803,71 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BMP SAVE — v5.8 (GC2145 RGB565 → BMP24)
+//  BMP SAVE — v5.9
 //
-//  Format BMP:
-//    - File header 14 byte
-//    - DIB header (BITMAPINFOHEADER) 40 byte
-//    - Pixel data RGB888, bottom-up, row padded ke kelipatan 4 byte
+//  FIX WARNA: ESP32 camera output RGB565 dalam format big-endian (byte-swapped)
+//  untuk kompatibilitas dengan lcd.pushImage(). Sebelum konversi ke BGR888,
+//  perlu swap byte kembali ke little-endian standar.
 //
-//  Konversi RGB565 → RGB888:
-//    R = (px >> 11 & 0x1F) << 3   (5 bit → 8 bit)
-//    G = (px >>  5 & 0x3F) << 2   (6 bit → 8 bit)
-//    B = (px       & 0x1F) << 3   (5 bit → 8 bit)
-//  BMP simpan BGR (bukan RGB).
+//  byte-swap: uint16_t px_le = (px_raw << 8) | (px_raw >> 8)
+//  kemudian: R = (px_le >> 11 & 0x1F) << 3
+//             G = (px_le >>  5 & 0x3F) << 2
+//             B = (px_le       & 0x1F) << 3
 // ─────────────────────────────────────────────────────────────────────────────
 bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path) {
   FILE* f = fopen(path, "wb");
   if (!f) return false;
 
-  // Row size harus kelipatan 4 byte (RGB888 = 3 byte/px)
   int rowSize  = ((w * 3 + 3) / 4) * 4;
   int dataSize = rowSize * h;
   int fileSize = 54 + dataSize;
 
-  // ── BMP File Header (14 byte) ─────────────────────────────────────────
   uint8_t hdr[54];
   memset(hdr, 0, sizeof(hdr));
 
   hdr[0] = 'B'; hdr[1] = 'M';
-
-  // File size LE
   hdr[2] = fileSize & 0xFF;
   hdr[3] = (fileSize >> 8)  & 0xFF;
   hdr[4] = (fileSize >> 16) & 0xFF;
   hdr[5] = (fileSize >> 24) & 0xFF;
-
-  // Pixel data offset = 54
   hdr[10] = 54;
-
-  // ── DIB Header BITMAPINFOHEADER (40 byte, mulai offset 14) ───────────
-  // Header size = 40
   hdr[14] = 40;
-
-  // Width LE
   hdr[18] = w & 0xFF;
   hdr[19] = (w >> 8) & 0xFF;
   hdr[20] = (w >> 16) & 0xFF;
   hdr[21] = (w >> 24) & 0xFF;
-
-  // Height LE (positif = bottom-up, standar BMP)
   hdr[22] = h & 0xFF;
   hdr[23] = (h >> 8) & 0xFF;
   hdr[24] = (h >> 16) & 0xFF;
   hdr[25] = (h >> 24) & 0xFF;
-
-  // Color planes = 1
   hdr[26] = 1;
-
-  // Bits per pixel = 24
   hdr[28] = 24;
-
-  // Compression = 0 (BI_RGB)
-  // hdr[30..33] sudah 0
-
-  // Image data size
   hdr[34] = dataSize & 0xFF;
   hdr[35] = (dataSize >> 8)  & 0xFF;
   hdr[36] = (dataSize >> 16) & 0xFF;
   hdr[37] = (dataSize >> 24) & 0xFF;
-
-  // Pixels per meter X/Y = 2835 (~72 dpi)
   hdr[38] = 0x13; hdr[39] = 0x0B;
   hdr[42] = 0x13; hdr[43] = 0x0B;
 
   fwrite(hdr, 1, 54, f);
 
-  // ── Pixel Data — bottom-up (baris terakhir gambar ditulis pertama) ────
-  // Maksimum DISP_W=320, rowSize = 320*3+2=962, bulatkan ke 964
   static uint8_t rowBuf[320 * 3 + 4];
 
   for (int y = h - 1; y >= 0; y--) {
     memset(rowBuf, 0, rowSize);
     const uint16_t* srcRow = (const uint16_t*)rgb565Buf + (size_t)y * w;
     for (int x = 0; x < w; x++) {
-      uint16_t px = srcRow[x];
+      uint16_t raw = srcRow[x];
+
+      // ── v5.9 FIX: byte-swap dari big-endian ke little-endian ──────────
+      // ESP32 camera → big-endian untuk LCD. Swap kembali untuk BMP.
+      uint16_t px = (raw << 8) | (raw >> 8);
+
       uint8_t r = ((px >> 11) & 0x1F) << 3;
       uint8_t g = ((px >>  5) & 0x3F) << 2;
       uint8_t b = ( px        & 0x1F) << 3;
-      // BMP: BGR
+
+      // BMP: BGR order
       rowBuf[x * 3 + 0] = b;
       rowBuf[x * 3 + 1] = g;
       rowBuf[x * 3 + 2] = r;
@@ -746,11 +881,10 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BMP LOAD — v5.8
+//  BMP LOAD — v5.9
 //
-//  Baca file BMP ke buffer RGB565 untuk ditampilkan via lcd.pushImage().
-//  Mendukung BMP24 (paling umum). BMP32/16 tidak didukung.
-//  Output: buffer RGB565 di PSRAM, caller wajib free().
+//  FIX: Output RGB565 di-swap (byte-swap) agar kompatibel dengan
+//  lcd.pushImage() yang menggunakan format big-endian.
 // ─────────────────────────────────────────────────────────────────────────────
 uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
   FILE* f = fopen(path, "rb");
@@ -758,27 +892,22 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
 
   uint8_t hdr[54];
   if (fread(hdr, 1, 54, f) != 54) { fclose(f); return nullptr; }
-
-  // Signature
   if (hdr[0] != 'B' || hdr[1] != 'M') { fclose(f); return nullptr; }
 
-  // Pixel data offset
   uint32_t dataOffset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8)
                       | ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
 
-  // Width & Height
   int32_t bmpW = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19] << 8)
                           | ((uint32_t)hdr[20] << 16) | ((uint32_t)hdr[21] << 24));
   int32_t bmpH = (int32_t)((uint32_t)hdr[22] | ((uint32_t)hdr[23] << 8)
                           | ((uint32_t)hdr[24] << 16) | ((uint32_t)hdr[25] << 24));
 
-  // BMP height negatif = top-down
   bool topDown = false;
   if (bmpH < 0) { topDown = true; bmpH = -bmpH; }
 
   uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
   if (bpp != 24) {
-    Serial.printf("[BMP] bpp=%d tidak didukung (hanya 24)\n", bpp);
+    Serial.printf("[BMP] bpp=%d tidak didukung\n", bpp);
     fclose(f); return nullptr;
   }
 
@@ -786,13 +915,11 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
     fclose(f); return nullptr;
   }
 
-  // Alokasi buffer RGB565
   size_t pixCount = (size_t)bmpW * (size_t)bmpH;
   uint16_t* buf = (uint16_t*)ps_malloc(pixCount * sizeof(uint16_t));
   if (!buf) { buf = (uint16_t*)malloc(pixCount * sizeof(uint16_t)); }
   if (!buf) { fclose(f); return nullptr; }
 
-  // Row size BMP = kelipatan 4 byte
   int rowSize = ((bmpW * 3 + 3) / 4) * 4;
   uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
   if (!rowBuf) { free(buf); fclose(f); return nullptr; }
@@ -800,12 +927,9 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
   fseek(f, (long)dataOffset, SEEK_SET);
 
   for (int row = 0; row < bmpH; row++) {
-    if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize) {
-      // File pendek, isi sisa dengan hitam
+    if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize)
       memset(rowBuf, 0, rowSize);
-    }
 
-    // BMP bottom-up: row 0 di file = baris bawah gambar
     int destRow = topDown ? row : (bmpH - 1 - row);
     uint16_t* destLine = buf + (size_t)destRow * bmpW;
 
@@ -813,10 +937,14 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
       uint8_t b = rowBuf[x * 3 + 0];
       uint8_t g = rowBuf[x * 3 + 1];
       uint8_t r = rowBuf[x * 3 + 2];
-      // RGB888 → RGB565
-      destLine[x] = ((uint16_t)(r & 0xF8) << 8)
-                  | ((uint16_t)(g & 0xFC) << 3)
-                  | ((uint16_t)(b >> 3));
+
+      // RGB888 → RGB565 little-endian
+      uint16_t px_le = ((uint16_t)(r & 0xF8) << 8)
+                     | ((uint16_t)(g & 0xFC) << 3)
+                     | ((uint16_t)(b >> 3));
+
+      // ── v5.9 FIX: swap ke big-endian untuk lcd.pushImage() ───────────
+      destLine[x] = (px_le << 8) | (px_le >> 8);
     }
 
     if (row % 30 == 0) esp_task_wdt_reset();
@@ -835,8 +963,6 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
 // ─────────────────────────────────────────────────────────────────────────────
 bool ledFlashEnabled = false;
 
-// ── Gallery file type ─────────────────────────────────────────────────────────
-// v5.8: ganti bool galleryIsVideo[] → GalleryFileType[]
 enum GalleryFileType : uint8_t {
   GFILE_JPG   = 0,
   GFILE_BMP   = 1,
@@ -855,7 +981,6 @@ int   gallerySelIdx = 0;
 char  photoViewPath[48];
 int   photoViewIndex = 0;
 
-// Helper inline
 inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
 inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
 inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
@@ -904,8 +1029,9 @@ const ExpPresetCfg expPresets[4] = {
   { false, false, 300,  false, 0, 0,  0 },
 };
 
-int menuLedSel = 0;
-int menuExpSel = 0;
+int menuLedSel    = 0;
+int menuExpSel    = 0;
+int menuFormatSel = 0;  // v5.9: 0=BMP, 1=JPG
 
 unsigned long deleteDialogOpenMs = 0;
 #define DELETE_TIMEOUT_MS 8000
@@ -933,7 +1059,7 @@ float         fpsValue      = 0.0f;
 #define PILL_PAD_X   5
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MJPEG Player state (tidak berubah)
+//  MJPEG Player state
 // ─────────────────────────────────────────────────────────────────────────────
 #define MJPEG_BUF_SIZE   (150 * 1024)
 #define MJPEG_FRAME_RATE  15
@@ -1090,7 +1216,7 @@ void unmountVFSOnly() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  scanPhotoCount — v5.8: hitung .jpg dan .bmp
+//  scanPhotoCount — hitung .jpg dan .bmp
 // ─────────────────────────────────────────────────────────────────────────────
 void scanPhotoCount() {
   photoCount = 0;
@@ -1102,9 +1228,7 @@ void scanPhotoCount() {
     bool isJpg = name.startsWith("photo_") && name.endsWith(".jpg");
     bool isBmp = name.startsWith("photo_") && name.endsWith(".bmp");
     if (isJpg || isBmp) {
-      // Ambil nomor dari nama file: photo_NNNN.ext → NNNN
-      int extLen = isJpg ? 4 : 4; // ".jpg" dan ".bmp" sama-sama 4 karakter
-      int num = name.substring(6, name.length() - extLen).toInt();
+      int num = name.substring(6, name.length() - 4).toInt();
       if (num > photoCount) photoCount = num;
     }
   }
@@ -1126,7 +1250,7 @@ void scanVideoCount() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery — v5.8: deteksi JPG / BMP / VIDEO
+//  Gallery — deteksi JPG / BMP / VIDEO
 // ─────────────────────────────────────────────────────────────────────────────
 void scanGalleryFiles() {
   galleryCount = 0; galleryScroll = 0;
@@ -1149,7 +1273,6 @@ void scanGalleryFiles() {
   }
   closedir(dir);
 
-  // Urutkan nama file ascending (bubble sort)
   for (int i = 0; i < galleryCount - 1; i++) {
     for (int j = 0; j < galleryCount - i - 1; j++) {
       if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
@@ -1167,7 +1290,7 @@ void scanGalleryFiles() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  drawGallery — v5.8: ikon tipe file berbeda
+//  drawGallery
 // ─────────────────────────────────────────────────────────────────────────────
 void drawGallery() {
   lcd.fillScreen(COL_BLACK);
@@ -1194,37 +1317,26 @@ void drawGallery() {
     lcd.fillRect(0, rowY, DISP_W, GALLERY_ITEM_H - 1, rowBg);
     lcd.drawFastHLine(0, rowY + GALLERY_ITEM_H - 1, DISP_W, COL_GRAY_2);
 
-    // Nomor urut
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
     char num[6]; snprintf(num, sizeof(num), "%3d", i + 1);
     lcd.drawString(num, 6, rowY + 8);
 
-    // Ikon tipe file
     GalleryFileType ft = galleryFileType[i];
     if (ft == GFILE_VIDEO) {
-      // Segitiga play — video
       lcd.setTextColor(COL_VID_ACCENT);
-      lcd.drawString("\x10", 26, rowY + 8);  // karakter play
+      lcd.drawString("\x10", 26, rowY + 8);
     } else if (ft == GFILE_BMP) {
-      // Kotak kecil dengan "B" — BMP
       lcd.drawRect(26, rowY + 5, 9, 9, COL_BMP_ACCENT);
       lcd.setTextColor(COL_BMP_ACCENT);
       lcd.drawString("B", 28, rowY + 6);
     } else {
-      // Kotak kosong — JPG
       lcd.drawRect(26, rowY + 6, 7, 7, COL_GRAY_5);
     }
 
-    // Nama file + warna per tipe
-    uint16_t nameCol;
-    if      (ft == GFILE_VIDEO) nameCol = COL_GRAY_A;
-    else if (ft == GFILE_BMP)   nameCol = COL_GRAY_C;
-    else                         nameCol = COL_GRAY_C;
+    uint16_t nameCol = (ft == GFILE_VIDEO) ? COL_GRAY_A : COL_GRAY_C;
     lcd.setTextColor(nameCol);
     lcd.drawString(galleryFiles[i], 38, rowY + 8);
 
-    // Label tipe di kanan
-    lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
     const char* typeLabel = (ft == GFILE_VIDEO) ? "VID" :
                             (ft == GFILE_BMP)   ? "BMP" : "JPG";
     uint16_t typeCol = (ft == GFILE_VIDEO) ? COL_VID_ACCENT :
@@ -1233,11 +1345,9 @@ void drawGallery() {
     lcd.drawString(typeLabel, DISP_W - 28, rowY + 8);
   }
 
-  // Highlight seleksi
   int selY = 24 + (gallerySelIdx - galleryScroll) * GALLERY_ITEM_H;
   lcd.drawRect(0, selY, DISP_W - 4, GALLERY_ITEM_H - 1, COL_GRAY_5);
 
-  // Scrollbar
   if (galleryCount > GALLERY_ITEMS_PAGE) {
     int barH  = DISP_H - 22;
     int indH  = max(10, barH * GALLERY_ITEMS_PAGE / galleryCount);
@@ -1277,7 +1387,7 @@ void galleryStep(int delta) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo pixel buffer — v5.8: branch BMP
+//  Photo pixel buffer — branch BMP
 // ─────────────────────────────────────────────────────────────────────────────
 bool photoLoadPixelBuf(int idx) {
   if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return false;
@@ -1288,7 +1398,6 @@ bool photoLoadPixelBuf(int idx) {
   snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
 
   if (gIsBmp(idx)) {
-    // ── BMP: baca langsung tanpa library ────────────────────────────────
     uint16_t bw = 0, bh = 0;
     uint16_t* buf = loadBMP(path, &bw, &bh);
     if (!buf || bw == 0 || bh == 0) return false;
@@ -1296,9 +1405,7 @@ bool photoLoadPixelBuf(int idx) {
     photoBufW = bw;
     photoBufH = bh;
     return true;
-
   } else {
-    // ── JPG: decode via TJpgDec ─────────────────────────────────────────
     FILE* f = fopen(path, "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END); size_t fsize = ftell(f); fseek(f, 0, SEEK_SET);
@@ -1371,15 +1478,16 @@ void photoViewRender() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  photoViewDrawCaption — v5.8: stego info hanya untuk JPG
+//  photoViewDrawCaption — v5.9: stego info untuk JPG dan BMP
 // ─────────────────────────────────────────────────────────────────────────────
 void photoViewDrawCaption(int idx) {
   char stegoInfo[48] = "";
 
-  // Stego hanya ada di JPG
+  char path[56];
+  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
+
   if (gIsJpg(idx)) {
-    char path[56];
-    snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
+    // ── JPG: baca stego dari COM marker ──────────────────────────────────
     FILE* f = fopen(path, "rb");
     if (f) {
       fseek(f, 0, SEEK_END);
@@ -1402,9 +1510,16 @@ void photoViewDrawCaption(int idx) {
       }
       fclose(f);
     }
+  } else if (gIsBmp(idx)) {
+    // ── BMP: baca stego dari LSB Blue channel ────────────────────────────
+    char payload[STEGO_BMP_MAX_PAYLOAD + 1];
+    if (stegoBmpExtract(path, payload, sizeof(payload))) {
+      char* p1 = strchr(payload, '|');
+      if (p1) snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
+    }
   }
 
-  // Hitung urutan foto (photo saja, skip video)
+  // Hitung urutan foto
   int photoSeq = 0, photoTotal = 0;
   for (int i = 0; i < galleryCount; i++) {
     if (gIsPhoto(i)) {
@@ -1413,7 +1528,6 @@ void photoViewDrawCaption(int idx) {
     }
   }
 
-  // Tag tipe file
   const char* typeTag = gIsBmp(idx) ? " [BMP]" : "";
 
   lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
@@ -1483,7 +1597,7 @@ void photoViewDeleteCurrent() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  showPhotoView — v5.8: guard gIsPhoto(), bukan !galleryIsVideo()
+//  showPhotoView
 // ─────────────────────────────────────────────────────────────────────────────
 void showPhotoView(int idx) {
   if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return;
@@ -1506,9 +1620,6 @@ void showPhotoView(int idx) {
   resetAllButtons(); appMode = MODE_PHOTO_VIEW;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  photoViewPrev / Next — v5.8: skip video, tidak skip BMP
-// ─────────────────────────────────────────────────────────────────────────────
 void photoViewPrev() {
   int idx = photoViewIndex - 1;
   if (idx < 0) idx = galleryCount - 1;
@@ -1561,6 +1672,76 @@ void openLedMenu() {
   menuLedSel = ledFlashEnabled ? 0 : 1;
   drawLedMenu(menuLedSel);
   resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_LED;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Menu Format — v5.9
+//  Hanya muncul untuk sensor GC2145
+//  Pilihan: [x] BMP  [ ] JPG   (checkbox style)
+// ─────────────────────────────────────────────────────────────────────────────
+void drawFormatMenu(int sel) {
+  int mw=220, mh=120, mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
+  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+
+  // Judul
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "FORMAT FOTO  GC2145";
+  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
+  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
+
+  // Deskripsi singkat
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("pilih format simpan foto:", mx + 10, my + 24);
+
+  // Option items
+  const char* labels[2] = {
+    "BMP  - raw RGB, warna asli, stego",
+    "JPG  - kompresi, stego+EXIF"
+  };
+
+  for (int i = 0; i < 2; i++) {
+    int iy = my + 38 + i * 26;
+    bool isSelected   = (i == (int)gc2145CaptureFormat);  // current saved value
+    bool isHighlighted = (i == sel);
+
+    // Row background
+    lcd.fillRect(mx + 8, iy, mw - 16, 20,
+                 isHighlighted ? COL_GRAY_5 : COL_GRAY_D);
+
+    // Checkbox
+    int cbX = mx + 14, cbY = iy + 6;
+    lcd.drawRect(cbX, cbY, 10, 10,
+                 isHighlighted ? COL_WHITE : COL_GRAY_7);
+    if (isSelected) {
+      // Centang (checkmark)
+      lcd.drawFastHLine(cbX + 2, cbY + 5, 6,
+                        isHighlighted ? COL_WHITE : COL_GRAY_E);
+      lcd.drawFastVLine(cbX + 2, cbY + 3, 4,
+                        isHighlighted ? COL_WHITE : COL_GRAY_E);
+      lcd.drawPixel(cbX + 4, cbY + 7,
+                    isHighlighted ? COL_WHITE : COL_GRAY_E);
+    }
+
+    // Label
+    lcd.setTextColor(isHighlighted ? COL_WHITE :
+                     (isSelected   ? COL_GRAY_E : COL_GRAY_7));
+    lcd.drawString(labels[i], cbX + 14, iy + 6);
+  }
+
+  // Hint
+  lcd.setTextColor(COL_GRAY_3);
+  const char* hint = "C/D=pilih  BOOT=ok  B=batal";
+  lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 13);
+}
+
+void openFormatMenu() {
+  menuFormatSel = (int)gc2145CaptureFormat;
+  drawFormatMenu(menuFormatSel);
+  resetAllButtons();
+  prevMode = appMode;
+  appMode  = MODE_MENU_FORMAT;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1813,7 +1994,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xc
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.8  bmp+gallery-update",DISP_W/2-60,103);
+  lcd.drawString("v5.9  bmpfix+format+stegobmp",DISP_W/2-66,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1826,11 +2007,9 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xc
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf, sizeof(buf), "%uMHz  OK", xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"CAPTURE",
-    (detectedSensor==PID_GC2145)?"GC2145→BMP  others→JPG+EXIF":"JPG+stego+EXIF",
-    COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(182,"GALLERY","JPG/BMP/VIDEO  enum type",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(194,"ISLAND","no-erase slide  noClear=true",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"BMP FIX","byte-swap RGB565 corrected",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(182,"FORMAT SEL","C-long=menu JPG/BMP GC2145",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(194,"STEGO-BMP","LSB Blue channel embed",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
   lcd.drawRect(28,206,DISP_W-56,4,COL_GRAY_3);
   int barW = DISP_W - 60;
@@ -1865,7 +2044,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.8",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -2030,8 +2209,13 @@ void renderViewfinder() {
         drawPill(DISP_W/2, 10, expBuf, COL_PILL_BG, COL_GRAY_E);
       }
 
-      // Pill format file sesuai sensor
-      const char* fmtTag = (detectedSensor == PID_GC2145) ? "BMP" : "JPG";
+      // Pill format: untuk GC2145 tampilkan pilihan format (BMP/JPG)
+      const char* fmtTag;
+      if (detectedSensor == PID_GC2145)
+        fmtTag = (gc2145CaptureFormat == GFMT_BMP) ? "BMP" : "JPG";
+      else
+        fmtTag = "JPG";
+
       char shotBuf[12];
       snprintf(shotBuf, sizeof(shotBuf), "#%04d %s", photoCount + 1, fmtTag);
       drawPill(38, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
@@ -2052,9 +2236,13 @@ void renderViewfinder() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview — v5.8
-//  GC2145 → saveBMP() langsung
-//  Sensor lain → frame2jpg → stegoEmbed → exifInject → fwrite
+//  captureAndPreview — v5.9
+//
+//  GC2145:
+//    - GFMT_BMP: stegoBmpEmbed() → saveBMP()  (dengan byte-swap fix)
+//    - GFMT_JPG: frame2jpg → stegoEmbed → exifInject → fwrite
+//
+//  Sensor lain: selalu JPG + stego + EXIF
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
@@ -2071,7 +2259,7 @@ void captureAndPreview() {
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) { blinkLED(5, 50, 50); return; }
 
-  // Preview ke layar
+  // Preview
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
@@ -2082,20 +2270,27 @@ void captureAndPreview() {
   if (sdReady) {
     photoCount++;
 
-    // ── GC2145: simpan BMP langsung dari buffer RGB565 ─────────────────
-    if (detectedSensor == PID_GC2145 &&
-        fb->format == PIXFORMAT_RGB565 &&
-        fb->width == DISP_W && fb->height == DISP_H) {
+    bool isGC2145rgb = (detectedSensor == PID_GC2145 &&
+                        fb->format == PIXFORMAT_RGB565 &&
+                        fb->width == DISP_W && fb->height == DISP_H);
+
+    // ── GC2145 + pilih BMP ────────────────────────────────────────────────
+    if (isGC2145rgb && gc2145CaptureFormat == GFMT_BMP) {
+
+      // Embed stego ke buffer RGB565 sebelum save
+      char payload[STEGO_BMP_MAX_PAYLOAD];
+      stegoMakePayload(payload, sizeof(payload), photoCount);
+      stegoBmpEmbed(fb->buf, fb->width, fb->height, payload, (int)strlen(payload));
 
       char path[48];
       snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
       saved = saveBMP(fb->buf, fb->width, fb->height, path);
 
-      Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  %s\n",
-                    photoCount, fb->width, fb->height,
+      Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  stego=%s  %s\n",
+                    photoCount, fb->width, fb->height, payload,
                     saved ? "OK" : "GAGAL");
 
-    // ── Sensor lain: JPEG + stego + EXIF ──────────────────────────────
+    // ── GC2145 + pilih JPG, atau sensor lain: JPG + stego + EXIF ─────────
     } else {
       uint8_t *jpg_buf  = nullptr;
       size_t   jpg_len  = 0;
@@ -2108,7 +2303,6 @@ void captureAndPreview() {
       }
 
       if (ok && jpg_buf && jpg_len > 0) {
-        // Step 1: Stego
         char payload[STEGO_PAYLOAD_LEN];
         stegoMakePayload(payload, sizeof(payload), photoCount);
         int payLen = (int)strlen(payload);
@@ -2117,13 +2311,11 @@ void captureAndPreview() {
                                               payload, payLen, &stegoLen);
         if (!stegoBuf) { stegoBuf = jpg_buf; stegoLen = jpg_len; }
 
-        // Step 2: EXIF
         size_t finalLen = 0;
         uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen,
                                               photoCount, sensorName, &finalLen);
         if (!finalBuf) { finalBuf = stegoBuf; finalLen = stegoLen; }
 
-        // Step 3: Tulis ke SD
         char path[40];
         snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
         FILE* f = fopen(path, "wb");
@@ -2139,20 +2331,19 @@ void captureAndPreview() {
         if (finalBuf != stegoBuf) free(finalBuf);
         if (stegoBuf != jpg_buf)  free(stegoBuf);
         if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
-      } else {
-        Serial.println("[CAPTURE] frame2jpg gagal");
       }
     }
 
-    if (!saved) photoCount--; // rollback jika gagal
+    if (!saved) photoCount--;
   }
 
   esp_camera_fb_return(fb);
 
   if (saved) {
     char notifText[28];
-    const char* ext = (detectedSensor == PID_GC2145) ? "BMP" : "JPG";
-    snprintf(notifText, sizeof(notifText), "SAVED %s #%04d", ext, photoCount);
+    bool isBmpSave = (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP);
+    snprintf(notifText, sizeof(notifText), "SAVED %s #%04d",
+             isBmpSave ? "BMP" : "JPG", photoCount);
     islandPush(NOTIF_OK, notifText);
     blinkLED(2, 150, 80);
   } else {
@@ -2219,11 +2410,11 @@ bool initCamera() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Setup — v5.8: alokasi galleryFileType (ganti galleryIsVideo)
+//  Setup — v5.9
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.8 ===");
+  Serial.println("\n=== Sanzxcam v5.9 ===");
 
   galleryFiles    = (char(*)[32])    ps_malloc(GALLERY_MAX_FILES * 32);
   galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
@@ -2277,8 +2468,17 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  MODE HANDLERS
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  handleModeViewfinder — v5.9
+//  C short  → gallery
+//  C long   → FORMAT MENU (hanya GC2145), sensor lain tidak ada format menu
+//  D short  → toggle face detect  (ganti dari C long)
+//  D long   → exposure menu
+// ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt) {
   if (!evt.valid) { renderViewfinder(); return; }
+
   if (evt.pin == BTN_BOOT) {
     if (evt.isLong) { if (sdReady) enterUSBMode(); }
     else            { captureAndPreview(); }
@@ -2288,8 +2488,15 @@ void handleModeViewfinder(ButtonEvent evt) {
     else             { openLedMenu(); }
   }
   else if (evt.pin == BTN_C) {
-    if (evt.isLong) { toggleFaceDetect(); }
-    else {
+    if (evt.isLong) {
+      // ── v5.9: format menu untuk GC2145, sensor lain tidak didukung ────
+      if (detectedSensor == PID_GC2145) {
+        openFormatMenu();
+      } else {
+        islandPush(NOTIF_INFO, "FORMAT: hanya GC2145");
+      }
+    } else {
+      // Short: buka gallery
       if (sdReady) {
         scanGalleryFiles();
         gallerySelIdx = 0; galleryScroll = 0; galleryHoldDir = 0;
@@ -2300,14 +2507,11 @@ void handleModeViewfinder(ButtonEvent evt) {
     }
   }
   else if (evt.pin == BTN_D) {
-    if (evt.isShort) { toggleFaceDetect(); }
-    else             { openExpMenu(); }
+    if (evt.isShort) { toggleFaceDetect(); }  // D short: face detect
+    else             { openExpMenu(); }        // D long: exposure
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  handleModeGallery — v5.8: BOOT buka JPG/BMP→photoView, VIDEO→mjpegPlayer
-// ─────────────────────────────────────────────────────────────────────────────
 void handleModeGallery(ButtonEvent evt) {
   bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
   if (cHeld && galleryHoldDir != -1) {
@@ -2335,7 +2539,6 @@ void handleModeGallery(ButtonEvent evt) {
       if (ft == GFILE_VIDEO) {
         openMjpegPlayer(galleryFiles[gallerySelIdx]);
       } else {
-        // JPG atau BMP — keduanya ke photo view
         showPhotoView(gallerySelIdx);
       }
     }
@@ -2439,6 +2642,30 @@ void handleModeMenuLed(ButtonEvent evt) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  handleModeMenuFormat — v5.9
+// ─────────────────────────────────────────────────────────────────────────────
+void handleModeMenuFormat(ButtonEvent evt) {
+  if (!evt.valid) return;
+  if (evt.pin == BTN_BOOT) {
+    gc2145CaptureFormat = (menuFormatSel == 0) ? GFMT_BMP : GFMT_JPG;
+    char fbBuf[28];
+    snprintf(fbBuf, sizeof(fbBuf), "FORMAT: %s",
+             gc2145CaptureFormat == GFMT_BMP ? "BMP+stego" : "JPG+EXIF+stego");
+    islandPush(NOTIF_INFO, fbBuf);
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
+  }
+  else if (evt.pin == BTN_B) {
+    lcd.fillScreen(COL_BLACK); resetAllButtons();
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
+  }
+  else if (evt.pin == BTN_C || evt.pin == BTN_D) {
+    menuFormatSel = (menuFormatSel == 0) ? 1 : 0;
+    drawFormatMenu(menuFormatSel);
+  }
+}
+
 void handleModeMenuExp(ButtonEvent evt) {
   if (!evt.valid) return;
   if (evt.pin == BTN_BOOT) {
@@ -2528,6 +2755,7 @@ void loop() {
     case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                     break;
     case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                  break;
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                break;
+    case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                  break;  // v5.9
   }
 
   if (appMode != MODE_VIEWFINDER) {
@@ -2535,4 +2763,3 @@ void loop() {
     islandTick();
   }
 }
-
