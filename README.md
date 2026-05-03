@@ -1,180 +1,305 @@
-```
-╔═══════════════════════════════════════════════════════════╗
-║   ███████╗ █████╗ ███╗   ██╗███████╗██╗  ██╗ ██████╗    ║
-║  ██╔════╝██╔══██╗████╗  ██║╚══███╔╝╚██╗██╔╝██╔════╝    ║
-║  ███████╗███████║██╔██╗ ██║  ███╔╝  ╚███╔╝ ██║         ║
-║  ╚════██║██╔══██║██║╚██╗██║ ███╔╝   ██╔██╗ ██║         ║
-║  ███████║██║  ██║██║ ╚████║███████╗██╔╝ ██╗╚██████╗    ║
-║  ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝    ║
-║                                                           ║
-║  v5.8           ·  ESP32-S3  ·  4-BTN edition  ║
-╚═══════════════════════════════════════════════════════════╝
-```
+# SANZXCAM v5.9 — README
 
-> **ESP32-S3 camera system** — Live viewfinder, high-speed BMP/JPG capture, video recording, internal gallery, USB Mass Storage, and local face detection. Monochrome terminal aesthetic. Zero cloud. Just hardware.
+## Deskripsi Proyek
+
+Firmware kamera berbasis ESP32-S3 dengan display ILI9341 2.4" (320×240 landscape). Mendukung dua sensor kamera (GC2145 dan OV3660), menyimpan foto ke SD card dalam format JPG atau BMP, merekam video MJPEG, dan menyertakan fitur steganografi pada setiap file foto.
 
 ---
 
-## `$ system --info`
+## Hardware
 
-```
-BOARD    : Freenove ESP32-S3-WROOM (N16R8)
-DISPLAY  : ILI9341 2.4" 320×240 landscape (SPI2)
-STORAGE  : MicroSD via SDMMC 1-bit
-SENSOR   : GC2145 / OV3660 (auto-detect)
-BUTTONS  : 4x tactile — BOOT / B / C / D
-UI       : Monochrome · Dynamic Island Notifications
-VERSION  : v5.8
-```
+| Komponen | Detail |
+|---|---|
+| MCU | ESP32-S3 (Freenove ESP32-S3-WROOM) |
+| Display | ILI9341 2.4", 320×240, landscape, via SPI |
+| Touch | XPT2046, SPI shared |
+| Kamera | GC2145 (utama) / OV3660 |
+| Storage | SD Card via SDMMC 1-bit |
+| LED | Pin 48 (indikator), Pin 2 (flash) |
+| Tombol | BOOT (pin 0), B (pin 41), C (pin 3), D (pin 46) |
 
 ---
 
-## `$ features --list`
+## Pin Map
 
-| Module | Status | Keterangan |
+### Kamera (DVP)
+| Signal | Pin |
+|---|---|
+| XCLK | 15 |
+| SIOD (SDA) | 4 |
+| SIOC (SCL) | 5 |
+| Y2–Y9 | 11,9,8,10,12,18,17,16 |
+| VSYNC | 6 |
+| HREF | 7 |
+| PCLK | 13 |
+
+### Display SPI
+| Signal | Pin |
+|---|---|
+| MOSI | 45 |
+| MISO | 42 |
+| SCLK | 47 |
+| DC | 14 |
+| CS | 21 |
+| RST | 1 |
+
+### SD Card (SDMMC 1-bit)
+| Signal | Pin |
+|---|---|
+| CLK | 39 |
+| CMD | 38 |
+| D0 | 40 |
+
+---
+
+## Mode Aplikasi
+
+| Mode | Keterangan |
+|---|---|
+| MODE_VIEWFINDER | Live preview kamera, FPS counter, pill info |
+| MODE_GALLERY | Daftar file JPG/BMP/VIDEO di SD card |
+| MODE_PHOTO_VIEW | Lihat foto dengan zoom 1×/2×/4× dan pan |
+| MODE_MJPEG_PLAYER | Putar video MJPEG dengan kontrol speed/loop |
+| MODE_MENU_LED | Toggle flash LED saat capture |
+| MODE_MENU_EXP | Pilih preset exposure (AUTO/MOON/NIGHT/MANUAL) |
+| MODE_MENU_EXP_ADJ | Adjust manual exposure value dan gain |
+| MODE_DIALOG_DELETE | Konfirmasi hapus file, timeout 8 detik |
+| MODE_MENU_FORMAT | Pilih format foto GC2145: BMP atau JPG |
+
+---
+
+## Kontrol Tombol
+
+### Viewfinder
+| Tombol | Short Press | Long Press |
 |---|---|---|
-| **Dynamic Island** | `[NEW]` | Smooth non-blocking UI notifications for system events |
-| **BMP Capture** | `[NEW]` | Direct RGB565 to BMP24 for GC2145 (lossless quality) |
-| **EXIF & Stego** | `[NEW]` | APP1 EXIF injection + COM marker steganography (JPG) |
-| **Gallery Pro** | `[UPD]` | Triple format support: JPG / BMP / VIDEO with icons |
-| Live Viewfinder | `[ACTIVE]` | RGB565 full-frame, real-time FPS & Sensor ID |
-| Video Record | `[ACTIVE]` | MJPEG to SD, timer overlay, `video_XXXX.mjpeg` |
-| Photo Viewer | `[ACTIVE]` | Zoom 1×/2×/4×, pan, delete dialog |
-| MJPEG Player | `[ACTIVE]` | Play/pause, loop, variable speed (0.5×/1×/2×) |
-| Face Detection | `[ACTIVE]` | MSR01 + MNP01 two-stage, bracket & keypoint overlay |
-| USB Mass Storage| `[ACTIVE]` | Mount SD card directly to PC via USB-OTG |
+| BOOT | Ambil foto | Masuk USB MSC mode |
+| B | Start/Stop rekam video | Menu LED flash |
+| C | Buka Gallery | Menu Format (GC2145 saja) |
+| D | Toggle Face Detect | Menu Exposure |
+
+### Gallery
+| Tombol | Aksi |
+|---|---|
+| BOOT | Buka file terpilih (foto/video) |
+| B | Kembali ke Viewfinder |
+| C (hold) | Scroll ke atas (akselerasi) |
+| D (hold) | Scroll ke bawah (akselerasi) |
+
+### Photo View
+| Tombol | Short Press | Long Press |
+|---|---|---|
+| BOOT | Kembali ke Gallery | — |
+| B | Cycle zoom (1×→2×→4×→1×) | Buka dialog hapus |
+| C | Foto sebelumnya / pan kiri (zoom) | Pan ke atas (zoom) |
+| D | Foto berikutnya / pan kanan (zoom) | Pan ke bawah (zoom) |
+
+### MJPEG Player
+| Tombol | Aksi |
+|---|---|
+| BOOT | Stop & kembali ke Gallery |
+| B | Pause / Resume |
+| C | Toggle loop |
+| D | Cycle speed (0.5× / 1× / 2×) |
 
 ---
 
-## `$ hardware --pinout`
+## Format File
 
-### Display — SPI2
-```
-MOSI  ──── GPIO 45      DC    ──── GPIO 14
-MISO  ──── GPIO 42      CS    ──── GPIO 21
-SCLK  ──── GPIO 47      RST   ──── GPIO  1
-```
+### Foto JPG
+- Kompresi JPEG quality 85
+- Inject EXIF APP1: Make=SANZXCAM, Model=sensor, Software=v5.9, Timestamp
+- Inject steganografi: COM marker `SANZXCAM|NNNN|v5.9`
+- Nama file: `photo_NNNN.jpg`
 
-### SD Card — SDMMC 1-bit
-```
-CLK   ──── GPIO 39      CMD   ──── GPIO 38
-D0    ──── GPIO 40
-```
+### Foto BMP (GC2145 only)
+- Raw RGB565 dikonversi ke BGR888 24-bit
+- Fix byte-swap: big-endian ESP32 → little-endian standar BMP
+- Inject steganografi: LSB bit Blue channel setiap pixel
+- Nama file: `photo_NNNN.bmp`
 
-### Camera (QVGA RGB565)
-```
-XCLK  ──── GPIO 15      VSYNC ──── GPIO  6
-SIOD  ──── GPIO  4      HREF  ──── GPIO  7
-SIOC  ──── GPIO  5      PCLK  ──── GPIO 13
-D2-D9 ──── GPIO 11, 9, 8, 10, 12, 18, 17, 16
-```
-
-### Buttons & LED
-```
-BTN_BOOT  ──── GPIO  0    (Shutter / USB Mode)
-BTN_B     ──── GPIO 41    (Record / Flash / Zoom)
-BTN_C     ──── GPIO  3    (Gallery / Face / Prev)
-BTN_D     ──── GPIO 46    (Face / Exposure / Next)
-LED_IND   ──── GPIO 48    (Status Blink)
-LED_FLASH ──── GPIO  2    (Flash Capture)
-```
+### Video MJPEG
+- Stream frame JPEG tanpa container header
+- Frame rate target: 15 FPS
+- Nama file: `video_NNNN.mjpeg`
 
 ---
 
-## `$ wiring --warnings`
+## Fitur Steganografi
+
+### JPEG — COM Marker
+Payload disisipkan pada marker `0xFE` (COM) tepat setelah SOI (`0xFFD8`):
 
 ```
-⚠  CROSSTALK ALERT
-   Jauhkan kabel tombol dari kabel clock kamera (PCLK/XCLK)
-   dan SPI display (SCLK). Jarak minimal 3–5mm.
-   Kabel nempel 1cm saja sudah cukup bikin ghost press.
-
-   PCLK kamera  : 20 MHz  ─┐
-   XCLK kamera  : 20 MHz   ├─ sumber noise utama
-   SPI display  : 40 MHz  ─┘
-
-   FIX #1 : pisah routing, jangan sejajar panjang
-   FIX #2 : twist kabel tombol + GND bersama
-   FIX #3 : kapasitor 100nF dari pin tombol ke GND
+Format: SANZXCAM|NNNN|v5.9
+Contoh: SANZXCAM|0042|v5.9
 ```
 
----
+Ekstraksi menggunakan fungsi `stegoExtractFromJpeg()` yang men-scan marker sequence JPEG.
 
-## `$ dependencies --install`
-
-### Required Libraries
-1. **LovyanGFX** (v1.x) - High performance display driver.
-2. **JPEGDEC** - Fast JPEG decoding for MJPEG and Photo View.
-3. **TJpg_Decoder** - Used for high-quality full image decoding.
-4. **esp32-camera** - Built-in Espressif camera driver.
-5. **esp-dl** - Required for Face Detection (MSR01/MNP01).
-
-### Board Settings (Arduino IDE)
-- **Board**: Freenove ESP32-S3-WROOM
-- **PSRAM**: OPI PSRAM (Crucial for 320x240 RGB565 processing)
-- **Flash Size**: 16MB (or at least 8MB)
-- **USB Mode**: USB-OTG (Required for Mass Storage)
-- **Partition Scheme**: 16M Flash (3MB APP / 9MB FAT) or similar.
-
----
-
-## `$ usage --guide`
-
-### 1. Viewfinder Mode (Default)
-*   **BOOT (Tap)**: Capture Photo (GC2145 saves as **.bmp**, others as **.jpg**).
-*   **BOOT (Hold)**: Enter **USB Mass Storage** mode.
-*   **B (Tap)**: Start/Stop Video Recording (**MJPEG**).
-*   **B (Hold)**: Flash LED Menu.
-*   **C (Tap)**: Open Gallery.
-*   **C (Hold)**: Toggle Face Detection.
-*   **D (Tap)**: Toggle Face Detection.
-*   **D (Hold)**: Exposure Preset Menu (**AUTO/MOON/NIGHT/MANUAL**).
-
-### 2. Gallery Mode
-*   **C / D (Hold)**: Scroll up/down with acceleration.
-*   **BOOT**: Open selected file (Photo or Video).
-*   **B**: Back to Viewfinder.
-
----
-
-## `$ troubleshoot --run`
+### BMP — LSB Blue Channel
+Payload disisipkan ke bit LSB channel Blue (byte 0 dalam triplet BGR) dari setiap pixel, 1 bit per pixel, MSB first.
 
 ```
-[ERR] Ghost press — tombol tekan sendiri
-      → Cek routing kabel tombol vs kabel clock
-      → Pisah minimal 3–5mm, jangan sejajar
-      → Tambah kapasitor 100nF dari pin tombol ke GND
-
-[ERR] SD card not found
-      → Pastikan format FAT32
-      → Coba turunkan SDMMC freq ke SDMMC_FREQ_PROBING
-      → Cek pull-up: SDMMC_SLOT_FLAG_INTERNAL_PULLUP harus aktif
-
-[ERR] Camera init failed — layar hitam
-      → Cek kabel XCLK dan SIOD/SIOC (I2C kamera)
-      → Buka Serial Monitor 115200 — lihat log PID
-      → PID 0x0000 = koneksi I2C putus
-
-[ERR] USB MSC tidak muncul di PC
-      → Build harus pakai USB Mode: USB-OTG
-      → Pakai kabel data (bukan kabel charge only)
-
-[WARN] Face detection — FPS turun ke 3–5fps
-       → Normal. MSR01+MNP01 berat di CPU.
+Kapasitas: lebar × tinggi bit (320×240 = 76.800 bit ≈ 9.600 karakter)
+Max payload: 64 karakter
+Format: SANZXCAM|NNNN|v5.9
 ```
 
 ---
 
-## `$ technical --details`
+## ⚠️ BUG KRITIS: Steganografi BMP Tidak Berfungsi Benar
 
-### BMP Capture (v5.8)
-For the GC2145 sensor, the system skips JPEG compression and writes the RGB565 buffer directly to a **BMP24** file. This preserves maximum detail and avoids compression artifacts.
+Terdapat dua bug serius pada implementasi steganografi BMP di v5.9 yang menyebabkan **payload tidak dapat diekstrak kembali** dari file BMP yang sudah disimpan.
 
-### EXIF & Steganography
-JPEGs captured by other sensors include:
-- **EXIF Data**: Injected APP1 segment containing Make (SANZXCAM), Model, and Timestamp.
-- **Steganography**: Hidden payload in the COM marker (FF FE) containing the device version and photo serial number.
+### Bug 1 — Konversi Bit Loss saat RGB565 → BGR888
+
+**Lokasi:** `stegoBmpEmbed()` vs `saveBMP()`
+
+`stegoBmpEmbed()` menyisipkan bit ke LSB dari `rgb565Buf[p*2+1]`:
+- Byte ini adalah byte "lo" dalam pasangan big-endian kamera
+- Dalam format RGB565: bit 0 dari byte lo = bit 0 dari field Blue (5 bit)
+
+Kemudian `saveBMP()` melakukan konversi:
+```cpp
+uint16_t px = (raw << 8) | (raw >> 8);     // byte-swap
+uint8_t b   = (px & 0x1F) << 3;            // expand 5-bit ke 8-bit, << 3
+rowBuf[x*3] = b;
+```
+
+Operasi `<< 3` menyebabkan bit 0 dari field Blue (yang sudah dimodifikasi oleh embed) bergeser ke posisi bit 3 pada byte BGR888. Sehingga `rowBuf[x*3+0] & 0x01` di `stegoBmpExtract()` **tidak membaca bit yang sama** dengan yang di-embed. Bit LSB BGR888 sebenarnya berasal dari bit 3 asli field Blue RGB565, bukan bit yang di-embed.
+
+### Bug 2 — Urutan Pixel Terbalik saat Embed vs Extract
+
+**Lokasi:** `stegoBmpEmbed()` vs `stegoBmpExtract()` + `saveBMP()`
+
+`stegoBmpEmbed()` mengiterasi pixel dalam urutan:
+```
+p=0 → row y=0 kamera → pixel[0,0]
+p=1 → row y=0 kamera → pixel[0,1]
+...
+p=W → row y=1 kamera → pixel[1,0]
+```
+
+`saveBMP()` menulis dalam urutan BMP bottom-up:
+```
+row y=H-1 → ditulis pertama (offset awal data)
+row y=H-2 → ditulis kedua
+...
+row y=0   → ditulis terakhir (offset akhir data)
+```
+
+`stegoBmpExtract()` membaca mulai dari `row = bmpH-1` turun ke 0:
+```
+row=bmpH-1 → offset awal data → row y=H-1 kamera (SALAH: seharusnya y=0)
+```
+
+Akibatnya, urutan pixel saat extract **terbalik** dibanding saat embed. Jika payload memiliki panjang > 1 karakter, bit akan direkonstruksi dalam urutan yang salah, menghasilkan payload yang korup.
+
+### Solusi yang Benar
+
+Ada dua pendekatan untuk memperbaiki kedua bug sekaligus:
+
+**Opsi A — Embed setelah konversi ke BGR888 (di dalam saveBMP):**
+```cpp
+// Di saveBMP(), setelah hitung nilai b, g, r:
+// Embed ke bit 0 (LSB) dari byte Blue (b) sebelum tulis ke rowBuf
+int pixelIdx = (h - 1 - y) * w + x;  // karena saveBMP iterasi y dari h-1 ke 0
+if (pixelIdx < totalPayloadBits) {
+    int charIdx = pixelIdx / 8;
+    int bitPos  = 7 - (pixelIdx % 8);
+    uint8_t bit = (payload[charIdx] >> bitPos) & 0x01;
+    b = (b & 0xFE) | bit;
+}
+rowBuf[x*3+0] = b;
+```
+Dengan cara ini, embed dan extract bekerja pada representasi yang sama (BGR888, urutan pixel identik dengan yang dibaca `stegoBmpExtract()`).
+
+**Opsi B — Ubah stegoBmpExtract() agar membaca dalam urutan terbalik:**
+Extract saat ini membaca dari `row=bmpH-1` turun ke 0 (= row y=H-1..0 kamera). Harus diubah membaca dari `row=0` naik ke `bmpH-1` (= row y=H-1..0 dari kamera... wait, ini masih terbalik). Yang benar: extract harus membaca dari `row=0` ke `bmpH-1` agar mendapat pixel dalam urutan yang sama dengan embed (p=0,1,2,...).
+
+Tapi Bug 1 (konversi bit) tetap harus diperbaiki terpisah.
+
+**Rekomendasi: Opsi A** — lebih bersih karena embed dilakukan tepat sebelum tulis, langsung pada nilai BGR888 final, tanpa perlu memikirkan byte order RGB565.
 
 ---
 
-*SANZXCAM — Local. Secure. Raw.*
+## Exposure Presets
+
+| Preset | AEC | AEC2 | AEC Value | AGC | Gain | Ceiling | AE Level |
+|---|---|---|---|---|---|---|---|
+| AUTO | ON | ON | 300 | ON | 0 | 2 | 0 |
+| MOON | OFF | OFF | 20 | OFF | 0 | 0 | -2 |
+| NIGHT | OFF | ON | 1200 | OFF | 5 | 6 | +2 |
+| MANUAL | OFF | OFF | user | OFF | user | 0 | 0 |
+
+---
+
+## Dynamic Island
+
+Notifikasi animasi slide-in/out dari atas layar, mendukung stack hingga 3 pesan.
+
+| Tipe | Ikon | Keterangan |
+|---|---|---|
+| NOTIF_OK | + | Operasi berhasil |
+| NOTIF_FLASH | * | Flash LED toggle |
+| NOTIF_REC | o | Recording aktif (blink dot) |
+| NOTIF_FACE | @ | Face detect toggle |
+| NOTIF_WARN | ! | Peringatan/error |
+| NOTIF_INFO | i | Informasi umum |
+
+Durasi tampil: 1000ms + animasi masuk 150ms + animasi keluar 150ms.
+
+---
+
+## USB Mass Storage
+
+BOOT long press dari Viewfinder mengaktifkan mode USB MSC. SD card di-expose ke host sebagai USB drive. Keluar dengan BOOT press setelah host eject. VFS di-remount setelah keluar.
+
+---
+
+## EXIF Metadata (JPEG)
+
+| Tag | ID | Nilai |
+|---|---|---|
+| ImageDescription | 0x010E | `photo_NNNN` |
+| Make | 0x010F | `SANZXCAM` |
+| Model | 0x0110 | Nama sensor |
+| Software | 0x0131 | `v5.9` |
+| DateTimeOriginal | 0x9003 | Timestamp dari millis() |
+
+Format timestamp: `2025:01:01 HH:MM:SS` (relatif dari boot, bukan waktu nyata karena tidak ada RTC).
+
+---
+
+## Dependensi Library
+
+| Library | Fungsi |
+|---|---|
+| esp32-camera | Driver kamera DVP |
+| LovyanGFX v1 | Display ILI9341 + touch XPT2046 |
+| TJpg_Decoder | Decode JPEG ke pixel buffer |
+| MjpegClass | Stream MJPEG dari file |
+| JPEGDEC | Decode frame MJPEG |
+| human_face_detect | MSR01 + MNP01 face detection |
+| USBMSC | USB Mass Storage Class |
+| esp_vfs_fat | FAT filesystem via SDMMC |
+
+---
+
+## Changelog v5.9
+
+- **[FIX-BMP-COLOR]** Perbaikan warna BMP dengan byte-swap RGB565 sebelum konversi ke BGR888
+- **[FORMAT-SELECT]** Menu pilih format foto GC2145 (BMP/JPG) via C long press
+- **[STEGO-BMP]** Implementasi steganografi LSB Blue channel untuk file BMP (lihat bug notes di atas)
+
+---
+
+## Changelog v5.8 (ringkasan)
+
+- Simpan foto GC2145 sebagai BMP langsung dari raw RGB565
+- Gallery mendukung tiga tipe file: JPG, BMP, VIDEO
+- Animasi Dynamic Island smooth tanpa artefak kotak hitam
+- Inject EXIF APP1 ke JPEG
+- Steganografi via COM marker JPEG
+- Fix: applyExpPreset() mempertahankan hmirror/vflip sensor
