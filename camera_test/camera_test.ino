@@ -1,57 +1,44 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.7
+ * Version: v5.8
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.7 (fixes di atas v5.6-island-fix9):
+ *  CHANGELOG v5.8 (di atas v5.7):
  *
- *  [ISLAND-FIX] Animasi island benar-benar smooth tanpa kotak hitam
+ *  [BMP] Simpan foto GC2145 langsung sebagai BMP (tanpa JPEG encode)
+ *    - saveBMP(): tulis BMP24 header + konversi RGB565→RGB888 bottom-up
+ *    - GC2145 → .bmp, sensor lain → .jpg (JPEG+stego+EXIF seperti sebelumnya)
+ *    - Notif island: "SAVED BMP #NNNN" / "SAVED JPG #NNNN"
  *
- *  Root cause final:
- *  islandErase() dipanggil sebelum islandDraw() setiap frame →
- *  fillRect hitam muncul sejenak sebelum island digambar ulang.
- *  Di viewfinder, frame kamera sudah menimpa seluruh layar setiap
- *  loop — erase manual tidak diperlukan sama sekali.
+ *  [GALLERY] Gallery manager mendukung tiga tipe file: JPG / BMP / VIDEO
+ *    - GalleryFileType enum (GFILE_JPG / GFILE_BMP / GFILE_VIDEO)
+ *      menggantikan bool galleryIsVideo[]
+ *    - galleryFiles[] dialokasikan dari PSRAM seperti sebelumnya
+ *    - scanGalleryFiles(): deteksi .bmp + .jpg + .mjpeg
+ *    - scanPhotoCount(): hitung photo_.bmp dan photo_.jpg
+ *    - drawGallery(): ikon berbeda untuk JPG / BMP / VIDEO
+ *    - galleryUpdateHighlight(): pakai GalleryFileType
+ *    - galleryStep(): skip video, tidak skip BMP/JPG (keduanya viewable)
+ *    - handleModeGallery(): BOOT buka JPG→photoView, BMP→photoView,
+ *      VIDEO→mjpegPlayer
+ *    - photoLoadPixelBuf(): branch BMP decode (baca langsung tanpa library)
+ *    - photoViewDrawCaption(): stego info hanya untuk JPG
+ *    - photoViewPrev/Next(): skip video, tidak skip BMP
+ *    - showPhotoView(): guard isPhoto (bukan video)
+ *    - openDeleteDialog(): path pakai galleryFiles[photoViewIndex]
  *
- *  Fix:
- *  [ISLAND-1] islandNoClear = true SELALU di renderViewfinder()
- *             (bukan hanya saat !frozen seperti sebelumnya).
- *  [ISLAND-2] Hapus islandErase() dari SLIDING_IN dan SLIDING_OUT.
- *             Frame kamera yang bersihkan bekas island lama.
- *  [ISLAND-3] islandErase() tanpa parameter — pakai islandLastX/Y/W/H
- *             bukan parameter iX/iW/iH dari caller (yang bisa beda
- *             dengan apa yang sudah ada di layar).
- *  [ISLAND-4] islandDraw() simpan Last* SEBELUM early return
- *             (iY + iH <= 0) agar erase frame berikutnya presisi.
- *
- *  [EXIF] Inject APP1 EXIF ke JPEG hasil capture
- *
- *  Alur capture: frame2jpg → stegoEmbedToJpeg → exifInjectToJpeg
- *  Tags yang diinject:
- *    0x010F  Make            = "SANZXCAM"
- *    0x0110  Model           = sensorName (GC2145 / OV3660)
- *    0x0131  Software        = "v5.7"
- *    0x010E  ImageDescription= "photo_NNNN"
- *    0x9003  DateTimeOriginal= millis-based timestamp placeholder
- *    0x9000  ExifVersion     = "0220"
- *  Implementasi manual (no library), pure byte array ~200 byte.
- *  Little-endian TIFF header sesuai EXIF spec.
+ *  [SETUP] galleryFileType dialokasikan dari PSRAM (ganti galleryIsVideo)
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.6-island-fix9:
- *  [FIX-I-1] islandDrawnOnce flag
- *  [FIX-I-3] SLIDING_OUT terakhir langsung islandHide()
- *  [FIX-H]   islandLastY disimpan setiap islandDraw
- *  [FIX-F]   Tidak ada fillRect lebar di islandDraw
- *  [FIX-D]   islandNoClear skip fillRect saat viewfinder aktif
- *  [FIX-E]   Steganografi: payLen tanpa \0, fallback malloc
- *  [FIX-B]   applyExpPreset() jaga hmirror/vflip + delay + flush
- *  [FIX-C]   Stego embed ke COM marker JPEG
- *  Shadow + highlight + separator di island (smooth)
+ *  TETAP dari v5.7:
+ *  [ISLAND-1..4] animasi island smooth tanpa kotak hitam
+ *  [EXIF] inject APP1 EXIF ke JPEG (Make/Model/Software/Desc/DT)
+ *  [STEGO] embed payload ke COM marker JPEG
+ *  [FIX-B] applyExpPreset jaga hmirror/vflip
  * ═══════════════════════════════════════════════════════════════
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
- * DISPLAY: ILI9341 2.4" 320x240 landscape
+ * DISPLAY : ILI9341 2.4" 320x240 landscape
  */
 
 #include "esp_camera.h"
@@ -79,7 +66,7 @@
 #include <LovyanGFX.hpp>
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  *** EARLY TYPE DECLARATIONS ***
+//  EARLY TYPE DECLARATIONS
 // ─────────────────────────────────────────────────────────────────────────────
 enum NotifType : uint8_t {
   NOTIF_OK    = 0,
@@ -201,6 +188,11 @@ static LGFX lcd;
 #define COL_WHITE   0xFFFF
 #define COL_PILL_BG 0x18C3
 
+// Warna aksen tipe file di gallery
+#define COL_BMP_ACCENT  0x051F  // biru tua
+#define COL_VID_ACCENT  0x6000  // merah tua
+#define COL_JPG_ACCENT  0x3186  // abu-abu
+
 #define PID_GC2145 0x2145
 #define PID_OV3660 0x3660
 
@@ -300,13 +292,7 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — v5.7
-//
-//  [ISLAND-1] islandNoClear = true selalu di viewfinder
-//  [ISLAND-2] Tidak ada islandErase() di SLIDING_IN / SLIDING_OUT
-//             Frame kamera yang bersihkan bekas island
-//  [ISLAND-3] islandErase() tanpa parameter, pakai islandLast*
-//  [ISLAND-4] islandDraw() simpan Last* sebelum early return
+//  DYNAMIC ISLAND (tidak berubah dari v5.7)
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
 #define ISLAND_ANIM_MS       150
@@ -341,16 +327,9 @@ static int           islandLastY     = 0;
 static int           islandLastW     = 0;
 static int           islandLastH     = 0;
 static bool          islandDrawnOnce = false;
-
 static unsigned long islandFreezeUntilMs = 0;
+static bool          islandNoClear   = false;
 
-// islandNoClear: true di viewfinder — frame kamera timpa layar tiap loop,
-// fillRect hitam tidak diperlukan dan justru bikin flicker.
-static bool islandNoClear = false;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandCalcDims
-// ─────────────────────────────────────────────────────────────────────────────
 static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
   iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
   iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
@@ -361,16 +340,13 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
   NotifEntry& n        = islandStack[idx];
   const NotifStyle& s  = NOTIF_STYLES[(int)n.type];
-
   uint16_t rowBg = isFresh ? COL_GRAY_D : COL_BLACK;
   lcd.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
-
   int iconY = y + (ISLAND_H_ROW - ISLAND_ICON_SZ) / 2;
   lcd.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(s.iconFg);
   lcd.drawString(s.sym, x + 2, iconY + 1);
-
   lcd.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
   char buf[28];
   strncpy(buf, n.text, sizeof(buf) - 1);
@@ -382,7 +358,6 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
     if (strlen(buf) > 3) { buf[strlen(buf)-1] = '.'; buf[strlen(buf)-2] = '.'; }
   }
   lcd.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
-
   if (n.type == NOTIF_REC && isFresh) {
     int dotX = x + w - 4;
     int dotY = y + ISLAND_H_ROW / 2;
@@ -391,74 +366,48 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandErase — [ISLAND-3] tanpa parameter, pakai islandLast*
-//
-//  Hanya dipanggil di mode non-viewfinder (gallery, photo view, dll)
-//  dimana tidak ada frame kamera yang menimpa layar.
-//  Di viewfinder: islandNoClear = true → fungsi ini selalu skip.
-// ─────────────────────────────────────────────────────────────────────────────
 static void islandErase() {
   if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
   if (islandLastW <= 0 || islandLastH <= 0) return;
-
   int eraseX = islandLastX - 3;
   int eraseY = islandLastY;
   int eraseW = islandLastW + 6;
   int eraseH = islandLastH + 4;
-
-  // Clamp ke layar
   if (eraseY < 0) { eraseH += eraseY; eraseY = 0; }
   if (eraseH <= 0) return;
   if (eraseX < 0) { eraseW += eraseX; eraseX = 0; }
   if (eraseW <= 0) return;
-
   lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandDraw — [ISLAND-4] simpan Last* sebelum early return
-// ─────────────────────────────────────────────────────────────────────────────
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
-
   int iW, iH, iX;
   islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
-
-  // [ISLAND-4] Simpan Last* SEBELUM early return agar erase berikutnya presisi
   islandLastX = iX;
   islandLastY = iY;
   islandLastW = iW;
   islandLastH = iH;
-
-  if (iY + iH <= 0) return; // sepenuhnya di luar layar
-
+  if (iY + iH <= 0) return;
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
   lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
   lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
-  if (iH > 4 && iW > 4) {
+  if (iH > 4 && iW > 4)
     lcd.drawRoundRect(iX + 1, iY + 1, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
-  }
-
   int rowY = iY + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
     islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
-    if (i < n - 1) {
+    if (i < n - 1)
       lcd.drawFastHLine(iX + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
                         iW - ISLAND_PAD_H * 2, COL_GRAY_3);
-    }
     rowY += ISLAND_H_ROW + 2;
   }
-
   islandDrawnOnce = true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandHide
-// ─────────────────────────────────────────────────────────────────────────────
 static void islandHide() {
   islandState     = ISLAND_HIDDEN;
   islandCount     = 0;
@@ -475,82 +424,55 @@ void islandPush(NotifType type, const char* text) {
   strncpy(islandStack[0].text, text, sizeof(islandStack[0].text) - 1);
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
-
   islandShowAt    = millis();
   islandHideAt    = millis() + ISLAND_SHOW_MS;
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
-
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandTick — v5.7
-//
-//  [ISLAND-2] SLIDING_IN dan SLIDING_OUT tidak memanggil islandErase().
-//  Di viewfinder: islandNoClear=true → erase diskip otomatis.
-//  Di mode lain: erase dipanggil hanya di VISIBLE (redraw blink REC).
-//
-//  Pola:
-//    SLIDING_IN  : draw(offsetY) saja — tidak ada erase
-//    VISIBLE     : draw(0) hanya jika NOTIF_REC blink
-//    SLIDING_OUT : draw(offsetY) saja — tidak ada erase
-//    SLIDING_OUT terakhir: islandHide() langsung
-// ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
-
   switch (islandState) {
-    case ISLAND_HIDDEN:
-      break;
-
+    case ISLAND_HIDDEN: break;
     case ISLAND_SLIDING_IN: {
       unsigned long elapsed = now - islandAnimStart;
       int nItems = min(islandCount, ISLAND_MAX_STACK);
       int iW, iH, iX;
       islandCalcDims(nItems, iW, iH, iX);
-
       if (elapsed >= ISLAND_ANIM_MS) {
-        // [ISLAND-2] tidak ada islandErase() di sini
         islandDraw(0);
         islandState = ISLAND_VISIBLE;
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = 1.0f - pow(1.0f - progress, 3);
         int offsetY = (int)(-iH * (1.0f - progress));
-        // [ISLAND-2] tidak ada islandErase() di sini
         islandDraw(offsetY);
       }
       break;
     }
-
     case ISLAND_VISIBLE:
       if (now >= islandHideAt) {
         islandAnimStart = now;
         islandState = ISLAND_SLIDING_OUT;
       } else {
-        // Statis — hanya redraw kalau NOTIF_REC (dot blink)
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
-          islandErase(); // erase dulu (di non-viewfinder ini perlu)
+          islandErase();
           islandDraw(0);
         }
       }
       break;
-
     case ISLAND_SLIDING_OUT: {
       unsigned long elapsed = now - islandAnimStart;
       int nItems = min(islandCount, ISLAND_MAX_STACK);
       int iW, iH, iX;
       islandCalcDims(nItems, iW, iH, iX);
-
       if (elapsed >= ISLAND_ANIM_MS) {
-        // Island sudah di luar layar, langsung hide
         islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = pow(progress, 3);
         int offsetY = (int)(-iH * progress);
-        // [ISLAND-2] tidak ada islandErase() di sini
         islandDraw(offsetY);
       }
       break;
@@ -558,22 +480,19 @@ void islandTick() {
   }
 }
 
-// islandForceHide: paksa sembunyi saat mode switch
 void islandForceHide() {
-  islandNoClear = false; // reset dulu agar erase bisa jalan
-  if (islandState != ISLAND_HIDDEN && islandDrawnOnce) {
-    islandErase(); // [ISLAND-3] tanpa parameter
-  }
+  islandNoClear = false;
+  if (islandState != ISLAND_HIDDEN && islandDrawnOnce) islandErase();
   islandHide();
   islandFreezeUntilMs = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI — v5.6 (tidak berubah)
+//  STEGANOGRAFI (tidak berubah dari v5.7)
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
-#define STEGO_VERSION      "v5.7"
+#define STEGO_VERSION      "v5.8"
 
 void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
@@ -585,26 +504,17 @@ uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   if (!jpgIn || jpgLen < 4 || !outLen) return nullptr;
   if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
   if (!payload || payLen <= 0 || payLen > 500) return nullptr;
-
   int    comTotal = 4 + payLen;
   size_t newLen   = jpgLen + (size_t)comTotal;
-
   uint8_t* out = (uint8_t*)ps_malloc(newLen);
-  if (!out) {
-    out = (uint8_t*)malloc(newLen);
-    if (!out) return nullptr;
-  }
-
+  if (!out) { out = (uint8_t*)malloc(newLen); if (!out) return nullptr; }
   out[0] = 0xFF; out[1] = 0xD8;
   out[2] = 0xFF; out[3] = 0xFE;
-
   uint16_t comLen = (uint16_t)(2 + payLen);
   out[4] = (uint8_t)((comLen >> 8) & 0xFF);
   out[5] = (uint8_t)(comLen & 0xFF);
-
   memcpy(out + 6, payload, (size_t)payLen);
   memcpy(out + 6 + payLen, jpgIn + 2, jpgLen - 2);
-
   *outLen = newLen;
   return out;
 }
@@ -613,7 +523,6 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
                            char* outPayload, int maxLen) {
   if (!jpgBuf || jpgLen < 6 || !outPayload || maxLen < 2) return false;
   if (jpgBuf[0] != 0xFF || jpgBuf[1] != 0xD8) return false;
-
   size_t pos = 2;
   while (pos + 3 < jpgLen) {
     if (jpgBuf[pos] != 0xFF) break;
@@ -640,65 +549,9 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
   return false;
 }
 
-void stegoEmbedRGB565(uint16_t* buf, int w, int h,
-                      const char* payload, int payLen) {
-  if (!buf || !payload || payLen <= 0) return;
-  int totalPx = w * h;
-  if (payLen * 8 > totalPx) return;
-  for (int byteIdx = 0; byteIdx < payLen; byteIdx++) {
-    uint8_t ch = (uint8_t)payload[byteIdx];
-    for (int bit = 7; bit >= 0; bit--) {
-      int pixIdx = byteIdx * 8 + (7 - bit);
-      if (pixIdx >= totalPx) return;
-      uint16_t px = buf[pixIdx];
-      uint8_t  r5 = (px >> 11) & 0x1F;
-      r5 = (r5 & 0xFE) | ((ch >> bit) & 0x01);
-      buf[pixIdx] = (px & 0x07FF) | ((uint16_t)r5 << 11);
-    }
-  }
-}
-
-bool stegoExtractRGB565(uint16_t* buf, int w, int h,
-                        char* outPayload, int maxLen) {
-  if (!buf || !outPayload || maxLen <= 0) return false;
-  int totalPx = w * h;
-  int readLen = min(maxLen - 1, STEGO_PAYLOAD_LEN);
-  for (int byteIdx = 0; byteIdx < readLen; byteIdx++) {
-    uint8_t ch = 0;
-    for (int bit = 7; bit >= 0; bit--) {
-      int pixIdx = byteIdx * 8 + (7 - bit);
-      if (pixIdx >= totalPx) { outPayload[byteIdx] = '\0'; return false; }
-      ch |= ((buf[pixIdx] >> 11) & 0x01) << bit;
-    }
-    outPayload[byteIdx] = (char)ch;
-    if (ch == '\0') break;
-  }
-  outPayload[maxLen - 1] = '\0';
-  return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
-//  EXIF INJECT — v5.7
-//
-//  Inject APP1 EXIF marker ke JPEG hasil capture.
-//  Implementasi manual, pure byte array, tanpa library eksternal.
-//  Format: TIFF little-endian, IFD0 + ExifIFD pointer.
-//
-//  Tags yang diinject:
-//    IFD0:
-//      0x010E  ImageDescription  = "photo_NNNN"
-//      0x010F  Make              = "SANZXCAM"
-//      0x0110  Model             = sensorName
-//      0x0131  Software          = "v5.7"
-//      0x8769  ExifIFDPointer    = offset ke ExifIFD
-//    ExifIFD:
-//      0x9000  ExifVersion       = "0220" (4 bytes, type UNDEFINED)
-//      0x9003  DateTimeOriginal  = "YYYY:MM:DD HH:MM:SS" (millis-based)
-//
-//  Dipanggil setelah stegoEmbedToJpeg, hasilnya adalah JPEG final.
+//  EXIF INJECT (tidak berubah dari v5.7, hanya versi string diupdate)
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Helper tulis little-endian
 static inline void exifL16(uint8_t* b, uint16_t v) {
   b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
 }
@@ -707,8 +560,6 @@ static inline void exifL32(uint8_t* b, uint32_t v) {
   b[2] = (v >> 16) & 0xFF; b[3] = (v >> 24) & 0xFF;
 }
 
-// Tulis satu IFD entry (12 byte)
-// tag, type, count, val_or_offset (semua little-endian)
 static void exifEntry(uint8_t* b, uint16_t tag, uint16_t type,
                       uint32_t count, uint32_t valOrOff) {
   exifL16(b + 0, tag);
@@ -717,166 +568,266 @@ static void exifEntry(uint8_t* b, uint16_t tag, uint16_t type,
   exifL32(b + 8, valOrOff);
 }
 
-// Buat string timestamp dari millis (format EXIF: "YYYY:MM:DD HH:MM:SS")
-// Karena tidak ada RTC, pakai millis() sebagai detik relatif sejak boot
 static void exifMakeTimestamp(char* buf, size_t bufLen) {
   unsigned long totalSec = millis() / 1000;
   unsigned long sec  = totalSec % 60;
   unsigned long min  = (totalSec / 60) % 60;
   unsigned long hour = (totalSec / 3600) % 24;
-  // Tanggal placeholder — tidak ada RTC
   snprintf(buf, bufLen, "2025:01:01 %02lu:%02lu:%02lu", hour, min, sec);
 }
 
-// exifInjectToJpeg
-// Input : jpgIn/jpgLen = JPEG yang sudah berisi stego COM marker
-// Output: JPEG baru dengan APP1 EXIF disisipkan setelah SOI (0xFFD8)
-//         sebelum COM marker
-// Caller wajib free() hasilnya
 uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
                            int photoNum, const char* sensorStr,
                            size_t* outLen) {
   if (!jpgIn || jpgLen < 4 || !outLen) return nullptr;
   if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
-
-  // ── String data untuk IFD ──────────────────────────────────────────────
   char strDesc[16], strMake[12], strModel[12], strSoftware[8], strDt[24];
   snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
   snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
   snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
-  snprintf(strSoftware, sizeof(strSoftware), "v5.7");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.8");
   exifMakeTimestamp(strDt, sizeof(strDt));
-
-  // Panjang string termasuk null terminator
   int lenDesc     = (int)strlen(strDesc)     + 1;
   int lenMake     = (int)strlen(strMake)     + 1;
   int lenModel    = (int)strlen(strModel)    + 1;
   int lenSoftware = (int)strlen(strSoftware) + 1;
-  int lenDt       = 20; // EXIF DateTime selalu 20 char termasuk \0
-
-  // ── Layout TIFF ────────────────────────────────────────────────────────
-  // Semua offset dihitung dari awal header TIFF (setelah "Exif\0\0")
-  //
-  // Offset  0 :  TIFF header (8 byte): "II", 0x002A, offset IFD0 = 8
-  // Offset  8 :  IFD0 — 5 entry × 12 byte = 60 byte + 2 byte count + 4 byte next IFD
-  //              Total IFD0 = 2 + 60 + 4 = 66 byte
-  //              IFD0 selesai di offset 8 + 66 = 74
-  // Offset 74 :  ExifIFD — 2 entry × 12 byte = 24 byte + 2 + 4 = 30 byte
-  //              ExifIFD selesai di offset 74 + 30 = 104
-  // Offset 104:  Data area (string data)
-
-  const uint32_t offTiff      = 0;    // relatif ke awal TIFF
-  const uint32_t offIFD0      = 8;
-  const int      nIFD0        = 5;    // Make, Model, Software, ImageDesc, ExifIFDPtr
-  const uint32_t offExifIFD   = offIFD0 + 2 + nIFD0 * 12 + 4; // = 74
-  const int      nExifIFD     = 2;    // ExifVersion, DateTimeOriginal
-  const uint32_t offDataArea  = offExifIFD + 2 + nExifIFD * 12 + 4; // = 104
-
-  // Offset masing-masing string di data area (relatif ke awal TIFF)
+  int lenDt       = 20;
+  const uint32_t offIFD0     = 8;
+  const int      nIFD0       = 5;
+  const uint32_t offExifIFD  = offIFD0 + 2 + nIFD0 * 12 + 4;
+  const int      nExifIFD    = 2;
+  const uint32_t offDataArea = offExifIFD + 2 + nExifIFD * 12 + 4;
   uint32_t offDesc     = offDataArea;
   uint32_t offMake     = offDesc     + (uint32_t)lenDesc;
   uint32_t offModel    = offMake     + (uint32_t)lenMake;
   uint32_t offSoftware = offModel    + (uint32_t)lenModel;
   uint32_t offDt       = offSoftware + (uint32_t)lenSoftware;
-
-  uint32_t tiffSize = offDt + (uint32_t)lenDt;
-
-  // ── Ukuran APP1 ────────────────────────────────────────────────────────
-  // APP1 = marker(2) + length(2) + "Exif\0\0"(6) + TIFF data
-  uint32_t app1DataSize = 6 + tiffSize; // "Exif\0\0" + tiff
-  uint16_t app1Len = (uint16_t)(2 + app1DataSize); // length field termasuk dirinya sendiri
-
+  uint32_t tiffSize    = offDt + (uint32_t)lenDt;
+  uint32_t app1DataSize = 6 + tiffSize;
+  uint16_t app1Len      = (uint16_t)(2 + app1DataSize);
   size_t totalSize = 2 + 2 + 2 + app1DataSize + (jpgLen - 2);
-  // SOI(2) + APP1marker(2) + APP1len(2) + APP1data + sisa JPEG setelah SOI
-
   uint8_t* out = (uint8_t*)ps_malloc(totalSize);
-  if (!out) {
-    out = (uint8_t*)malloc(totalSize);
-    if (!out) {
-      Serial.printf("[EXIF] alokasi %u byte gagal\n", (unsigned)totalSize);
-      return nullptr;
-    }
-  }
-
+  if (!out) { out = (uint8_t*)malloc(totalSize); if (!out) return nullptr; }
   size_t pos = 0;
-
-  // SOI
   out[pos++] = 0xFF; out[pos++] = 0xD8;
-
-  // APP1 marker
   out[pos++] = 0xFF; out[pos++] = 0xE1;
-
-  // APP1 length (big-endian)
   out[pos++] = (app1Len >> 8) & 0xFF;
   out[pos++] = app1Len & 0xFF;
-
-  // "Exif\0\0"
   out[pos++] = 'E'; out[pos++] = 'x'; out[pos++] = 'i'; out[pos++] = 'f';
   out[pos++] = 0x00; out[pos++] = 0x00;
-
-  // ── TIFF header (little-endian) ────────────────────────────────────────
-  uint8_t* tiff = out + pos; // pointer ke awal TIFF untuk kemudahan offset
-  size_t   tp   = 0;         // posisi relatif dalam TIFF
-
-  // Byte order: "II" = little endian
+  uint8_t* tiff = out + pos;
+  size_t   tp   = 0;
   tiff[tp++] = 'I'; tiff[tp++] = 'I';
-  // Magic: 0x002A
   tiff[tp++] = 0x2A; tiff[tp++] = 0x00;
-  // Offset IFD0 (dari awal TIFF) = 8
   exifL32(tiff + tp, offIFD0); tp += 4;
-
-  // ── IFD0 ──────────────────────────────────────────────────────────────
-  // Entry count
   exifL16(tiff + tp, (uint16_t)nIFD0); tp += 2;
-
-  // Tag 0x010E ImageDescription (type=2=ASCII)
-  exifEntry(tiff + tp, 0x010E, 2, (uint32_t)lenDesc, offDesc);     tp += 12;
-  // Tag 0x010F Make
-  exifEntry(tiff + tp, 0x010F, 2, (uint32_t)lenMake, offMake);     tp += 12;
-  // Tag 0x0110 Model
-  exifEntry(tiff + tp, 0x0110, 2, (uint32_t)lenModel, offModel);   tp += 12;
-  // Tag 0x0131 Software
+  exifEntry(tiff + tp, 0x010E, 2, (uint32_t)lenDesc, offDesc);         tp += 12;
+  exifEntry(tiff + tp, 0x010F, 2, (uint32_t)lenMake, offMake);         tp += 12;
+  exifEntry(tiff + tp, 0x0110, 2, (uint32_t)lenModel, offModel);       tp += 12;
   exifEntry(tiff + tp, 0x0131, 2, (uint32_t)lenSoftware, offSoftware); tp += 12;
-  // Tag 0x8769 ExifIFD pointer (type=4=LONG)
-  exifEntry(tiff + tp, 0x8769, 4, 1, offExifIFD);                  tp += 12;
-
-  // Next IFD offset = 0 (tidak ada IFD1)
+  exifEntry(tiff + tp, 0x8769, 4, 1, offExifIFD);                      tp += 12;
   exifL32(tiff + tp, 0); tp += 4;
-
-  // ── ExifIFD ───────────────────────────────────────────────────────────
   exifL16(tiff + tp, (uint16_t)nExifIFD); tp += 2;
-
-  // Tag 0x9000 ExifVersion (type=7=UNDEFINED, count=4, value inline "0220")
-  exifEntry(tiff + tp, 0x9000, 7, 4, 0x30323230); tp += 12; // "0220" as LE uint32
-
-  // Tag 0x9003 DateTimeOriginal (type=2=ASCII, count=20)
+  exifEntry(tiff + tp, 0x9000, 7, 4, 0x30323230); tp += 12;
   exifEntry(tiff + tp, 0x9003, 2, (uint32_t)lenDt, offDt); tp += 12;
-
-  // Next IFD = 0
   exifL32(tiff + tp, 0); tp += 4;
-
-  // ── Data area ─────────────────────────────────────────────────────────
-  // tp sekarang = offDataArea
   memcpy(tiff + tp, strDesc,     (size_t)lenDesc);     tp += lenDesc;
   memcpy(tiff + tp, strMake,     (size_t)lenMake);     tp += lenMake;
   memcpy(tiff + tp, strModel,    (size_t)lenModel);    tp += lenModel;
   memcpy(tiff + tp, strSoftware, (size_t)lenSoftware); tp += lenSoftware;
-  // DateTime: pad/truncate ke 20 char
   memset(tiff + tp, 0, (size_t)lenDt);
   memcpy(tiff + tp, strDt, min((int)strlen(strDt), lenDt - 1));
   tp += lenDt;
-
-  pos += tp; // maju pos sebesar TIFF yang sudah ditulis
-
-  // Sisa JPEG setelah SOI (skip 2 byte SOI asli)
+  pos += tp;
   memcpy(out + pos, jpgIn + 2, jpgLen - 2);
   pos += jpgLen - 2;
-
   *outLen = pos;
-
-  Serial.printf("[EXIF] inject OK: photo_%04d sensor=%s dt=%s app1=%u totalJpeg=%u\n",
-                photoNum, strModel, strDt, (unsigned)app1Len, (unsigned)pos);
   return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BMP SAVE — v5.8 (GC2145 RGB565 → BMP24)
+//
+//  Format BMP:
+//    - File header 14 byte
+//    - DIB header (BITMAPINFOHEADER) 40 byte
+//    - Pixel data RGB888, bottom-up, row padded ke kelipatan 4 byte
+//
+//  Konversi RGB565 → RGB888:
+//    R = (px >> 11 & 0x1F) << 3   (5 bit → 8 bit)
+//    G = (px >>  5 & 0x3F) << 2   (6 bit → 8 bit)
+//    B = (px       & 0x1F) << 3   (5 bit → 8 bit)
+//  BMP simpan BGR (bukan RGB).
+// ─────────────────────────────────────────────────────────────────────────────
+bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path) {
+  FILE* f = fopen(path, "wb");
+  if (!f) return false;
+
+  // Row size harus kelipatan 4 byte (RGB888 = 3 byte/px)
+  int rowSize  = ((w * 3 + 3) / 4) * 4;
+  int dataSize = rowSize * h;
+  int fileSize = 54 + dataSize;
+
+  // ── BMP File Header (14 byte) ─────────────────────────────────────────
+  uint8_t hdr[54];
+  memset(hdr, 0, sizeof(hdr));
+
+  hdr[0] = 'B'; hdr[1] = 'M';
+
+  // File size LE
+  hdr[2] = fileSize & 0xFF;
+  hdr[3] = (fileSize >> 8)  & 0xFF;
+  hdr[4] = (fileSize >> 16) & 0xFF;
+  hdr[5] = (fileSize >> 24) & 0xFF;
+
+  // Pixel data offset = 54
+  hdr[10] = 54;
+
+  // ── DIB Header BITMAPINFOHEADER (40 byte, mulai offset 14) ───────────
+  // Header size = 40
+  hdr[14] = 40;
+
+  // Width LE
+  hdr[18] = w & 0xFF;
+  hdr[19] = (w >> 8) & 0xFF;
+  hdr[20] = (w >> 16) & 0xFF;
+  hdr[21] = (w >> 24) & 0xFF;
+
+  // Height LE (positif = bottom-up, standar BMP)
+  hdr[22] = h & 0xFF;
+  hdr[23] = (h >> 8) & 0xFF;
+  hdr[24] = (h >> 16) & 0xFF;
+  hdr[25] = (h >> 24) & 0xFF;
+
+  // Color planes = 1
+  hdr[26] = 1;
+
+  // Bits per pixel = 24
+  hdr[28] = 24;
+
+  // Compression = 0 (BI_RGB)
+  // hdr[30..33] sudah 0
+
+  // Image data size
+  hdr[34] = dataSize & 0xFF;
+  hdr[35] = (dataSize >> 8)  & 0xFF;
+  hdr[36] = (dataSize >> 16) & 0xFF;
+  hdr[37] = (dataSize >> 24) & 0xFF;
+
+  // Pixels per meter X/Y = 2835 (~72 dpi)
+  hdr[38] = 0x13; hdr[39] = 0x0B;
+  hdr[42] = 0x13; hdr[43] = 0x0B;
+
+  fwrite(hdr, 1, 54, f);
+
+  // ── Pixel Data — bottom-up (baris terakhir gambar ditulis pertama) ────
+  // Maksimum DISP_W=320, rowSize = 320*3+2=962, bulatkan ke 964
+  static uint8_t rowBuf[320 * 3 + 4];
+
+  for (int y = h - 1; y >= 0; y--) {
+    memset(rowBuf, 0, rowSize);
+    const uint16_t* srcRow = (const uint16_t*)rgb565Buf + (size_t)y * w;
+    for (int x = 0; x < w; x++) {
+      uint16_t px = srcRow[x];
+      uint8_t r = ((px >> 11) & 0x1F) << 3;
+      uint8_t g = ((px >>  5) & 0x3F) << 2;
+      uint8_t b = ( px        & 0x1F) << 3;
+      // BMP: BGR
+      rowBuf[x * 3 + 0] = b;
+      rowBuf[x * 3 + 1] = g;
+      rowBuf[x * 3 + 2] = r;
+    }
+    fwrite(rowBuf, 1, rowSize, f);
+    if (y % 30 == 0) esp_task_wdt_reset();
+  }
+
+  fclose(f);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BMP LOAD — v5.8
+//
+//  Baca file BMP ke buffer RGB565 untuk ditampilkan via lcd.pushImage().
+//  Mendukung BMP24 (paling umum). BMP32/16 tidak didukung.
+//  Output: buffer RGB565 di PSRAM, caller wajib free().
+// ─────────────────────────────────────────────────────────────────────────────
+uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return nullptr;
+
+  uint8_t hdr[54];
+  if (fread(hdr, 1, 54, f) != 54) { fclose(f); return nullptr; }
+
+  // Signature
+  if (hdr[0] != 'B' || hdr[1] != 'M') { fclose(f); return nullptr; }
+
+  // Pixel data offset
+  uint32_t dataOffset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8)
+                      | ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
+
+  // Width & Height
+  int32_t bmpW = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19] << 8)
+                          | ((uint32_t)hdr[20] << 16) | ((uint32_t)hdr[21] << 24));
+  int32_t bmpH = (int32_t)((uint32_t)hdr[22] | ((uint32_t)hdr[23] << 8)
+                          | ((uint32_t)hdr[24] << 16) | ((uint32_t)hdr[25] << 24));
+
+  // BMP height negatif = top-down
+  bool topDown = false;
+  if (bmpH < 0) { topDown = true; bmpH = -bmpH; }
+
+  uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
+  if (bpp != 24) {
+    Serial.printf("[BMP] bpp=%d tidak didukung (hanya 24)\n", bpp);
+    fclose(f); return nullptr;
+  }
+
+  if (bmpW <= 0 || bmpH <= 0 || bmpW > 4096 || bmpH > 4096) {
+    fclose(f); return nullptr;
+  }
+
+  // Alokasi buffer RGB565
+  size_t pixCount = (size_t)bmpW * (size_t)bmpH;
+  uint16_t* buf = (uint16_t*)ps_malloc(pixCount * sizeof(uint16_t));
+  if (!buf) { buf = (uint16_t*)malloc(pixCount * sizeof(uint16_t)); }
+  if (!buf) { fclose(f); return nullptr; }
+
+  // Row size BMP = kelipatan 4 byte
+  int rowSize = ((bmpW * 3 + 3) / 4) * 4;
+  uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
+  if (!rowBuf) { free(buf); fclose(f); return nullptr; }
+
+  fseek(f, (long)dataOffset, SEEK_SET);
+
+  for (int row = 0; row < bmpH; row++) {
+    if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize) {
+      // File pendek, isi sisa dengan hitam
+      memset(rowBuf, 0, rowSize);
+    }
+
+    // BMP bottom-up: row 0 di file = baris bawah gambar
+    int destRow = topDown ? row : (bmpH - 1 - row);
+    uint16_t* destLine = buf + (size_t)destRow * bmpW;
+
+    for (int x = 0; x < bmpW; x++) {
+      uint8_t b = rowBuf[x * 3 + 0];
+      uint8_t g = rowBuf[x * 3 + 1];
+      uint8_t r = rowBuf[x * 3 + 2];
+      // RGB888 → RGB565
+      destLine[x] = ((uint16_t)(r & 0xF8) << 8)
+                  | ((uint16_t)(g & 0xFC) << 3)
+                  | ((uint16_t)(b >> 3));
+    }
+
+    if (row % 30 == 0) esp_task_wdt_reset();
+  }
+
+  free(rowBuf);
+  fclose(f);
+
+  *outW = (uint16_t)bmpW;
+  *outH = (uint16_t)bmpH;
+  return buf;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -884,17 +835,31 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
 // ─────────────────────────────────────────────────────────────────────────────
 bool ledFlashEnabled = false;
 
+// ── Gallery file type ─────────────────────────────────────────────────────────
+// v5.8: ganti bool galleryIsVideo[] → GalleryFileType[]
+enum GalleryFileType : uint8_t {
+  GFILE_JPG   = 0,
+  GFILE_BMP   = 1,
+  GFILE_VIDEO = 2,
+};
+
 #define GALLERY_MAX_FILES  1000
 #define GALLERY_ITEMS_PAGE    8
 #define GALLERY_ITEM_H       26
 
-char (*galleryFiles)[32] = nullptr;
-bool* galleryIsVideo      = nullptr;
+char             (*galleryFiles)[32] = nullptr;
+GalleryFileType*   galleryFileType   = nullptr;
 int   galleryCount  = 0;
 int   galleryScroll = 0;
 int   gallerySelIdx = 0;
 char  photoViewPath[48];
 int   photoViewIndex = 0;
+
+// Helper inline
+inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
+inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
+inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
+inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
 
 unsigned long galleryHoldStart = 0;
 unsigned long galleryLastStep  = 0;
@@ -968,7 +933,7 @@ float         fpsValue      = 0.0f;
 #define PILL_PAD_X   5
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  MJPEG Player state
+//  MJPEG Player state (tidak berubah)
 // ─────────────────────────────────────────────────────────────────────────────
 #define MJPEG_BUF_SIZE   (150 * 1024)
 #define MJPEG_FRAME_RATE  15
@@ -1124,15 +1089,23 @@ void unmountVFSOnly() {
   ff_diskio_register_sdmmc(0,NULL);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  scanPhotoCount — v5.8: hitung .jpg dan .bmp
+// ─────────────────────────────────────────────────────────────────────────────
 void scanPhotoCount() {
-  photoCount=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
+  photoCount = 0;
+  DIR* dir = opendir("/sdcard");
+  if (!dir) return;
   struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr) {
-    String name=entry->d_name;
-    if(name.startsWith("photo_")&&name.endsWith(".jpg")) {
-      int num=name.substring(6,name.length()-4).toInt();
-      if(num>photoCount) photoCount=num;
+  while ((entry = readdir(dir)) != nullptr) {
+    String name = entry->d_name;
+    bool isJpg = name.startsWith("photo_") && name.endsWith(".jpg");
+    bool isBmp = name.startsWith("photo_") && name.endsWith(".bmp");
+    if (isJpg || isBmp) {
+      // Ambil nomor dari nama file: photo_NNNN.ext → NNNN
+      int extLen = isJpg ? 4 : 4; // ".jpg" dan ".bmp" sama-sama 4 karakter
+      int num = name.substring(6, name.length() - extLen).toInt();
+      if (num > photoCount) photoCount = num;
     }
   }
   closedir(dir);
@@ -1153,184 +1126,258 @@ void scanVideoCount() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery
+//  Gallery — v5.8: deteksi JPG / BMP / VIDEO
 // ─────────────────────────────────────────────────────────────────────────────
 void scanGalleryFiles() {
-  galleryCount=0; galleryScroll=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
+  galleryCount = 0; galleryScroll = 0;
+  DIR* dir = opendir("/sdcard");
+  if (!dir) return;
   struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr&&galleryCount<GALLERY_MAX_FILES) {
-    String name=entry->d_name;
-    bool isJpg  =name.endsWith(".jpg")||name.endsWith(".JPG");
-    bool isMjpeg=name.endsWith(".mjpeg")||name.endsWith(".MJPEG");
-    if(isJpg||isMjpeg) {
-      strncpy(galleryFiles[galleryCount],entry->d_name,31);
-      galleryFiles[galleryCount][31]='\0';
-      galleryIsVideo[galleryCount]=isMjpeg;
+  while ((entry = readdir(dir)) != nullptr && galleryCount < GALLERY_MAX_FILES) {
+    String name = entry->d_name;
+    bool isJpg   = name.endsWith(".jpg")   || name.endsWith(".JPG");
+    bool isBmp   = name.endsWith(".bmp")   || name.endsWith(".BMP");
+    bool isMjpeg = name.endsWith(".mjpeg") || name.endsWith(".MJPEG");
+    if (isJpg || isBmp || isMjpeg) {
+      strncpy(galleryFiles[galleryCount], entry->d_name, 31);
+      galleryFiles[galleryCount][31] = '\0';
+      if (isMjpeg)      galleryFileType[galleryCount] = GFILE_VIDEO;
+      else if (isBmp)   galleryFileType[galleryCount] = GFILE_BMP;
+      else              galleryFileType[galleryCount] = GFILE_JPG;
       galleryCount++;
     }
   }
   closedir(dir);
-  for(int i=0;i<galleryCount-1;i++) {
-    for(int j=0;j<galleryCount-i-1;j++) {
-      if(strcmp(galleryFiles[j],galleryFiles[j+1])>0) {
+
+  // Urutkan nama file ascending (bubble sort)
+  for (int i = 0; i < galleryCount - 1; i++) {
+    for (int j = 0; j < galleryCount - i - 1; j++) {
+      if (strcmp(galleryFiles[j], galleryFiles[j+1]) > 0) {
         char tmp[32];
-        strncpy(tmp,galleryFiles[j],31);
-        strncpy(galleryFiles[j],galleryFiles[j+1],31);
-        strncpy(galleryFiles[j+1],tmp,31);
-        bool bTmp=galleryIsVideo[j];
-        galleryIsVideo[j]=galleryIsVideo[j+1];
-        galleryIsVideo[j+1]=bTmp;
+        strncpy(tmp, galleryFiles[j], 31);
+        strncpy(galleryFiles[j], galleryFiles[j+1], 31);
+        strncpy(galleryFiles[j+1], tmp, 31);
+        GalleryFileType tTmp = galleryFileType[j];
+        galleryFileType[j]   = galleryFileType[j+1];
+        galleryFileType[j+1] = tTmp;
       }
     }
     esp_task_wdt_reset();
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  drawGallery — v5.8: ikon tipe file berbeda
+// ─────────────────────────────────────────────────────────────────────────────
 void drawGallery() {
   lcd.fillScreen(COL_BLACK);
-  lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
-  lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
+  lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
+  lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-  char hdr[32]; snprintf(hdr,sizeof(hdr),"GALLERY  %d item",galleryCount);
-  lcd.drawString(hdr,(DISP_W-lcd.textWidth(hdr))/2,6);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK",DISP_W-46,6);
+  char hdr[32];
+  snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
+  lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("B=BACK", DISP_W - 46, 6);
 
-  if(galleryCount==0) {
+  if (galleryCount == 0) {
     lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("SD kosong / tidak ada file",(DISP_W-lcd.textWidth("SD kosong / tidak ada file"))/2,DISP_H/2);
+    const char* msg = "SD kosong / tidak ada file";
+    lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, DISP_H / 2);
     return;
   }
 
-  int visibleEnd=min(galleryScroll+GALLERY_ITEMS_PAGE,galleryCount);
-  for(int i=galleryScroll;i<visibleEnd;i++) {
-    int rowY=24+(i-galleryScroll)*GALLERY_ITEM_H;
-    uint16_t rowBg=(i%2==0)?COL_GRAY_D:COL_BLACK;
-    lcd.fillRect(0,rowY,DISP_W,GALLERY_ITEM_H-1,rowBg);
-    lcd.drawFastHLine(0,rowY+GALLERY_ITEM_H-1,DISP_W,COL_GRAY_2);
+  int visibleEnd = min(galleryScroll + GALLERY_ITEMS_PAGE, galleryCount);
+  for (int i = galleryScroll; i < visibleEnd; i++) {
+    int rowY = 24 + (i - galleryScroll) * GALLERY_ITEM_H;
+    uint16_t rowBg = (i % 2 == 0) ? COL_GRAY_D : COL_BLACK;
+    lcd.fillRect(0, rowY, DISP_W, GALLERY_ITEM_H - 1, rowBg);
+    lcd.drawFastHLine(0, rowY + GALLERY_ITEM_H - 1, DISP_W, COL_GRAY_2);
+
+    // Nomor urut
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    char num[6]; snprintf(num,sizeof(num),"%3d",i+1);
-    lcd.drawString(num,6,rowY+8);
-    if(galleryIsVideo[i]) { lcd.setTextColor(COL_GRAY_7); lcd.drawString("\x10",26,rowY+8); }
-    else { lcd.drawRect(26,rowY+6,7,7,COL_GRAY_5); }
-    lcd.setTextColor(galleryIsVideo[i]?COL_GRAY_A:COL_GRAY_C);
-    lcd.drawString(galleryFiles[i],36,rowY+8);
-    lcd.setTextColor(COL_GRAY_3); lcd.drawString(">",DISP_W-12,rowY+8);
+    char num[6]; snprintf(num, sizeof(num), "%3d", i + 1);
+    lcd.drawString(num, 6, rowY + 8);
+
+    // Ikon tipe file
+    GalleryFileType ft = galleryFileType[i];
+    if (ft == GFILE_VIDEO) {
+      // Segitiga play — video
+      lcd.setTextColor(COL_VID_ACCENT);
+      lcd.drawString("\x10", 26, rowY + 8);  // karakter play
+    } else if (ft == GFILE_BMP) {
+      // Kotak kecil dengan "B" — BMP
+      lcd.drawRect(26, rowY + 5, 9, 9, COL_BMP_ACCENT);
+      lcd.setTextColor(COL_BMP_ACCENT);
+      lcd.drawString("B", 28, rowY + 6);
+    } else {
+      // Kotak kosong — JPG
+      lcd.drawRect(26, rowY + 6, 7, 7, COL_GRAY_5);
+    }
+
+    // Nama file + warna per tipe
+    uint16_t nameCol;
+    if      (ft == GFILE_VIDEO) nameCol = COL_GRAY_A;
+    else if (ft == GFILE_BMP)   nameCol = COL_GRAY_C;
+    else                         nameCol = COL_GRAY_C;
+    lcd.setTextColor(nameCol);
+    lcd.drawString(galleryFiles[i], 38, rowY + 8);
+
+    // Label tipe di kanan
+    lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+    const char* typeLabel = (ft == GFILE_VIDEO) ? "VID" :
+                            (ft == GFILE_BMP)   ? "BMP" : "JPG";
+    uint16_t typeCol = (ft == GFILE_VIDEO) ? COL_VID_ACCENT :
+                       (ft == GFILE_BMP)   ? COL_BMP_ACCENT : COL_JPG_ACCENT;
+    lcd.setTextColor(typeCol);
+    lcd.drawString(typeLabel, DISP_W - 28, rowY + 8);
   }
 
-  int selY=24+(gallerySelIdx-galleryScroll)*GALLERY_ITEM_H;
-  lcd.drawRect(0,selY,DISP_W-4,GALLERY_ITEM_H-1,COL_GRAY_5);
+  // Highlight seleksi
+  int selY = 24 + (gallerySelIdx - galleryScroll) * GALLERY_ITEM_H;
+  lcd.drawRect(0, selY, DISP_W - 4, GALLERY_ITEM_H - 1, COL_GRAY_5);
 
-  if(galleryCount>GALLERY_ITEMS_PAGE) {
-    int barH=DISP_H-22;
-    int indH=max(10,barH*GALLERY_ITEMS_PAGE/galleryCount);
-    int indY=22+(barH-indH)*galleryScroll/max(1,galleryCount-GALLERY_ITEMS_PAGE);
-    lcd.fillRect(DISP_W-4,22,4,barH,COL_GRAY_2);
-    lcd.fillRect(DISP_W-4,indY,4,indH,COL_GRAY_7);
+  // Scrollbar
+  if (galleryCount > GALLERY_ITEMS_PAGE) {
+    int barH  = DISP_H - 22;
+    int indH  = max(10, barH * GALLERY_ITEMS_PAGE / galleryCount);
+    int indY  = 22 + (barH - indH) * galleryScroll / max(1, galleryCount - GALLERY_ITEMS_PAGE);
+    lcd.fillRect(DISP_W - 4, 22, 4, barH, COL_GRAY_2);
+    lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
   }
 }
 
 void galleryUpdateHighlight(int oldSel, int newSel) {
-  int oldRow=oldSel-galleryScroll;
-  if(oldRow>=0&&oldRow<GALLERY_ITEMS_PAGE) {
-    int y=24+oldRow*GALLERY_ITEM_H;
-    lcd.drawRect(0,y,DISP_W-4,GALLERY_ITEM_H-1,(oldSel%2==0)?COL_GRAY_D:COL_BLACK);
+  int oldRow = oldSel - galleryScroll;
+  if (oldRow >= 0 && oldRow < GALLERY_ITEMS_PAGE) {
+    int y = 24 + oldRow * GALLERY_ITEM_H;
+    lcd.drawRect(0, y, DISP_W - 4, GALLERY_ITEM_H - 1,
+                 (oldSel % 2 == 0) ? COL_GRAY_D : COL_BLACK);
   }
-  int newRow=newSel-galleryScroll;
-  if(newRow>=0&&newRow<GALLERY_ITEMS_PAGE) {
-    int y=24+newRow*GALLERY_ITEM_H;
-    lcd.drawRect(0,y,DISP_W-4,GALLERY_ITEM_H-1,COL_GRAY_5);
+  int newRow = newSel - galleryScroll;
+  if (newRow >= 0 && newRow < GALLERY_ITEMS_PAGE) {
+    int y = 24 + newRow * GALLERY_ITEM_H;
+    lcd.drawRect(0, y, DISP_W - 4, GALLERY_ITEM_H - 1, COL_GRAY_5);
   }
 }
 
 void galleryStep(int delta) {
-  if(galleryCount<=0) return;
-  int oldSel=gallerySelIdx;
-  gallerySelIdx=(gallerySelIdx+delta%galleryCount+galleryCount)%galleryCount;
-  if(gallerySelIdx==oldSel) return;
-  bool needRedraw=false;
-  if(gallerySelIdx<galleryScroll) { galleryScroll=gallerySelIdx; needRedraw=true; }
-  else if(gallerySelIdx>=galleryScroll+GALLERY_ITEMS_PAGE) { galleryScroll=gallerySelIdx-GALLERY_ITEMS_PAGE+1; needRedraw=true; }
-  if(needRedraw) drawGallery();
-  else           galleryUpdateHighlight(oldSel,gallerySelIdx);
+  if (galleryCount <= 0) return;
+  int oldSel = gallerySelIdx;
+  gallerySelIdx = (gallerySelIdx + delta % galleryCount + galleryCount) % galleryCount;
+  if (gallerySelIdx == oldSel) return;
+  bool needRedraw = false;
+  if (gallerySelIdx < galleryScroll) {
+    galleryScroll = gallerySelIdx; needRedraw = true;
+  } else if (gallerySelIdx >= galleryScroll + GALLERY_ITEMS_PAGE) {
+    galleryScroll = gallerySelIdx - GALLERY_ITEMS_PAGE + 1; needRedraw = true;
+  }
+  if (needRedraw) drawGallery();
+  else            galleryUpdateHighlight(oldSel, gallerySelIdx);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Photo pixel buffer
+//  Photo pixel buffer — v5.8: branch BMP
 // ─────────────────────────────────────────────────────────────────────────────
 bool photoLoadPixelBuf(int idx) {
-  if(idx<0||idx>=galleryCount||galleryIsVideo[idx]) return false;
-  if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-  photoBufW=0; photoBufH=0;
-  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
-  FILE* f=fopen(path,"rb"); if(!f) return false;
-  fseek(f,0,SEEK_END); size_t fsize=ftell(f); fseek(f,0,SEEK_SET);
-  uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize);
-  if(!jpgBuf) { fclose(f); return false; }
-  fread(jpgBuf,1,fsize,f); fclose(f);
-  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
-  uint16_t iw=0,ih=0;
-  TJpgDec.getJpgSize(&iw,&ih,jpgBuf,fsize);
-  if(iw==0||ih==0) { free(jpgBuf); return false; }
-  uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t));
-  if(!buf) { free(jpgBuf); return false; }
-  memset(buf,0,(size_t)iw*ih*sizeof(uint16_t));
-  _decodeTargetBuf=buf; _decodeTargetW=iw;
-  TJpgDec.drawJpg(0,0,jpgBuf,fsize);
-  _decodeTargetBuf=nullptr;
-  free(jpgBuf);
-  photoPixelBuf=buf; photoBufW=iw; photoBufH=ih;
-  return true;
+  if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return false;
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
+  photoBufW = 0; photoBufH = 0;
+
+  char path[56];
+  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
+
+  if (gIsBmp(idx)) {
+    // ── BMP: baca langsung tanpa library ────────────────────────────────
+    uint16_t bw = 0, bh = 0;
+    uint16_t* buf = loadBMP(path, &bw, &bh);
+    if (!buf || bw == 0 || bh == 0) return false;
+    photoPixelBuf = buf;
+    photoBufW = bw;
+    photoBufH = bh;
+    return true;
+
+  } else {
+    // ── JPG: decode via TJpgDec ─────────────────────────────────────────
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END); size_t fsize = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t* jpgBuf = (uint8_t*)ps_malloc(fsize);
+    if (!jpgBuf) { fclose(f); return false; }
+    fread(jpgBuf, 1, fsize, f); fclose(f);
+    TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
+    uint16_t iw = 0, ih = 0;
+    TJpgDec.getJpgSize(&iw, &ih, jpgBuf, fsize);
+    if (iw == 0 || ih == 0) { free(jpgBuf); return false; }
+    uint16_t* buf = (uint16_t*)ps_malloc((size_t)iw * ih * sizeof(uint16_t));
+    if (!buf) { free(jpgBuf); return false; }
+    memset(buf, 0, (size_t)iw * ih * sizeof(uint16_t));
+    _decodeTargetBuf = buf; _decodeTargetW = iw;
+    TJpgDec.drawJpg(0, 0, jpgBuf, fsize);
+    _decodeTargetBuf = nullptr;
+    free(jpgBuf);
+    photoPixelBuf = buf; photoBufW = iw; photoBufH = ih;
+    return true;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo View
 // ─────────────────────────────────────────────────────────────────────────────
 void photoViewRender() {
-  if(!photoPixelBuf) return;
-  float zf=photoZoomFactors[photoZoomLevel];
+  if (!photoPixelBuf) return;
+  float zf = photoZoomFactors[photoZoomLevel];
   lcd.fillScreen(COL_BLACK);
-  if(zf<=1.0f) {
-    int ox=(DISP_W-min((int)photoBufW,DISP_W))/2;
-    int oy=(DISP_H-min((int)photoBufH,DISP_H))/2;
-    int renderW=min((int)photoBufW,DISP_W);
-    int renderH=min((int)photoBufH,DISP_H);
-    for(int row=0;row<renderH;row++) {
-      lcd.pushImage(ox,oy+row,renderW,1,photoPixelBuf+row*photoBufW);
-      if(row%20==0) esp_task_wdt_reset();
+  if (zf <= 1.0f) {
+    int ox = (DISP_W - min((int)photoBufW, DISP_W)) / 2;
+    int oy = (DISP_H - min((int)photoBufH, DISP_H)) / 2;
+    int renderW = min((int)photoBufW, DISP_W);
+    int renderH = min((int)photoBufH, DISP_H);
+    for (int row = 0; row < renderH; row++) {
+      lcd.pushImage(ox, oy + row, renderW, 1, photoPixelBuf + row * photoBufW);
+      if (row % 20 == 0) esp_task_wdt_reset();
     }
   } else {
-    int vpW=(int)(DISP_W/zf), vpH=(int)(DISP_H/zf);
-    int maxOffX=max(0,(int)photoBufW-vpW);
-    int maxOffY=max(0,(int)photoBufH-vpH);
-    photoZoomOffX=constrain(photoZoomOffX,0,maxOffX);
-    photoZoomOffY=constrain(photoZoomOffY,0,maxOffY);
+    int vpW = (int)(DISP_W / zf), vpH = (int)(DISP_H / zf);
+    int maxOffX = max(0, (int)photoBufW - vpW);
+    int maxOffY = max(0, (int)photoBufH - vpH);
+    photoZoomOffX = constrain(photoZoomOffX, 0, maxOffX);
+    photoZoomOffY = constrain(photoZoomOffY, 0, maxOffY);
     static uint16_t lineBuf[DISP_W];
-    for(int sy=0;sy<DISP_H;sy++) {
-      int srcY=constrain(photoZoomOffY+(int)(sy/zf),0,(int)photoBufH-1);
-      for(int sx=0;sx<DISP_W;sx++) {
-        int srcX=constrain(photoZoomOffX+(int)(sx/zf),0,(int)photoBufW-1);
-        lineBuf[sx]=photoPixelBuf[srcY*photoBufW+srcX];
+    for (int sy = 0; sy < DISP_H; sy++) {
+      int srcY = constrain(photoZoomOffY + (int)(sy / zf), 0, (int)photoBufH - 1);
+      for (int sx = 0; sx < DISP_W; sx++) {
+        int srcX = constrain(photoZoomOffX + (int)(sx / zf), 0, (int)photoBufW - 1);
+        lineBuf[sx] = photoPixelBuf[srcY * photoBufW + srcX];
       }
-      lcd.pushImage(0,sy,DISP_W,1,lineBuf);
-      if(sy%20==0) esp_task_wdt_reset();
+      lcd.pushImage(0, sy, DISP_W, 1, lineBuf);
+      if (sy % 20 == 0) esp_task_wdt_reset();
     }
   }
-  if(photoZoomLevel>0) {
-    char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f\xd7",(double)zf);
-    drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
+  if (photoZoomLevel > 0) {
+    char zBuf[8]; snprintf(zBuf, sizeof(zBuf), "%.0f\xd7", (double)zf);
+    drawPill(DISP_W / 2, DISP_H - 10, zBuf, COL_PILL_BG, COL_GRAY_A);
   }
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("B=zoom",2,2);
-  lcd.drawString("BOOT=back",DISP_W-58,2);
-  if(photoZoomLevel==0) { lcd.drawString("C=prev",2,DISP_H-10); lcd.drawString("D=next",DISP_W-44,DISP_H-10); }
-  else { lcd.drawString("C/D=pan",2,DISP_H-10); lcd.drawString("Blong=del",DISP_W-58,DISP_H-10); }
+  lcd.drawString("B=zoom", 2, 2);
+  lcd.drawString("BOOT=back", DISP_W - 58, 2);
+  if (photoZoomLevel == 0) {
+    lcd.drawString("C=prev", 2, DISP_H - 10);
+    lcd.drawString("D=next", DISP_W - 44, DISP_H - 10);
+  } else {
+    lcd.drawString("C/D=pan", 2, DISP_H - 10);
+    lcd.drawString("Blong=del", DISP_W - 58, DISP_H - 10);
+  }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  photoViewDrawCaption — v5.8: stego info hanya untuk JPG
+// ─────────────────────────────────────────────────────────────────────────────
 void photoViewDrawCaption(int idx) {
   char stegoInfo[48] = "";
 
-  if (!galleryIsVideo[idx]) {
+  // Stego hanya ada di JPG
+  if (gIsJpg(idx)) {
     char path[56];
     snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
     FILE* f = fopen(path, "rb");
@@ -1338,11 +1385,9 @@ void photoViewDrawCaption(int idx) {
       fseek(f, 0, SEEK_END);
       long fsize_l = ftell(f);
       fseek(f, 0, SEEK_SET);
-
       if (fsize_l > 0) {
-        size_t fsize = (size_t)fsize_l;
+        size_t fsize   = (size_t)fsize_l;
         size_t readSize = (fsize < 8192) ? fsize : 8192;
-
         uint8_t* buf = (uint8_t*)ps_malloc(readSize);
         if (!buf) buf = (uint8_t*)malloc(readSize);
         if (buf) {
@@ -1350,9 +1395,7 @@ void photoViewDrawCaption(int idx) {
           char payload[STEGO_PAYLOAD_LEN + 1];
           if (stegoExtractFromJpeg(buf, readN, payload, sizeof(payload))) {
             char* p1 = strchr(payload, '|');
-            if (p1) {
-              snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
-            }
+            if (p1) snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
           }
           free(buf);
         }
@@ -1361,29 +1404,39 @@ void photoViewDrawCaption(int idx) {
     }
   }
 
-  int photoSeq=0, photoTotal=0;
+  // Hitung urutan foto (photo saja, skip video)
+  int photoSeq = 0, photoTotal = 0;
   for (int i = 0; i < galleryCount; i++) {
-    if (!galleryIsVideo[i]) { photoTotal++; if (i <= idx) photoSeq = photoTotal; }
+    if (gIsPhoto(i)) {
+      photoTotal++;
+      if (i <= idx) photoSeq = photoTotal;
+    }
   }
 
-  lcd.fillRect(0, DISP_H-16, DISP_W, 16, COL_GRAY_D);
+  // Tag tipe file
+  const char* typeTag = gIsBmp(idx) ? " [BMP]" : "";
+
+  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
-  char bar[48], barFull[80];
-  snprintf(bar,     sizeof(bar),     "< %d / %d >%s", photoSeq, photoTotal, stegoInfo);
-  snprintf(barFull, sizeof(barFull), "< %d / %d >  %s%s", photoSeq, photoTotal, galleryFiles[idx], stegoInfo);
+  char bar[56], barFull[88];
+  snprintf(bar,     sizeof(bar),
+           "< %d / %d >%s%s", photoSeq, photoTotal, typeTag, stegoInfo);
+  snprintf(barFull, sizeof(barFull),
+           "< %d / %d >  %s%s%s", photoSeq, photoTotal,
+           galleryFiles[idx], typeTag, stegoInfo);
   const char* barStr = (lcd.textWidth(barFull) < DISP_W - 4) ? barFull : bar;
   lcd.setTextColor(COL_GRAY_A);
   lcd.drawString(barStr, (DISP_W - lcd.textWidth(barStr)) / 2, DISP_H - 13);
 }
 
 void photoViewClearCaption() {
-  lcd.fillRect(0,DISP_H-16,DISP_W,16,COL_BLACK);
-  if(photoZoomLevel>0) {
-    float zf=photoZoomFactors[photoZoomLevel];
-    char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f\xd7",(double)zf);
-    drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
+  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_BLACK);
+  if (photoZoomLevel > 0) {
+    float zf = photoZoomFactors[photoZoomLevel];
+    char zBuf[8]; snprintf(zBuf, sizeof(zBuf), "%.0f\xd7", (double)zf);
+    drawPill(DISP_W / 2, DISP_H - 10, zBuf, COL_PILL_BG, COL_GRAY_A);
   }
-  photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
+  photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1395,72 +1448,82 @@ void drawDeleteDialog(const char* filename) {
   lcd.drawRoundRect(dx,dy,dw,dh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title="HAPUS FILE?";
-  lcd.drawString(title,dx+(dw-lcd.textWidth(title))/2,dy+8);
+  const char* title = "HAPUS FILE?";
+  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 8);
   lcd.setTextColor(COL_GRAY_7);
-  char truncName[28]; strncpy(truncName,filename,27); truncName[27]='\0';
-  lcd.drawString(truncName,dx+(dw-lcd.textWidth(truncName))/2,dy+22);
-  lcd.drawFastHLine(dx+10,dy+36,dw-20,COL_GRAY_3);
+  char truncName[28]; strncpy(truncName, filename, 27); truncName[27] = '\0';
+  lcd.drawString(truncName, dx + (dw - lcd.textWidth(truncName)) / 2, dy + 22);
+  lcd.drawFastHLine(dx + 10, dy + 36, dw - 20, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_A);
-  const char* hint="BOOT=YES   B/C/D=NO";
-  lcd.drawString(hint,dx+(dw-lcd.textWidth(hint))/2,dy+46);
+  const char* hint = "BOOT=YES   B/C/D=NO";
+  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + 46);
   lcd.setTextColor(COL_GRAY_5);
-  const char* hint2="(timeout 8s = NO)";
-  lcd.drawString(hint2,dx+(dw-lcd.textWidth(hint2))/2,dy+60);
+  const char* hint2 = "(timeout 8s = NO)";
+  lcd.drawString(hint2, dx + (dw - lcd.textWidth(hint2)) / 2, dy + 60);
 }
 
 void openDeleteDialog() {
   drawDeleteDialog(galleryFiles[photoViewIndex]);
-  deleteDialogOpenMs=millis();
+  deleteDialogOpenMs = millis();
   resetAllButtons();
-  appMode=MODE_DIALOG_DELETE;
+  appMode = MODE_DIALOG_DELETE;
 }
 
 void photoViewDeleteCurrent() {
-  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[photoViewIndex]);
-  bool ok=(remove(path)==0);
+  char path[56];
+  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[photoViewIndex]);
+  bool ok = (remove(path) == 0);
   islandPush(ok ? NOTIF_OK : NOTIF_WARN, ok ? "FILE DIHAPUS" : "GAGAL HAPUS");
-  if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
   scanGalleryFiles(); scanPhotoCount();
-  gallerySelIdx=0;
+  gallerySelIdx = 0;
   resetAllButtons();
-  appMode=MODE_GALLERY;
+  appMode = MODE_GALLERY;
   drawGallery();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  showPhotoView — v5.8: guard gIsPhoto(), bukan !galleryIsVideo()
+// ─────────────────────────────────────────────────────────────────────────────
 void showPhotoView(int idx) {
-  if(idx<0||idx>=galleryCount||galleryIsVideo[idx]) return;
-  photoViewIndex=idx;
-  strncpy(photoViewPath,galleryFiles[idx],sizeof(photoViewPath)-1);
-  photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
+  if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return;
+  photoViewIndex = idx;
+  strncpy(photoViewPath, galleryFiles[idx], sizeof(photoViewPath) - 1);
+  photoZoomLevel = 0; photoZoomOffX = 0; photoZoomOffY = 0;
   lcd.fillScreen(COL_BLACK);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("loading...",DISP_W/2-24,DISP_H/2-4);
-  if(!photoLoadPixelBuf(idx)) {
+  const char* loadMsg = gIsBmp(idx) ? "loading BMP..." : "loading...";
+  lcd.drawString(loadMsg, DISP_W / 2 - 30, DISP_H / 2 - 4);
+  if (!photoLoadPixelBuf(idx)) {
     lcd.fillScreen(COL_BLACK);
-    lcd.drawString("gagal load foto",20,DISP_H/2);
-    delay(1500); resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+    lcd.drawString("gagal load foto", 20, DISP_H / 2);
+    delay(1500); resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
     return;
   }
   photoViewRender();
   photoViewDrawCaption(idx);
-  photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true;
-  resetAllButtons(); appMode=MODE_PHOTO_VIEW;
+  photoViewCaptionUntilMs = millis() + 2000; photoViewCaptionVisible = true;
+  resetAllButtons(); appMode = MODE_PHOTO_VIEW;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  photoViewPrev / Next — v5.8: skip video, tidak skip BMP
+// ─────────────────────────────────────────────────────────────────────────────
 void photoViewPrev() {
-  int idx=photoViewIndex-1; if(idx<0) idx=galleryCount-1;
-  for(int t=0;t<galleryCount;t++) {
-    if(!galleryIsVideo[idx]) { showPhotoView(idx); return; }
-    idx--; if(idx<0) idx=galleryCount-1;
+  int idx = photoViewIndex - 1;
+  if (idx < 0) idx = galleryCount - 1;
+  for (int t = 0; t < galleryCount; t++) {
+    if (gIsPhoto(idx)) { showPhotoView(idx); return; }
+    idx--; if (idx < 0) idx = galleryCount - 1;
   }
 }
 
 void photoViewNext() {
-  int idx=photoViewIndex+1; if(idx>=galleryCount) idx=0;
-  for(int t=0;t<galleryCount;t++) {
-    if(!galleryIsVideo[idx]) { showPhotoView(idx); return; }
-    idx++; if(idx>=galleryCount) idx=0;
+  int idx = photoViewIndex + 1;
+  if (idx >= galleryCount) idx = 0;
+  for (int t = 0; t < galleryCount; t++) {
+    if (gIsPhoto(idx)) { showPhotoView(idx); return; }
+    idx++; if (idx >= galleryCount) idx = 0;
   }
 }
 
@@ -1483,7 +1546,10 @@ void drawLedMenu(int sel) {
     lcd.fillRect(mx+8,iy,mw-16,18,isHighlight?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor(isHighlight?COL_WHITE:(isChecked?COL_GRAY_E:COL_GRAY_7));
     lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
-    if(isChecked) { lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E); lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E); }
+    if(isChecked){
+      lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);
+      lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);
+    }
     lcd.drawString((i==0)?"LED ON   - flash saat capture":"LED OFF  - tanpa flash",mx+24,iy+5);
   }
   lcd.setTextColor(COL_GRAY_3);
@@ -1492,9 +1558,9 @@ void drawLedMenu(int sel) {
 }
 
 void openLedMenu() {
-  menuLedSel=ledFlashEnabled?0:1;
+  menuLedSel = ledFlashEnabled ? 0 : 1;
   drawLedMenu(menuLedSel);
-  resetAllButtons(); prevMode=appMode; appMode=MODE_MENU_LED;
+  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_LED;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1547,36 +1613,36 @@ void drawExpAdjOverlay() {
 }
 
 void openExpMenu() {
-  menuExpSel=(int)expPreset;
+  menuExpSel = (int)expPreset;
   drawExpMenu(menuExpSel);
-  resetAllButtons(); prevMode=appMode; appMode=MODE_MENU_EXP;
+  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_EXP;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MJPEG Player
 // ─────────────────────────────────────────────────────────────────────────────
 bool mjpegOpen(const char* filename) {
-  char path[48]; snprintf(path,sizeof(path),"/sdcard/%s",filename);
-  if(mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
-  if(mjpegBuf)  { free(mjpegBuf);   mjpegBuf=nullptr; }
-  mjpegBuf=(uint8_t*)malloc(MJPEG_BUF_SIZE);
-  if(!mjpegBuf) return false;
-  mjpegFile=fopen(path,"rb");
-  if(!mjpegFile) { free(mjpegBuf); mjpegBuf=nullptr; return false; }
-  fileStream.f=mjpegFile;
-  mjpeg.setup(&fileStream,mjpegBuf,jpegDrawCallback,true,0,0,DISP_W,DISP_H);
-  strncpy(mjpegPath,filename,sizeof(mjpegPath)-1);
-  strncpy(mjpegPathSaved,filename,sizeof(mjpegPathSaved)-1);
-  mjpegFrame=0; mjpegPlaying=true; mjpegPaused=false; mjpegNotifUntilMs=0;
+  char path[48]; snprintf(path, sizeof(path), "/sdcard/%s", filename);
+  if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
+  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
+  mjpegBuf = (uint8_t*)malloc(MJPEG_BUF_SIZE);
+  if (!mjpegBuf) return false;
+  mjpegFile = fopen(path, "rb");
+  if (!mjpegFile) { free(mjpegBuf); mjpegBuf = nullptr; return false; }
+  fileStream.f = mjpegFile;
+  mjpeg.setup(&fileStream, mjpegBuf, jpegDrawCallback, true, 0, 0, DISP_W, DISP_H);
+  strncpy(mjpegPath, filename, sizeof(mjpegPath) - 1);
+  strncpy(mjpegPathSaved, filename, sizeof(mjpegPathSaved) - 1);
+  mjpegFrame = 0; mjpegPlaying = true; mjpegPaused = false; mjpegNotifUntilMs = 0;
   lcd.fillScreen(COL_BLACK);
   return true;
 }
 
 void mjpegClose() {
-  if(mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
-  if(mjpegBuf)  { free(mjpegBuf);   mjpegBuf=nullptr; }
-  fileStream.f=nullptr;
-  mjpegPlaying=false; mjpegPaused=false; mjpegFrame=0; mjpegNotifUntilMs=0;
+  if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
+  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
+  fileStream.f = nullptr;
+  mjpegPlaying = false; mjpegPaused = false; mjpegFrame = 0; mjpegNotifUntilMs = 0;
 }
 
 void mjpegShowNotif(const char* text) {
@@ -1586,17 +1652,18 @@ void mjpegShowNotif(const char* text) {
   lcd.fillRoundRect(px,py,pw,ph,6,COL_GRAY_D);
   lcd.drawRoundRect(px,py,pw,ph,6,COL_GRAY_5);
   lcd.setTextColor(COL_GRAY_E); lcd.drawString(text,px+10,py+4);
-  mjpegNotifUntilMs=millis()+1200;
+  mjpegNotifUntilMs = millis() + 1200;
 }
 
 void mjpegClearNotif() {
   lcd.fillRect((DISP_W-188)/2-4,(DISP_H-25)/2,196,25,COL_BLACK);
-  mjpegNotifUntilMs=0;
+  mjpegNotifUntilMs = 0;
 }
 
 void mjpegDrawHUD() {
   char buf[24];
-  snprintf(buf,sizeof(buf),"%.1f\xd7  %s",(double)mjpegSpeeds[mjpegSpeedIdx],mjpegLoop?"LOOP":"-");
+  snprintf(buf, sizeof(buf), "%.1f\xd7  %s",
+           (double)mjpegSpeeds[mjpegSpeedIdx], mjpegLoop ? "LOOP" : "-");
   lcd.setFont(&fonts::Font0);
   int tw=lcd.textWidth(buf),pw=tw+10,ph=13;
   lcd.fillRoundRect(4,4,pw,ph,4,COL_PILL_BG);
@@ -1604,96 +1671,100 @@ void mjpegDrawHUD() {
 }
 
 void loopMjpegPlayer() {
-  if(!mjpegPlaying) return;
-  if(!mjpegPaused) {
-    int64_t frameStart=esp_timer_get_time();
-    bool ok=mjpeg.readMjpegBuf();
-    if(!ok) {
-      if(mjpegLoop) {
+  if (!mjpegPlaying) return;
+  if (!mjpegPaused) {
+    int64_t frameStart = esp_timer_get_time();
+    bool ok = mjpeg.readMjpegBuf();
+    if (!ok) {
+      if (mjpegLoop) {
         mjpegClose();
-        if(!mjpegOpen(mjpegPathSaved)) { resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); }
+        if (!mjpegOpen(mjpegPathSaved)) {
+          resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
+        }
         return;
       }
-      mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return;
+      mjpegClose(); resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
     }
     mjpeg.drawJpg(); mjpegFrame++; mjpegDrawHUD();
-    if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
-    float speed=mjpegSpeeds[mjpegSpeedIdx];
-    int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
-    int64_t remain=targetUs-(esp_timer_get_time()-frameStart);
-    if(remain>1000) {
-      int64_t waitEnd=esp_timer_get_time()+remain;
-      while(esp_timer_get_time()<waitEnd) { delayMicroseconds(500); esp_task_wdt_reset(); }
+    if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) mjpegClearNotif();
+    float speed = mjpegSpeeds[mjpegSpeedIdx];
+    int64_t targetUs = (int64_t)(1000000.0f / (MJPEG_FRAME_RATE * speed));
+    int64_t remain = targetUs - (esp_timer_get_time() - frameStart);
+    if (remain > 1000) {
+      int64_t waitEnd = esp_timer_get_time() + remain;
+      while (esp_timer_get_time() < waitEnd) { delayMicroseconds(500); esp_task_wdt_reset(); }
     }
   } else {
-    if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
+    if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) mjpegClearNotif();
     delay(16);
   }
   esp_task_wdt_reset();
 }
 
 void openMjpegPlayer(const char* filename) {
-  mjpegLoop=false; mjpegSpeedIdx=1;
-  if(!mjpegOpen(filename)) {
+  mjpegLoop = false; mjpegSpeedIdx = 1;
+  if (!mjpegOpen(filename)) {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("gagal buka file",20,DISP_H/2);
-    delay(1500); resetAllButtons(); drawGallery(); appMode=MODE_GALLERY; return;
+    lcd.drawString("gagal buka file", 20, DISP_H / 2);
+    delay(1500); resetAllButtons(); drawGallery(); appMode = MODE_GALLERY; return;
   }
-  resetAllButtons(); appMode=MODE_MJPEG_PLAYER;
+  resetAllButtons(); appMode = MODE_MJPEG_PLAYER;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  REC overlay
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRecIndicator() {
-  if(!recActive) return;
-  unsigned long elapsed=(millis()-recStartMs)/1000;
-  char timeBuf[10]; snprintf(timeBuf,sizeof(timeBuf),"%02lu:%02lu",elapsed/60,elapsed%60);
-  bool blink=(millis()/500)%2;
-  lcd.fillRect(4,4,76,14,COL_BLACK);
-  lcd.fillCircle(10,11,4,blink?COL_WHITE:COL_GRAY_5);
+  if (!recActive) return;
+  unsigned long elapsed = (millis() - recStartMs) / 1000;
+  char timeBuf[10];
+  snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu", elapsed / 60, elapsed % 60);
+  bool blink = (millis() / 500) % 2;
+  lcd.fillRect(4, 4, 76, 14, COL_BLACK);
+  lcd.fillCircle(10, 11, 4, blink ? COL_WHITE : COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString(timeBuf,18,6);
+  lcd.drawString(timeBuf, 18, 6);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Recording
 // ─────────────────────────────────────────────────────────────────────────────
 void startRecording() {
-  if(!sdReady) return;
-  if(faceDetectMode) { faceDetectMode=false; faceDetectCount=0; }
+  if (!sdReady) return;
+  if (faceDetectMode) { faceDetectMode = false; faceDetectCount = 0; }
   recVideoCount++;
-  char path[48]; snprintf(path,sizeof(path),"/sdcard/video_%04d.mjpeg",recVideoCount);
-  recFile=fopen(path,"wb");
-  if(!recFile) { recVideoCount--; return; }
-  recFrameCount=0; recStartMs=millis(); recActive=true;
-  char buf[20]; snprintf(buf,sizeof(buf),"REC  #%04d",recVideoCount);
+  char path[48];
+  snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
+  recFile = fopen(path, "wb");
+  if (!recFile) { recVideoCount--; return; }
+  recFrameCount = 0; recStartMs = millis(); recActive = true;
+  char buf[20]; snprintf(buf, sizeof(buf), "REC  #%04d", recVideoCount);
   islandPush(NOTIF_REC, buf);
 }
 
 void stopRecording() {
-  if(!recActive||!recFile) return;
-  fclose(recFile); recFile=nullptr; recActive=false;
-  unsigned long dur=(millis()-recStartMs)/1000;
-  char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
+  if (!recActive || !recFile) return;
+  fclose(recFile); recFile = nullptr; recActive = false;
+  unsigned long dur = (millis() - recStartMs) / 1000;
+  char buf[28]; snprintf(buf, sizeof(buf), "%df  %02lu:%02lu", recFrameCount, dur / 60, dur % 60);
   islandPush(NOTIF_OK, buf);
-  blinkLED(3,100,80);
-  fpsLastTime=millis(); fpsFrameCount=0;
+  blinkLED(3, 100, 80);
+  fpsLastTime = millis(); fpsFrameCount = 0;
 }
 
 void recordFrame() {
-  if(!recActive||!recFile) return;
-  camera_fb_t *fb=esp_camera_fb_get();
-  if(!fb) { esp_task_wdt_reset(); return; }
-  uint8_t *jpg_buf=nullptr; size_t jpg_len=0; bool ok=false;
-  if(fb->format==PIXFORMAT_JPEG) { jpg_buf=fb->buf; jpg_len=fb->len; ok=true; }
-  else { ok=frame2jpg(fb,70,&jpg_buf,&jpg_len); }
-  if(ok&&jpg_buf) {
-    fwrite(jpg_buf,1,jpg_len,recFile); recFrameCount++;
-    if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
+  if (!recActive || !recFile) return;
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) { esp_task_wdt_reset(); return; }
+  uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
+  if (fb->format == PIXFORMAT_JPEG) { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
+  else { ok = frame2jpg(fb, 70, &jpg_buf, &jpg_len); }
+  if (ok && jpg_buf) {
+    fwrite(jpg_buf, 1, jpg_len, recFile); recFrameCount++;
+    if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
   }
-  if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
-    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+  if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
+    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawRecIndicator();
     islandTick();
   }
@@ -1703,21 +1774,21 @@ void recordFrame() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  USB MSC
 // ─────────────────────────────────────────────────────────────────────────────
-static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize) {
+static int32_t onRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
   (void)offset;
-  if(!sdCard||!sdmmcDriverInit) return -1;
-  return (sdmmc_read_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
+  if (!sdCard || !sdmmcDriverInit) return -1;
+  return (sdmmc_read_sectors(sdCard, buffer, lba, bufsize / 512) == ESP_OK) ? (int32_t)bufsize : -1;
 }
-static int32_t onWrite(uint32_t lba,uint32_t offset,uint8_t* buffer,uint32_t bufsize) {
+static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
   (void)offset;
-  if(!sdCard||!sdmmcDriverInit) return -1;
-  return (sdmmc_write_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
+  if (!sdCard || !sdmmcDriverInit) return -1;
+  return (sdmmc_write_sectors(sdCard, buffer, lba, bufsize / 512) == ESP_OK) ? (int32_t)bufsize : -1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Boot screen
 // ─────────────────────────────────────────────────────────────────────────────
-void drawCameraIcon(int cx,int cy,uint16_t col) {
+void drawCameraIcon(int cx, int cy, uint16_t col) {
   lcd.drawRoundRect(cx-22,cy-14,44,30,4,col);
   lcd.drawCircle(cx,cy-1,10,col);
   lcd.drawCircle(cx,cy-1,5,COL_GRAY_5);
@@ -1725,15 +1796,15 @@ void drawCameraIcon(int cx,int cy,uint16_t col) {
   lcd.drawPixel(cx+4,cy-5,COL_GRAY_7);
 }
 
-void bootLogLine(int y,const char* label,const char* status,uint16_t statusCol=COL_GRAY_E) {
+void bootLogLine(int y, const char* label, const char* status, uint16_t statusCol = COL_GRAY_E) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label,28,y);
-  int lx=28+lcd.textWidth(label)+3;
-  for(int dx=lx;dx<268;dx+=4) lcd.drawPixel(dx,y+5,COL_GRAY_3);
-  lcd.setTextColor(statusCol); lcd.drawString(status,272,y);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label, 28, y);
+  int lx = 28 + lcd.textWidth(label) + 3;
+  for (int dx = lx; dx < 268; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_3);
+  lcd.setTextColor(statusCol); lcd.drawString(status, 272, y);
 }
 
-void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK,uint32_t xclkHz) {
+void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid, bool xclkOK, uint32_t xclkHz) {
   lcd.fillScreen(COL_BLACK);
   lcd.drawFastHLine(0,0,DISP_W,COL_GRAY_3);
   lcd.drawFastHLine(0,DISP_H-1,DISP_W,COL_GRAY_3);
@@ -1742,39 +1813,41 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.7  exif+island-smooth",DISP_W/2-60,103);
+  lcd.drawString("v5.8  bmp+gallery-update",DISP_W/2-60,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
-  char buf[32];
-  snprintf(buf,sizeof(buf),sdOK?"OK  %lluMB":"NOT FOUND",sdMB);
+  char buf[40];
+  snprintf(buf, sizeof(buf), sdOK ? "OK  %lluMB" : "NOT FOUND", sdMB);
   bootLogLine(122,"SD CARD",buf,sdOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   bootLogLine(134,"CAM PROBE","20MHz",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  if(pidOK) snprintf(buf,sizeof(buf),"0x%04X  %s",pid,sensorName);
-  else snprintf(buf,sizeof(buf),"0x%04X  ???",pid);
+  if (pidOK) snprintf(buf, sizeof(buf), "0x%04X  %s", pid, sensorName);
+  else        snprintf(buf, sizeof(buf), "0x%04X  ???", pid);
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
+  snprintf(buf, sizeof(buf), "%uMHz  OK", xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND","no-erase slide  noClear=true always",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(182,"EXIF","APP1 inject: Make Model Sw Desc DT",COL_GRAY_E); delay(120); esp_task_wdt_reset();
-  bootLogLine(194,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"CAPTURE",
+    (detectedSensor==PID_GC2145)?"GC2145→BMP  others→JPG+EXIF":"JPG+stego+EXIF",
+    COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(182,"GALLERY","JPG/BMP/VIDEO  enum type",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(194,"ISLAND","no-erase slide  noClear=true",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
   lcd.drawRect(28,206,DISP_W-56,4,COL_GRAY_3);
-  int barW=DISP_W-60;
-  for(int i=0;i<=barW;i+=4) {
-    lcd.fillRect(30,207,i,2,COL_GRAY_7);
-    if(i%16==0) esp_task_wdt_reset();
+  int barW = DISP_W - 60;
+  for (int i = 0; i <= barW; i += 4) {
+    lcd.fillRect(30, 207, i, 2, COL_GRAY_7);
+    if (i % 16 == 0) esp_task_wdt_reset();
   }
-  lcd.fillRect(30,207,barW,2,COL_GRAY_C);
+  lcd.fillRect(30, 207, barW, 2, COL_GRAY_C);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("READY",DISP_W/2-15,218);
+  lcd.drawString("READY", DISP_W/2 - 15, 218);
   delay(800); esp_task_wdt_reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  USB mode screen
 // ─────────────────────────────────────────────────────────────────────────────
-void drawUSBIcon(int cx,int cy,uint16_t col) {
+void drawUSBIcon(int cx, int cy, uint16_t col) {
   lcd.drawFastVLine(cx,cy-24,28,col);
   lcd.drawCircle(cx,cy-27,4,col);
   lcd.drawFastHLine(cx-18,cy-12,36,col);
@@ -1792,21 +1865,21 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.7",DISP_W-26,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.8",DISP_W-26,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("to host via USB",(DISP_W-lcd.textWidth("to host via USB"))/2,136);
   lcd.drawFastHLine(40,150,DISP_W-80,COL_GRAY_2);
-  auto infoRow=[&](int y,const char* key,const char* val) {
+  auto infoRow=[&](int y, const char* key, const char* val) {
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5); lcd.drawString(key,44,y);
     lcd.setTextColor(COL_GRAY_C); lcd.drawString(val,DISP_W-44-lcd.textWidth(val),y);
   };
   char buf[32];
   infoRow(156,"SENSOR",sensorName);
   if(sdSizeMB<1024) snprintf(buf,sizeof(buf),"%lluMB  FAT32",sdSizeMB);
-  else snprintf(buf,sizeof(buf),"%lluGB  FAT32",sdSizeMB/1024);
+  else               snprintf(buf,sizeof(buf),"%lluGB  FAT32",sdSizeMB/1024);
   infoRow(170,"STORAGE",buf);
   snprintf(buf,sizeof(buf),"%04d files",photoCount);
   infoRow(184,"PHOTOS",buf);
@@ -1819,22 +1892,22 @@ void drawUSBModeScreen() {
 }
 
 void enterUSBMode() {
-  if(!sdReady) return;
-  if(photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+  if (!sdReady) return;
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
   islandForceHide();
-  unmountVFSOnly(); sdReady=false;
+  unmountVFSOnly(); sdReady = false;
   esp_task_wdt_reset(); msc.mediaPresent(true); esp_task_wdt_reset();
   drawUSBModeScreen();
-  usbModeActive=true;
-  blinkLED(3,200,100); resetAllButtons();
+  usbModeActive = true;
+  blinkLED(3, 200, 100); resetAllButtons();
 }
 
 void exitUSBMode() {
-  usbModeActive=false; msc.mediaPresent(false); esp_task_wdt_reset();
+  usbModeActive = false; msc.mediaPresent(false); esp_task_wdt_reset();
   lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
-  sdReady=remountVFSOnly();
-  if(sdReady) {
+  sdReady = remountVFSOnly();
+  if (sdReady) {
     scanPhotoCount();
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
@@ -1846,8 +1919,8 @@ void exitUSBMode() {
   }
   esp_task_wdt_reset(); blinkLED(2,150,100); delay(1000);
   lcd.fillScreen(COL_BLACK); resetAllButtons();
-  appMode=MODE_VIEWFINDER;
-  fpsLastTime=millis(); fpsFrameCount=0; fpsValue=0.0f;
+  appMode = MODE_VIEWFINDER;
+  fpsLastTime = millis(); fpsFrameCount = 0; fpsValue = 0.0f;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1855,21 +1928,21 @@ void exitUSBMode() {
 // ─────────────────────────────────────────────────────────────────────────────
 void updateFPS() {
   fpsFrameCount++;
-  unsigned long elapsed=millis()-fpsLastTime;
-  if(elapsed>=500) {
-    fpsValue=fpsFrameCount*1000.0f/elapsed;
-    fpsFrameCount=0; fpsLastTime=millis();
+  unsigned long elapsed = millis() - fpsLastTime;
+  if (elapsed >= 500) {
+    fpsValue = fpsFrameCount * 1000.0f / elapsed;
+    fpsFrameCount = 0; fpsLastTime = millis();
   }
 }
 
 void runFaceDetect(camera_fb_t *fb) {
-  if(!fb||fb->format!=PIXFORMAT_RGB565) return;
+  if (!fb || fb->format != PIXFORMAT_RGB565) return;
   HumanFaceDetectMSR01 msr(0.1f,0.5f,10,0.2f);
   HumanFaceDetectMNP01 mnp(0.5f,0.3f,5);
-  auto &candidates=msr.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3});
-  auto &results=mnp.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3},candidates);
-  faceDetectCount=results.size();
-  for(auto &res:results) {
+  auto &candidates = msr.infer((uint16_t*)fb->buf, {(int)fb->height,(int)fb->width,3});
+  auto &results    = mnp.infer((uint16_t*)fb->buf, {(int)fb->height,(int)fb->width,3}, candidates);
+  faceDetectCount = results.size();
+  for (auto &res : results) {
     int x1=constrain(res.box[0],0,DISP_W-1),y1=constrain(res.box[1],0,DISP_H-1);
     int x2=constrain(res.box[2],0,DISP_W-1),y2=constrain(res.box[3],0,DISP_H-1);
     int bw=x2-x1,bh=y2-y1; if(bw<4||bh<4) continue;
@@ -1878,15 +1951,15 @@ void runFaceDetect(camera_fb_t *fb) {
     lcd.drawFastHLine(x2-CL,y1,CL,COL_WHITE); lcd.drawFastVLine(x2,y1,CL,COL_WHITE);
     lcd.drawFastHLine(x1,y2,CL,COL_WHITE); lcd.drawFastVLine(x1,y2-CL,CL,COL_WHITE);
     lcd.drawFastHLine(x2-CL,y2,CL,COL_WHITE); lcd.drawFastVLine(x2,y2-CL,CL,COL_WHITE);
-    if(res.keypoint.size()>=10)
-      for(int k=0;k<10;k+=2)
+    if (res.keypoint.size() >= 10)
+      for (int k = 0; k < 10; k += 2)
         lcd.fillCircle(constrain(res.keypoint[k],0,DISP_W-1),
                        constrain(res.keypoint[k+1],0,DISP_H-1),2,COL_GRAY_C);
   }
 }
 
 void toggleFaceDetect() {
-  faceDetectMode=!faceDetectMode; faceDetectCount=0;
+  faceDetectMode = !faceDetectMode; faceDetectCount = 0;
   islandPush(NOTIF_FACE, faceDetectMode ? "FACE DETECT  ON" : "FACE DETECT  OFF");
 }
 
@@ -1897,11 +1970,9 @@ void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
   expPreset = preset;
-
   const ExpPresetCfg& c = expPresets[preset];
   int aecVal  = (preset == 3) ? expManualVal  : c.aec_val;
   int gainVal = (preset == 3) ? expManualGain : c.agc_gain;
-
   s->set_exposure_ctrl(s, c.aec_on  ? 1 : 0);
   s->set_aec2(s,          c.aec2_on ? 1 : 0);
   if (!c.aec_on) s->set_aec_value(s, aecVal);
@@ -1909,7 +1980,6 @@ void applyExpPreset(uint8_t preset) {
   if (!c.agc_on) s->set_agc_gain(s, gainVal);
   s->set_gainceiling(s, (gainceiling_t)c.gainceiling);
   s->set_ae_level(s, c.ae_level);
-
   if (detectedSensor == PID_GC2145) {
     s->set_hmirror(s, HMIRROR_GC2145);
     s->set_vflip(s,   VFLIP_GC2145);
@@ -1917,10 +1987,7 @@ void applyExpPreset(uint8_t preset) {
     s->set_hmirror(s, HMIRROR_OV3660);
     s->set_vflip(s,   VFLIP_OV3660);
   }
-
-  delay(150);
-  esp_task_wdt_reset();
-
+  delay(150); esp_task_wdt_reset();
   for (int i = 0; i < 2; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
@@ -1930,13 +1997,9 @@ void applyExpPreset(uint8_t preset) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  VIEWFINDER
-//  [ISLAND-1] islandNoClear = true SELALU — tidak ada erase di viewfinder
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
   bool frozen = (millis() < islandFreezeUntilMs);
-
-  // [ISLAND-1] Frame kamera menimpa seluruh layar setiap loop.
-  // fillRect hitam dari islandErase tidak pernah diperlukan di sini.
   islandNoClear = true;
 
   camera_fb_t *fb = nullptr;
@@ -1948,7 +2011,6 @@ void renderViewfinder() {
   if (!frozen) {
     if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
       lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-
       drawCornerBrackets(COL_GRAY_E);
       if (faceDetectMode) runFaceDetect(fb);
 
@@ -1958,31 +2020,31 @@ void renderViewfinder() {
 
       if (faceDetectMode) {
         char faceBuf[12];
-        snprintf(faceBuf, sizeof(faceBuf), faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
+        snprintf(faceBuf, sizeof(faceBuf),
+                 faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
         drawPill(DISP_W/2, 10, faceBuf, COL_PILL_BG, COL_GRAY_C);
       } else if (expPreset > 0) {
         char expBuf[12];
         if (expPreset == 3) snprintf(expBuf, sizeof(expBuf), "M %d", expManualVal);
-        else snprintf(expBuf, sizeof(expBuf), "%s", expPresetNames[expPreset]);
+        else                snprintf(expBuf, sizeof(expBuf), "%s", expPresetNames[expPreset]);
         drawPill(DISP_W/2, 10, expBuf, COL_PILL_BG, COL_GRAY_E);
       }
 
-      char shotBuf[10]; snprintf(shotBuf, sizeof(shotBuf), "#%04d", photoCount + 1);
-      drawPill(30, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
+      // Pill format file sesuai sensor
+      const char* fmtTag = (detectedSensor == PID_GC2145) ? "BMP" : "JPG";
+      char shotBuf[12];
+      snprintf(shotBuf, sizeof(shotBuf), "#%04d %s", photoCount + 1, fmtTag);
+      drawPill(38, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
       drawPill(DISP_W-36, DISP_H-10, sdReady ? "SD  OK" : "SD  --",
                COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
 
       if (recActive) drawRecIndicator();
-
       updateFPS();
-
     } else {
       lcd.fillScreen(COL_BLACK);
-      lcd.setFont(&fonts::Font0);
-      lcd.setTextColor(COL_GRAY_5);
+      lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
       lcd.drawString("format not rgb565", 10, 110);
     }
-
     esp_camera_fb_return(fb);
   }
 
@@ -1990,8 +2052,9 @@ void renderViewfinder() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview
-//  Alur: frame2jpg → stegoEmbedToJpeg → exifInjectToJpeg → fwrite
+//  captureAndPreview — v5.8
+//  GC2145 → saveBMP() langsung
+//  Sensor lain → frame2jpg → stegoEmbed → exifInject → fwrite
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
@@ -2008,84 +2071,88 @@ void captureAndPreview() {
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) { blinkLED(5, 50, 50); return; }
 
+  // Preview ke layar
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
   }
 
   bool saved = false;
+
   if (sdReady) {
-    uint8_t *jpg_buf  = nullptr;
-    size_t   jpg_len  = 0;
-    bool     ok       = false;
+    photoCount++;
 
-    if (fb->format == PIXFORMAT_RGB565) {
-      ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len);
-    } else if (fb->format == PIXFORMAT_JPEG) {
-      jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
-    }
+    // ── GC2145: simpan BMP langsung dari buffer RGB565 ─────────────────
+    if (detectedSensor == PID_GC2145 &&
+        fb->format == PIXFORMAT_RGB565 &&
+        fb->width == DISP_W && fb->height == DISP_H) {
 
-    if (ok && jpg_buf && jpg_len > 0) {
-      photoCount++;
+      char path[48];
+      snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
+      saved = saveBMP(fb->buf, fb->width, fb->height, path);
 
-      // ── Step 1: Stego COM marker ──────────────────────────────────────
-      char payload[STEGO_PAYLOAD_LEN];
-      stegoMakePayload(payload, sizeof(payload), photoCount);
-      int payLen = (int)strlen(payload);
+      Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  %s\n",
+                    photoCount, fb->width, fb->height,
+                    saved ? "OK" : "GAGAL");
 
-      size_t stegoLen = 0;
-      uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
-                                            payload, payLen,
-                                            &stegoLen);
-      if (!stegoBuf) {
-        Serial.printf("[STEGO] WARN: embed gagal photo_%04d\n", photoCount);
-        // lanjut tanpa stego
-        stegoBuf = jpg_buf;
-        stegoLen = jpg_len;
-      }
-
-      // ── Step 2: EXIF inject ───────────────────────────────────────────
-      size_t finalLen = 0;
-      uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen,
-                                            photoCount, sensorName,
-                                            &finalLen);
-      if (!finalBuf) {
-        Serial.printf("[EXIF] WARN: inject gagal photo_%04d, simpan tanpa EXIF\n", photoCount);
-        finalBuf = stegoBuf;
-        finalLen = stegoLen;
-      }
-
-      // ── Step 3: Tulis ke SD ───────────────────────────────────────────
-      char path[40];
-      snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
-      FILE* f = fopen(path, "wb");
-      if (f) {
-        size_t w = fwrite(finalBuf, 1, finalLen, f);
-        fclose(f);
-        saved = (w == finalLen);
-        if (saved) {
-          Serial.printf("[CAPTURE] photo_%04d.jpg  %u bytes  stego=%s exif=%s\n",
-                        photoCount, (unsigned)finalLen,
-                        (stegoBuf != jpg_buf) ? "YES" : "NO",
-                        (finalBuf != stegoBuf) ? "YES" : "NO");
-        }
-      }
-
-      // ── Cleanup ───────────────────────────────────────────────────────
-      if (finalBuf != stegoBuf) free(finalBuf);
-      if (stegoBuf != jpg_buf)  free(stegoBuf);
-      if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
-
+    // ── Sensor lain: JPEG + stego + EXIF ──────────────────────────────
     } else {
-      Serial.println("[CAPTURE] frame2jpg gagal");
+      uint8_t *jpg_buf  = nullptr;
+      size_t   jpg_len  = 0;
+      bool     ok       = false;
+
+      if (fb->format == PIXFORMAT_RGB565) {
+        ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len);
+      } else if (fb->format == PIXFORMAT_JPEG) {
+        jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
+      }
+
+      if (ok && jpg_buf && jpg_len > 0) {
+        // Step 1: Stego
+        char payload[STEGO_PAYLOAD_LEN];
+        stegoMakePayload(payload, sizeof(payload), photoCount);
+        int payLen = (int)strlen(payload);
+        size_t stegoLen = 0;
+        uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
+                                              payload, payLen, &stegoLen);
+        if (!stegoBuf) { stegoBuf = jpg_buf; stegoLen = jpg_len; }
+
+        // Step 2: EXIF
+        size_t finalLen = 0;
+        uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen,
+                                              photoCount, sensorName, &finalLen);
+        if (!finalBuf) { finalBuf = stegoBuf; finalLen = stegoLen; }
+
+        // Step 3: Tulis ke SD
+        char path[40];
+        snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+          size_t w = fwrite(finalBuf, 1, finalLen, f);
+          fclose(f);
+          saved = (w == finalLen);
+          if (saved)
+            Serial.printf("[CAPTURE-JPG] photo_%04d.jpg  %u bytes\n",
+                          photoCount, (unsigned)finalLen);
+        }
+
+        if (finalBuf != stegoBuf) free(finalBuf);
+        if (stegoBuf != jpg_buf)  free(stegoBuf);
+        if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+      } else {
+        Serial.println("[CAPTURE] frame2jpg gagal");
+      }
     }
+
+    if (!saved) photoCount--; // rollback jika gagal
   }
 
   esp_camera_fb_return(fb);
 
   if (saved) {
-    char notifText[24];
-    snprintf(notifText, sizeof(notifText), "SAVED  #%04d", photoCount);
+    char notifText[28];
+    const char* ext = (detectedSensor == PID_GC2145) ? "BMP" : "JPG";
+    snprintf(notifText, sizeof(notifText), "SAVED %s #%04d", ext, photoCount);
     islandPush(NOTIF_OK, notifText);
     blinkLED(2, 150, 80);
   } else {
@@ -2152,15 +2219,18 @@ bool initCamera() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Setup
+//  Setup — v5.8: alokasi galleryFileType (ganti galleryIsVideo)
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.7 ===");
+  Serial.println("\n=== Sanzxcam v5.8 ===");
 
-  galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
-  galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
-  if (!galleryFiles || !galleryIsVideo) { Serial.println("PSRAM alloc failed!"); ESP.restart(); }
+  galleryFiles    = (char(*)[32])    ps_malloc(GALLERY_MAX_FILES * 32);
+  galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
+  if (!galleryFiles || !galleryFileType) {
+    Serial.println("PSRAM alloc failed!");
+    ESP.restart();
+  }
 
   pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
   pinMode(LED_FLASH, OUTPUT); digitalWrite(LED_FLASH, LOW);
@@ -2173,7 +2243,7 @@ void setup() {
 
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
 
-  static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
+  static uint16_t touchCalData[8] = {3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
 
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
@@ -2222,10 +2292,10 @@ void handleModeViewfinder(ButtonEvent evt) {
     else {
       if (sdReady) {
         scanGalleryFiles();
-        gallerySelIdx=0; galleryScroll=0; galleryHoldDir=0;
+        gallerySelIdx = 0; galleryScroll = 0; galleryHoldDir = 0;
         islandForceHide();
-        islandNoClear = false; // masuk mode non-viewfinder → erase boleh jalan
-        resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+        islandNoClear = false;
+        resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
       }
     }
   }
@@ -2235,183 +2305,214 @@ void handleModeViewfinder(ButtonEvent evt) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  handleModeGallery — v5.8: BOOT buka JPG/BMP→photoView, VIDEO→mjpegPlayer
+// ─────────────────────────────────────────────────────────────────────────────
 void handleModeGallery(ButtonEvent evt) {
-  bool cHeld=btnC.isHeld(), dHeld=btnD.isHeld();
-  if (cHeld&&galleryHoldDir!=-1) { galleryHoldDir=-1; galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(-1); return; }
-  if (dHeld&&galleryHoldDir!=1)  { galleryHoldDir=1;  galleryHoldStart=millis(); galleryLastStep=millis(); galleryStep(1);  return; }
-  if (!cHeld&&!dHeld) galleryHoldDir=0;
+  bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
+  if (cHeld && galleryHoldDir != -1) {
+    galleryHoldDir = -1; galleryHoldStart = millis();
+    galleryLastStep = millis(); galleryStep(-1); return;
+  }
+  if (dHeld && galleryHoldDir != 1) {
+    galleryHoldDir = 1; galleryHoldStart = millis();
+    galleryLastStep = millis(); galleryStep(1); return;
+  }
+  if (!cHeld && !dHeld) galleryHoldDir = 0;
   if (galleryHoldDir != 0) {
-    uint32_t held=millis()-galleryHoldStart;
-    uint32_t interval=(held<500)?200:(held<1500)?100:50;
-    if (millis()-galleryLastStep>=interval) { galleryStep(galleryHoldDir); galleryLastStep=millis(); }
+    uint32_t held = millis() - galleryHoldStart;
+    uint32_t interval = (held < 500) ? 200 : (held < 1500) ? 100 : 50;
+    if (millis() - galleryLastStep >= interval) {
+      galleryStep(galleryHoldDir); galleryLastStep = millis();
+    }
     return;
   }
   if (!evt.valid) return;
-  if (evt.pin==BTN_BOOT&&evt.isShort) {
-    if (galleryCount>0&&gallerySelIdx>=0&&gallerySelIdx<galleryCount) {
-      if (galleryIsVideo[gallerySelIdx]) openMjpegPlayer(galleryFiles[gallerySelIdx]);
-      else showPhotoView(gallerySelIdx);
+
+  if (evt.pin == BTN_BOOT && evt.isShort) {
+    if (galleryCount > 0 && gallerySelIdx >= 0 && gallerySelIdx < galleryCount) {
+      GalleryFileType ft = galleryFileType[gallerySelIdx];
+      if (ft == GFILE_VIDEO) {
+        openMjpegPlayer(galleryFiles[gallerySelIdx]);
+      } else {
+        // JPG atau BMP — keduanya ke photo view
+        showPhotoView(gallerySelIdx);
+      }
     }
   }
-  else if (evt.pin==BTN_B&&evt.isShort) {
-    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-    galleryHoldDir=0; islandForceHide(); resetAllButtons();
-    islandNoClear = true; // kembali ke viewfinder
-    appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
-    fpsLastTime=millis(); fpsFrameCount=0;
+  else if (evt.pin == BTN_B && evt.isShort) {
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
+    galleryHoldDir = 0; islandForceHide(); resetAllButtons();
+    islandNoClear = true;
+    appMode = MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
+    fpsLastTime = millis(); fpsFrameCount = 0;
   }
 }
 
 void handleModePhotoView(ButtonEvent evt) {
   if (!evt.valid) return;
-  static unsigned long lastActionTime=0;
-  if (millis()-lastActionTime<150) return;
-  lastActionTime=millis();
+  static unsigned long lastActionTime = 0;
+  if (millis() - lastActionTime < 150) return;
+  lastActionTime = millis();
 
-  if (evt.pin==BTN_BOOT&&evt.isShort) {
-    photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
-    photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
-    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
-    resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return;
+  if (evt.pin == BTN_BOOT && evt.isShort) {
+    photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
+    photoZoomLevel = 0; photoZoomOffX = 0; photoZoomOffY = 0;
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
+    resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
   }
-  if (evt.pin==BTN_B) {
+  if (evt.pin == BTN_B) {
     if (evt.isLong) { photoViewClearCaption(); openDeleteDialog(); }
     else {
-      photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
-      photoZoomOffX=0; photoZoomOffY=0;
-      if (photoZoomLevel>0) {
-        float zf=photoZoomFactors[photoZoomLevel];
-        int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
-        photoZoomOffX=max(0,(int)photoBufW/2-vpW/2);
-        photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
+      photoZoomLevel = (photoZoomLevel + 1) % ZOOM_LEVELS;
+      photoZoomOffX = 0; photoZoomOffY = 0;
+      if (photoZoomLevel > 0) {
+        float zf = photoZoomFactors[photoZoomLevel];
+        int vpW = (int)(DISP_W / zf), vpH = (int)(DISP_H / zf);
+        photoZoomOffX = max(0, (int)photoBufW / 2 - vpW / 2);
+        photoZoomOffY = max(0, (int)photoBufH / 2 - vpH / 2);
       }
       photoViewRender();
-      if (photoZoomLevel==0) { photoViewDrawCaption(photoViewIndex); photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true; }
+      if (photoZoomLevel == 0) {
+        photoViewDrawCaption(photoViewIndex);
+        photoViewCaptionUntilMs = millis() + 2000; photoViewCaptionVisible = true;
+      }
     }
     return;
   }
-  if (photoZoomLevel==0) {
-    if (evt.pin==BTN_C&&evt.isShort) photoViewPrev();
-    if (evt.pin==BTN_D&&evt.isShort) photoViewNext();
+  if (photoZoomLevel == 0) {
+    if (evt.pin == BTN_C && evt.isShort) photoViewPrev();
+    if (evt.pin == BTN_D && evt.isShort) photoViewNext();
   } else {
-    float zf=photoZoomFactors[photoZoomLevel];
-    int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
-    int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
-    bool moved=false;
-    if (evt.pin==BTN_C) { if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX);moved=true;}else{photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY);moved=true;} }
-    if (evt.pin==BTN_D) { if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);moved=true;}else{photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY);moved=true;} }
+    float zf = photoZoomFactors[photoZoomLevel];
+    int maxOffX = max(0, (int)photoBufW - (int)(DISP_W / zf));
+    int maxOffY = max(0, (int)photoBufH - (int)(DISP_H / zf));
+    bool moved = false;
+    if (evt.pin == BTN_C) {
+      if (evt.isShort) { photoZoomOffX = constrain(photoZoomOffX - PAN_STEP, 0, maxOffX); moved = true; }
+      else             { photoZoomOffY = constrain(photoZoomOffY - PAN_STEP, 0, maxOffY); moved = true; }
+    }
+    if (evt.pin == BTN_D) {
+      if (evt.isShort) { photoZoomOffX = constrain(photoZoomOffX + PAN_STEP, 0, maxOffX); moved = true; }
+      else             { photoZoomOffY = constrain(photoZoomOffY + PAN_STEP, 0, maxOffY); moved = true; }
+    }
     if (moved) photoViewRender();
   }
 }
 
-void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,ButtonEvent evtC,ButtonEvent evtD) {
-  static unsigned long lastToggleTime=0;
-  if (evtBoot.valid) { mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return; }
-  if (evtB.valid&&(millis()-lastToggleTime)>=200) {
-    mjpegPaused=!mjpegPaused; mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY"); lastToggleTime=millis();
+void handleModeMjpegPlayer(ButtonEvent evtBoot, ButtonEvent evtB,
+                            ButtonEvent evtC,    ButtonEvent evtD) {
+  static unsigned long lastToggleTime = 0;
+  if (evtBoot.valid) {
+    mjpegClose(); resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
   }
-  if (evtC.valid&&(millis()-lastToggleTime)>=200) {
-    mjpegLoop=!mjpegLoop; mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF"); lastToggleTime=millis();
+  if (evtB.valid && (millis() - lastToggleTime) >= 200) {
+    mjpegPaused = !mjpegPaused;
+    mjpegShowNotif(mjpegPaused ? "PAUSE" : "PLAY"); lastToggleTime = millis();
   }
-  if (evtD.valid&&(millis()-lastToggleTime)>=200) {
-    mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
-    char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
-    mjpegShowNotif(spBuf); lastToggleTime=millis();
+  if (evtC.valid && (millis() - lastToggleTime) >= 200) {
+    mjpegLoop = !mjpegLoop;
+    mjpegShowNotif(mjpegLoop ? "LOOP ON" : "LOOP OFF"); lastToggleTime = millis();
+  }
+  if (evtD.valid && (millis() - lastToggleTime) >= 200) {
+    mjpegSpeedIdx = (mjpegSpeedIdx + 1) % 3;
+    char spBuf[12]; snprintf(spBuf, sizeof(spBuf), "%.1f\xd7", (double)mjpegSpeeds[mjpegSpeedIdx]);
+    mjpegShowNotif(spBuf); lastToggleTime = millis();
   }
   loopMjpegPlayer();
 }
 
 void handleModeMenuLed(ButtonEvent evt) {
   if (!evt.valid) return;
-  if (evt.pin==BTN_BOOT) {
-    ledFlashEnabled=(menuLedSel==0);
+  if (evt.pin == BTN_BOOT) {
+    ledFlashEnabled = (menuLedSel == 0);
     islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true;
-    appMode=MODE_VIEWFINDER;
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_B) {
+  else if (evt.pin == BTN_B) {
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true;
-    appMode=MODE_VIEWFINDER;
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_C||evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
+  else if (evt.pin == BTN_C || evt.pin == BTN_D) {
+    menuLedSel = (menuLedSel == 0) ? 1 : 0; drawLedMenu(menuLedSel);
+  }
 }
 
 void handleModeMenuExp(ButtonEvent evt) {
   if (!evt.valid) return;
-  if (evt.pin==BTN_BOOT) {
+  if (evt.pin == BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
-    if (menuExpSel==3) {
-      lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_MENU_EXP_ADJ; return;
+    if (menuExpSel == 3) {
+      lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode = MODE_MENU_EXP_ADJ; return;
     }
-    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
+    char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[menuExpSel]);
     islandPush(NOTIF_INFO, fbBuf);
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true;
-    appMode=MODE_VIEWFINDER;
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_B) {
+  else if (evt.pin == BTN_B) {
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true;
-    appMode=MODE_VIEWFINDER;
+    islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
-  else if (evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
-  else if (evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
+  else if (evt.pin == BTN_C) { menuExpSel = (menuExpSel + 3) % 4; drawExpMenu(menuExpSel); }
+  else if (evt.pin == BTN_D) { menuExpSel = (menuExpSel + 1) % 4; drawExpMenu(menuExpSel); }
 }
 
 void handleModeMenuExpAdj(ButtonEvent evt) {
-  camera_fb_t *fb=esp_camera_fb_get();
+  camera_fb_t *fb = esp_camera_fb_get();
   if (fb) {
-    if (fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
-      int visH=DISP_H-38;
-      for(int row=0;row<visH;row++) lcd.pushImage(0,row,DISP_W,1,(uint16_t*)fb->buf+row*DISP_W);
+    if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
+      int visH = DISP_H - 38;
+      for (int row = 0; row < visH; row++)
+        lcd.pushImage(0, row, DISP_W, 1, (uint16_t*)fb->buf + row * DISP_W);
     }
     esp_camera_fb_return(fb);
   }
   drawExpAdjOverlay(); esp_task_wdt_reset();
   if (!evt.valid) return;
-  if (evt.pin==BTN_BOOT) {
-    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
+  if (evt.pin == BTN_BOOT) {
+    char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[3]);
     islandPush(NOTIF_INFO, fbBuf);
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true;
-    appMode=MODE_VIEWFINDER; return;
+    islandNoClear = true; appMode = MODE_VIEWFINDER; return;
   }
-  bool changed=false;
-  if (evt.pin==BTN_C) { expManualVal=constrain(expManualVal-50,0,1200); changed=true; }
-  if (evt.pin==BTN_D) { expManualVal=constrain(expManualVal+50,0,1200); changed=true; }
-  if (evt.pin==BTN_B) { expManualGain=(expManualGain+1)%31; changed=true; }
+  bool changed = false;
+  if (evt.pin == BTN_C) { expManualVal  = constrain(expManualVal  - 50, 0, 1200); changed = true; }
+  if (evt.pin == BTN_D) { expManualVal  = constrain(expManualVal  + 50, 0, 1200); changed = true; }
+  if (evt.pin == BTN_B) { expManualGain = (expManualGain + 1) % 31;               changed = true; }
   if (changed) applyExpPreset(3);
 }
 
 void handleModeDialogDelete(ButtonEvent evt) {
-  if (millis()-deleteDialogOpenMs>=DELETE_TIMEOUT_MS) { resetAllButtons(); showPhotoView(photoViewIndex); return; }
+  if (millis() - deleteDialogOpenMs >= DELETE_TIMEOUT_MS) {
+    resetAllButtons(); showPhotoView(photoViewIndex); return;
+  }
   if (!evt.valid) return;
-  if (evt.pin==BTN_BOOT) photoViewDeleteCurrent();
+  if (evt.pin == BTN_BOOT) photoViewDeleteCurrent();
   else { resetAllButtons(); showPhotoView(photoViewIndex); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LOOP — v5.7
+//  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
   tickAllButtons();
 
-  ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
+  ButtonEvent evtBoot={}, evtB={}, evtC={}, evtD={};
   btnBoot.pollEvent(evtBoot);
   btnB.pollEvent(evtB);
   btnC.pollEvent(evtC);
   btnD.pollEvent(evtD);
 
-  ButtonEvent singleEvt={};
-  if      (evtBoot.valid) singleEvt=evtBoot;
-  else if (evtB.valid)    singleEvt=evtB;
-  else if (evtC.valid)    singleEvt=evtC;
-  else if (evtD.valid)    singleEvt=evtD;
+  ButtonEvent singleEvt = {};
+  if      (evtBoot.valid) singleEvt = evtBoot;
+  else if (evtB.valid)    singleEvt = evtB;
+  else if (evtC.valid)    singleEvt = evtC;
+  else if (evtD.valid)    singleEvt = evtD;
 
-  if (appMode==MODE_PHOTO_VIEW && photoViewCaptionVisible && millis()>photoViewCaptionUntilMs)
+  if (appMode == MODE_PHOTO_VIEW && photoViewCaptionVisible && millis() > photoViewCaptionUntilMs)
     photoViewClearCaption();
 
   if (usbModeActive) { if (evtBoot.valid) exitUSBMode(); return; }
@@ -2419,20 +2520,19 @@ void loop() {
   if (recActive) { if (evtB.valid) stopRecording(); else recordFrame(); return; }
 
   switch (appMode) {
-    case MODE_VIEWFINDER:
-      handleModeViewfinder(singleEvt);
-      break;
-    case MODE_GALLERY:       handleModeGallery(singleEvt);                   break;
-    case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                 break;
-    case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
-    case MODE_MENU_LED:      handleModeMenuLed(singleEvt);                   break;
-    case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                   break;
-    case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);               break;
-    case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);              break;
+    case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                  break;
+    case MODE_GALLERY:       handleModeGallery(singleEvt);                     break;
+    case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                   break;
+    case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD);   break;
+    case MODE_MENU_LED:      handleModeMenuLed(singleEvt);                     break;
+    case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                     break;
+    case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                  break;
+    case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                break;
   }
 
   if (appMode != MODE_VIEWFINDER) {
-    islandNoClear = false; // di luar viewfinder, erase boleh jalan
+    islandNoClear = false;
     islandTick();
   }
 }
+
