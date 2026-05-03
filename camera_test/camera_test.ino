@@ -1,53 +1,37 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.6-island-fix + stego-fix
+ * Version: v5.6-island-fix2 + stego-fix
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.6 (fixes di atas v5.5):
+ *  CHANGELOG v5.6-island-fix2 (fixes di atas v5.6):
  *
- *  [FIX-D] Island residue kotak hitam setelah notif hilang
- *    Root cause: islandHide() selalu panggil islandClearArea()
- *    yang fillRect hitam, bahkan saat renderViewfinder() sudah
- *    aktif push frame kamera. Frame kamera menimpa island, lalu
- *    islandClearArea() nulis hitam lagi di atas frame = kotak.
- *    Fix: tambah flag islandNoClear. Saat renderViewfinder tidak
- *    frozen (pushImage aktif), set islandNoClear=true sehingga
- *    islandHide() skip fillRect — frame kamera sendiri yang
- *    "membersihkan" area island secara alami setiap loop.
- *    islandForceHide() selalu reset flag ke false agar clear
- *    tetap jalan saat mode switch (gallery, photo view, dll).
+ *  [FIX-F] Kotak hitam lebih lebar dari island saat animasi
+ *    Root cause: islandDraw() memanggil fillRect(iX-3, 0, iW+6, ...)
+ *    dua kali — sekali saat island di luar layar (branch iY+iH<=0),
+ *    sekali sebelum fillRoundRect. Kedua fillRect ini lebih lebar
+ *    (+6px) dan lebih tinggi dari island itu sendiri, sehingga
+ *    muncul kotak hitam besar yang mencolok setiap animasi jalan.
+ *    Fix: hapus KEDUA fillRect background dari islandDraw().
+ *    Viewfinder: frame kamera yang bersihkan setiap loop.
+ *    Mode lain: islandClearArea() dipanggil dari islandTick()
+ *    SEBELUM islandDraw() agar posisi lama dibersihkan presisi.
  *
- *  [FIX-E] Steganografi tidak menyimpan pesan
- *    Root cause 1: stegoEmbedToJpeg() dipanggil dengan
- *      payLen = strlen(payload)+1 (include \0). Ini membuat
- *      comLen = 2 + payLen menyertakan null byte dalam length
- *      field. Parser extract lalu baca null byte sebagai bagian
- *      payload dan strncmp STEGO_MAGIC bisa gagal jika ada
- *      trailing junk. Fix: payLen = strlen(payload) saja (tanpa
- *      +1), null terminator ditambah manual saat extract.
- *    Root cause 2: ps_malloc(newLen) di stegoEmbedToJpeg bisa
- *      return nullptr jika PSRAM penuh (foto besar RGB565→JPEG).
- *      Kode lama tidak log kegagalan ini — foto tersimpan tanpa
- *      stego tanpa peringatan apapun.
- *      Fix: tambah Serial log + islandPush NOTIF_WARN jika embed
- *      gagal, sehingga user tahu.
- *    Root cause 3: stegoExtractFromJpeg di photoViewDrawCaption
- *      baca file dengan ps_malloc(min(fsize,4096)). Jika ps_malloc
- *      gagal, buf=nullptr dan extract langsung skip tanpa log.
- *      Fix: fallback ke malloc biasa jika ps_malloc gagal, tambah
- *      guard null check eksplisit.
- *    Root cause 4: scan marker di stegoExtractFromJpeg tidak
- *      handle marker 0xFF 0xFF (fill byte padding di beberapa
- *      encoder) → infinite loop / wrong parse. Fix: skip fill
- *      bytes dengan benar.
+ *  [FIX-G] Kotak hitam residue ~0.5s sebelum island naik keluar
+ *    Root cause: di ISLAND_SLIDING_OUT, islandDraw(offsetY) dipanggil
+ *    tanpa membersihkan posisi island sebelumnya. Island bergerak naik
+ *    tapi bekas piksel di posisi lama tidak dihapus → kotak tertinggal
+ *    selama durasi animasi slide-out (~150ms + render lag).
+ *    Fix: di islandTick() case SLIDING_IN dan SLIDING_OUT, tambahkan
+ *    islandClearArea() sebelum islandDraw(offsetY), dengan guard
+ *    islandNoClear untuk skip saat viewfinder aktif.
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.5:
- *  - islandTick() dipanggil di akhir renderViewfinder()
- *  - islandFreezeUntilMs: freeze saat capture agar island terlihat
- *  - applyExpPreset() jaga hmirror/vflip + delay + flush (FIX-B)
- *  - Stego embed ke COM marker JPEG (FIX-C)
- *  - Shadow + highlight + separator di island (smooth)
+ *  TETAP dari v5.6:
+ *  [FIX-D] islandNoClear: skip fillRect saat viewfinder tidak frozen
+ *  [FIX-E] Steganografi: payLen tanpa \0, fallback malloc, null guard
+ *  [FIX-B] applyExpPreset() jaga hmirror/vflip + delay + flush
+ *  [FIX-C] Stego embed ke COM marker JPEG
+ *  Shadow + highlight + separator di island (smooth)
  * ═══════════════════════════════════════════════════════════════
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
@@ -300,11 +284,18 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  DYNAMIC ISLAND — v5.6
+//  DYNAMIC ISLAND — v5.6-island-fix2
 //
-//  [FIX-D] islandNoClear: saat viewfinder tidak frozen, pushImage
-//  frame kamera sudah cukup "membersihkan" bekas island. Skip
+//  [FIX-D] islandNoClear: saat viewfinder tidak frozen, frame kamera
+//  sudah "membersihkan" area island setiap loop. islandHide() skip
 //  islandClearArea() agar tidak muncul kotak hitam residue.
+//
+//  [FIX-F] Hapus fillRect lebar dari islandDraw() — tidak ada lagi
+//  kotak hitam (iW+6) yang mencolok setiap frame animasi.
+//
+//  [FIX-G] islandTick() panggil islandClearArea() sebelum islandDraw()
+//  di state SLIDING_IN dan SLIDING_OUT, agar bekas island di posisi
+//  sebelumnya ikut terhapus — fix delay kotak 0.5s sebelum naik.
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
 #define ISLAND_ANIM_MS       150
@@ -341,7 +332,7 @@ static int           islandLastH     = 0;
 
 static unsigned long islandFreezeUntilMs = 0;
 
-// [FIX-D] Flag: jika true, islandHide() skip fillRect hitam
+// [FIX-D] Flag: jika true, islandHide() dan islandTick() skip fillRect hitam
 static bool islandNoClear = false;
 
 static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
@@ -378,6 +369,20 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  [FIX-F] islandDraw — TIDAK ada fillRect background di sini.
+//
+//  Versi lama punya dua fillRect bermasalah:
+//    1. fillRect(iX-3, 0, iW+6, 4) saat island di luar layar
+//       → gambar kotak hitam tipis 4px walaupun island tidak kelihatan
+//    2. fillRect(iX-3, 0, iW+6, iH+5+max(0,-offsetY)) sebelum roundRect
+//       → area hitam lebih lebar (iW+6) dan tinggi dari island = kotak besar
+//
+//  Fix: kedua fillRect dihapus total.
+//  Pembersihan area lama ditangani oleh:
+//    - Viewfinder: frame kamera pushImage setiap loop (islandNoClear=true)
+//    - Mode lain: islandClearArea() di islandTick() sebelum islandDraw()
+// ─────────────────────────────────────────────────────────────────────────────
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
@@ -387,18 +392,18 @@ static void islandDraw(int offsetY = 0) {
   int iX = ISLAND_CX - iW / 2;
   int iY = offsetY;
 
+  // Simpan bounds untuk islandClearArea()
   islandLastX = iX;
   islandLastY = 0;
   islandLastW = iW;
   islandLastH = iH;
 
-  if (iY + iH <= 0) {
-    lcd.fillRect(iX - 3, 0, iW + 6, 4, COL_BLACK);
-    return;
-  }
+  // [FIX-F] Island sepenuhnya di luar layar → tidak perlu gambar apa-apa.
+  // Dulu ada fillRect hitam di sini — itu sumber kotak tipis residue.
+  if (iY + iH <= 0) return;
 
-  lcd.fillRect(iX - 3, 0, iW + 6, iH + 5 + max(0, -offsetY), COL_BLACK);
-
+  // [FIX-F] Tidak ada fillRect background di sini.
+  // Langsung gambar island dengan roundRect.
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
   lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
   lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
@@ -448,6 +453,20 @@ void islandPush(NotifType type, const char* text) {
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  [FIX-G] islandTick — panggil islandClearArea() sebelum islandDraw()
+//  di state SLIDING_IN dan SLIDING_OUT, dengan guard islandNoClear.
+//
+//  Kenapa guard islandNoClear diperlukan:
+//    - Saat viewfinder aktif (tidak frozen), frame kamera pushImage
+//      setiap loop sudah membersihkan bekas island secara alami.
+//      Kalau kita juga panggil islandClearArea() (fillRect hitam),
+//      hasilnya double-clear: frame kamera datang → island muncul →
+//      fillRect hitam → island menimpa hitam → sedikit flicker.
+//    - Saat mode lain (gallery, photo view, dll) atau viewfinder frozen,
+//      tidak ada pushImage aktif → islandClearArea() wajib dipanggil
+//      agar bekas island di posisi lama terhapus sebelum redraw.
+// ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
 
@@ -459,6 +478,8 @@ void islandTick() {
       unsigned long elapsed = now - islandAnimStart;
       if (elapsed >= ISLAND_ANIM_MS) {
         islandState = ISLAND_VISIBLE;
+        // [FIX-G] Bersihkan area lama sebelum gambar posisi final
+        if (!islandNoClear && islandLastW > 0) islandClearArea();
         islandDraw(0);
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
@@ -466,6 +487,8 @@ void islandTick() {
         int nItems = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
         int offsetY = (int)(-targetH * (1.0f - progress));
+        // [FIX-G] Bersihkan posisi island frame sebelumnya
+        if (!islandNoClear && islandLastW > 0) islandClearArea();
         islandDraw(offsetY);
       }
       break;
@@ -492,6 +515,9 @@ void islandTick() {
         int nItems = min(islandCount, ISLAND_MAX_STACK);
         int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
         int offsetY = (int)(-targetH * progress);
+        // [FIX-G] Bersihkan bekas island sebelum gambar di posisi baru
+        // Ini yang fix "kotak hitam 0.5s sebelum island naik keluar"
+        if (!islandNoClear && islandLastW > 0) islandClearArea();
         islandDraw(offsetY);
       }
       break;
@@ -510,21 +536,7 @@ void islandForceHide() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI — v5.6 (FIX-E)
-//
-//  stegoEmbedToJpeg():
-//    - payLen = strlen(payload) TANPA \0
-//    - Tambah Serial log untuk debug
-//    - Fallback graceful jika ps_malloc gagal
-//
-//  stegoExtractFromJpeg():
-//    - Handle padding byte 0xFF 0xFF dengan benar
-//    - Tambah null terminator eksplisit setelah memcpy
-//    - Guard pos overflow lebih ketat
-//
-//  photoViewDrawCaption():
-//    - Fallback malloc biasa jika ps_malloc gagal
-//    - Guard null check buf eksplisit
+//  STEGANOGRAFI — v5.6 (FIX-E, tidak berubah dari v5.6)
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
@@ -535,12 +547,6 @@ void stegoMakePayload(char* out, int maxLen, int photoNum) {
 }
 
 // [FIX-E] stegoEmbedToJpeg — payLen = strlen(payload), TANPA \0
-// COM marker layout yang dihasilkan:
-//   [0..1]  = FF D8  (SOI)
-//   [2..3]  = FF FE  (COM marker)
-//   [4..5]  = big-endian(2 + payLen)  (length field)
-//   [6..6+payLen-1] = payload bytes
-//   [6+payLen..]    = sisa JPEG asli (skip SOI asli)
 uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
                            const char* payload, int payLen,
                            size_t* outLen) {
@@ -554,14 +560,11 @@ uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
     return nullptr;
   }
 
-  // COM header = 2 byte marker (FF FE) + 2 byte length = 4 byte
-  // Total penambahan = 4 + payLen
   int    comTotal = 4 + payLen;
   size_t newLen   = jpgLen + (size_t)comTotal;
 
   uint8_t* out = (uint8_t*)ps_malloc(newLen);
   if (!out) {
-    // Fallback ke heap biasa
     out = (uint8_t*)malloc(newLen);
     if (!out) {
       Serial.printf("[STEGO] embed: alokasi %u byte gagal\n", (unsigned)newLen);
@@ -570,24 +573,16 @@ uint8_t* stegoEmbedToJpeg(const uint8_t* jpgIn, size_t jpgLen,
     Serial.println("[STEGO] embed: ps_malloc gagal, pakai malloc biasa");
   }
 
-  // Tulis SOI baru
   out[0] = 0xFF;
   out[1] = 0xD8;
-
-  // Tulis COM marker
   out[2] = 0xFF;
   out[3] = 0xFE;
 
-  // Tulis length field (big-endian). Nilai = 2 + payLen
-  // (sesuai spec JFIF: length field menyertakan 2 byte length itu sendiri)
   uint16_t comLen = (uint16_t)(2 + payLen);
   out[4] = (uint8_t)((comLen >> 8) & 0xFF);
   out[5] = (uint8_t)(comLen & 0xFF);
 
-  // Tulis payload (tanpa \0)
   memcpy(out + 6, payload, (size_t)payLen);
-
-  // Salin sisa JPEG asli (lewati SOI asli di [0..1])
   memcpy(out + 6 + payLen, jpgIn + 2, jpgLen - 2);
 
   *outLen = newLen;
@@ -605,32 +600,27 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
 
   size_t pos = 2;
   while (pos + 3 < jpgLen) {
-    // Harus mulai dengan 0xFF
     if (jpgBuf[pos] != 0xFF) break;
 
-    // Skip padding bytes 0xFF 0xFF (beberapa encoder tambahkan ini)
     uint8_t marker = jpgBuf[pos + 1];
     if (marker == 0xFF) { pos++; continue; }
 
-    if (marker == 0xD8) { pos += 2; continue; } // SOI redundant, skip
-    if (marker == 0xD9) break;                   // EOI, berhenti
+    if (marker == 0xD8) { pos += 2; continue; }
+    if (marker == 0xD9) break;
 
-    // Marker tanpa length field (standalone): D0-D7, D8, D9
     if (marker >= 0xD0 && marker <= 0xD7) { pos += 2; continue; }
 
-    // Baca length field (perlu setidaknya 2 byte lagi setelah marker)
     if (pos + 3 >= jpgLen) break;
     uint16_t segLen = ((uint16_t)jpgBuf[pos + 2] << 8) | jpgBuf[pos + 3];
-    if (segLen < 2) break; // length field minimum = 2 (termasuk dirinya sendiri)
+    if (segLen < 2) break;
 
     if (marker == 0xFE) {
-      // COM marker ditemukan
-      int dataLen = (int)segLen - 2; // panjang data aktual (tanpa 2 byte length)
+      int dataLen = (int)segLen - 2;
       if (dataLen <= 0) { pos += 2 + segLen; continue; }
 
       int readLen = (dataLen < maxLen - 1) ? dataLen : maxLen - 1;
       memcpy(outPayload, jpgBuf + pos + 4, (size_t)readLen);
-      outPayload[readLen] = '\0'; // [FIX-E] null terminator eksplisit
+      outPayload[readLen] = '\0';
 
       bool match = (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
       Serial.printf("[STEGO] extract: dataLen=%d payload='%s' magic=%s\n",
@@ -638,7 +628,6 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
       return match;
     }
 
-    // Skip segmen lain
     size_t skip = 2 + (size_t)segLen;
     if (pos + skip > jpgLen) break;
     pos += skip;
@@ -1148,17 +1137,14 @@ void photoViewDrawCaption(int idx) {
 
       if (fsize_l > 0) {
         size_t fsize = (size_t)fsize_l;
-        // Baca cukup untuk header JPEG — COM marker ada di awal, 8KB lebih dari cukup
         size_t readSize = (fsize < 8192) ? fsize : 8192;
 
         uint8_t* buf = (uint8_t*)ps_malloc(readSize);
-        if (!buf) buf = (uint8_t*)malloc(readSize); // [FIX-E] fallback
+        if (!buf) buf = (uint8_t*)malloc(readSize);
         if (buf) {
           size_t readN = fread(buf, 1, readSize, f);
           char payload[STEGO_PAYLOAD_LEN + 1];
           if (stegoExtractFromJpeg(buf, readN, payload, sizeof(payload))) {
-            // payload: "SANZXCAM|0001|v5.6"
-            // Tampilkan bagian setelah magic: "|0001|v5.6"
             char* p1 = strchr(payload, '|');
             if (p1) {
               snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1 + 1);
@@ -1554,7 +1540,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.6  island-fix  stego-fix",DISP_W/2-70,103);
+  lcd.drawString("v5.6  island-fix2  stego-fix",DISP_W/2-72,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1567,7 +1553,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND","NoClear fix  residue solved",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND","NoClear+ClearBefore fix2",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(182,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(194,"EXTRACT","padding skip  null guard  8KB",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
@@ -1703,7 +1689,7 @@ void toggleFaceDetect() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Exposure (dari v5.5 FIX-B — tidak berubah)
+//  Exposure (FIX-B — tidak berubah)
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
   sensor_t *s = esp_camera_sensor_get();
@@ -1741,9 +1727,9 @@ void applyExpPreset(uint8_t preset) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  VIEWFINDER — v5.6 (FIX-D)
+//  VIEWFINDER — v5.6-island-fix2
 //
-//  Set islandNoClear = !frozen setiap frame.
+//  [FIX-D] Set islandNoClear = !frozen setiap frame.
 //  Saat tidak frozen: pushImage aktif → frame kamera membersihkan
 //  bekas island → islandHide() tidak perlu fillRect hitam.
 //  Saat frozen: pushImage skip → islandHide() boleh fillRect.
@@ -1799,23 +1785,13 @@ void renderViewfinder() {
     }
 
     esp_camera_fb_return(fb);
-
-  } else {
-    // Mode freeze: layar statis, island menyelesaikan animasinya
-    // islandNoClear = false saat frozen → islandHide() boleh fillRect
-    // (tapi frame statis sudah ada, jadi sedikit flicker di sisi island)
   }
 
   islandTick();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview — v5.6 (FIX-E)
-//
-//  Perubahan dari v5.5:
-//  - payLen = (int)strlen(payload)  → TANPA +1, tidak sertakan \0
-//  - Tambah islandPush WARN jika stegoEmbed gagal (alokasi)
-//  - Serial log semua path: embed ok / embed fail / no stego
+//  captureAndPreview — v5.6 (FIX-E, tidak berubah)
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
@@ -1853,17 +1829,15 @@ void captureAndPreview() {
       photoCount++;
 
       // [FIX-E] payLen = strlen saja, TANPA +1
-      // \0 tidak boleh ikut dalam length field COM marker
       char payload[STEGO_PAYLOAD_LEN];
       stegoMakePayload(payload, sizeof(payload), photoCount);
-      int payLen = (int)strlen(payload); // ← FIX: tidak +1
+      int payLen = (int)strlen(payload);
 
       size_t finalLen = 0;
       uint8_t* finalBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
                                             payload, payLen,
                                             &finalLen);
       if (!finalBuf) {
-        // [FIX-E] Log kegagalan embed — foto tetap disimpan tanpa stego
         Serial.printf("[STEGO] WARN: embed gagal untuk photo_%04d, simpan tanpa stego\n", photoCount);
       }
 
@@ -1964,7 +1938,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.6 island-fix + stego-fix ===");
+  Serial.println("\n=== Sanzxcam v5.6-island-fix2 + stego-fix ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
@@ -2185,7 +2159,7 @@ void handleModeDialogDelete(ButtonEvent evt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  LOOP — v5.6
+//  LOOP — v5.6-island-fix2
 // ─────────────────────────────────────────────────────────────────────────────
 void loop() {
   esp_task_wdt_reset();
