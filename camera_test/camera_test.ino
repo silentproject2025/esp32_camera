@@ -27,6 +27,7 @@
  *  [BOOT-GLITCH] Boot animation baru:
  *    - Fase 1: Splash dengan efek glitch — teks acak → SANZXCAM,
  *      chromatic aberration (ghost merah & biru), glitch bars
+ *      UPDATED: durasi Fase 1 diperpanjang ~1.2s → ~2.5s
  *    - Fase 2: Full screen boot log dengan 4 section:
  *      CAMERA, STORAGE, SYSTEM, BUILD
  *      Log rows muncul satu-satu, diakhiri progress bar + READY
@@ -432,7 +433,6 @@ void islandPush(NotifType type, const char* text) {
   islandStack[0].text[sizeof(islandStack[0].text) - 1] = '\0';
   if (islandCount < ISLAND_MAX_STACK) islandCount++;
   islandShowAt    = millis();
-  // Durasi berbeda per tipe notif
   int showMs = (type == NOTIF_WARN) ? 2000 : (type == NOTIF_INFO) ? 800 : 1000;
   islandHideAt    = millis() + showMs;
   islandAnimStart = millis();
@@ -1178,7 +1178,6 @@ void scanGalleryFiles() {
   }
   closedir(dir);
 
-  // Insertion sort — lebih efisien untuk data hampir urut
   for (int i = 1; i < galleryCount; i++) {
     char tmpN[32];
     strncpy(tmpN, galleryFiles[i], 31); tmpN[31] = '\0';
@@ -1201,7 +1200,6 @@ void drawGallery() {
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
 
-  // Header dengan info halaman
   int currentPage = galleryScroll / GALLERY_ITEMS_PAGE + 1;
   int totalPage   = max(1, (galleryCount + GALLERY_ITEMS_PAGE - 1) / GALLERY_ITEMS_PAGE);
   char hdr[32];
@@ -1209,7 +1207,6 @@ void drawGallery() {
   lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("B=BACK", DISP_W - 46, 6);
-  // Nomor halaman di kiri atas
   char pageInfo[8];
   snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
   lcd.setTextColor(COL_GRAY_3);
@@ -1807,7 +1804,6 @@ void drawRecIndicator() {
   lcd.fillCircle(10, 11, 4, blink ? COL_WHITE : COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString(timeBuf, 18, 4);
-  // Tambah frame count
   char fBuf[10]; snprintf(fBuf, sizeof(fBuf), "%df", recFrameCount);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString(fBuf, 18, 14);
@@ -1873,14 +1869,16 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BOOT ANIMATION — v5.9-fix
-//  Fase 1: Splash dengan efek glitch (teks acak → SANZXCAM, chromatic
-//          aberration, glitch bars horizontal)
-//  Fase 2: Full screen boot log dengan 4 section:
-//          CAMERA, STORAGE, SYSTEM, BUILD
+//  BOOT ANIMATION — v5.9-fix  [UPDATED: durasi diperpanjang ~1.2s → ~2.5s]
+//
+//  Perubahan dari versi sebelumnya:
+//    - glitchScrambleText step delay: 30ms → 50ms  (+~160ms total)
+//    - Delay setelah teks utama muncul: 0ms → 400ms (+400ms)
+//    - Delay sebelum wipe (subtitle): 100ms → 600ms (+500ms)
+//    - Delay setelah glitch akhir: 300ms → 800ms   (+500ms)
+//    - Wipe stripe delay: 4ms → 10ms               (+~180ms)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Karakter acak untuk efek glitch
 static const char GLITCH_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
 static const int  GLITCH_CHAR_COUNT = sizeof(GLITCH_CHARS) - 1;
 
@@ -1888,7 +1886,6 @@ char glitchRandChar() {
   return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)];
 }
 
-// Gambar teks scramble di tengah layar — huruf acak → target
 void glitchScrambleText(const char* target, int cx, int cy,
                         uint16_t col, int steps, int stepDelayMs) {
   int len = strlen(target);
@@ -1900,7 +1897,6 @@ void glitchScrambleText(const char* target, int cx, int cy,
     }
     buf[len] = '\0';
 
-    // Erase area
     lcd.fillRect(cx - 70, cy - 8, 140, 16, COL_BLACK);
     lcd.setFont(&fonts::FreeSansBold9pt7b);
     int tw = lcd.textWidth(buf);
@@ -1913,7 +1909,6 @@ void glitchScrambleText(const char* target, int cx, int cy,
   }
 }
 
-// Gambar glitch bars horizontal acak
 void glitchBarsFlash(int count, int delayMs) {
   for (int i = 0; i < count; i++) {
     int barY = random(DISP_H);
@@ -1927,24 +1922,19 @@ void glitchBarsFlash(int count, int delayMs) {
   }
 }
 
-// Gambar chromatic aberration ghost
 void glitchChromatic(const char* text, int cx, int cy, int offsetX, uint16_t colR, uint16_t colB) {
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   int tw = lcd.textWidth(text);
-  // Ghost merah (geser kiri)
   lcd.setTextColor(colR);
   lcd.drawString(text, cx - tw / 2 - offsetX, cy - 7);
-  // Ghost biru (geser kanan)
   lcd.setTextColor(colB);
   lcd.drawString(text, cx - tw / 2 + offsetX, cy - 7);
 }
 
-// Satu baris log di boot log full screen
 void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString(label, 8, y);
-  // Titik-titik
   int lx = 8 + lcd.textWidth(label) + 2;
   for (int dx = lx; dx < 230; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_2);
   lcd.setTextColor(valCol);
@@ -1952,7 +1942,6 @@ void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
   esp_task_wdt_reset();
 }
 
-// Section header
 void bootLogSection(int y, const char* title) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_3);
@@ -1964,6 +1953,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
                      bool xclkOK, uint32_t xclkHz) {
 
   // ── FASE 1: SPLASH GLITCH ────────────────────────────────────────────────
+  // Total durasi Fase 1: ~2.5 detik (sebelumnya ~1.2 detik)
   lcd.fillScreen(COL_BLACK);
 
   int cx = DISP_W / 2;
@@ -1983,7 +1973,8 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   glitchBarsFlash(6, 15);
 
   // Scramble teks → SANZXCAM
-  glitchScrambleText("SANZXCAM", cx, cy, COL_GRAY_C, 8, 30);
+  // [UPDATED] step delay 30ms → 50ms: total ~240ms → ~400ms
+  glitchScrambleText("SANZXCAM", cx, cy, COL_GRAY_C, 8, 50);
 
   // Chromatic aberration
   glitchChromatic("SANZXCAM", cx, cy, 3, 0xF000, 0x001F);
@@ -1995,6 +1986,9 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   lcd.setTextColor(COL_GRAY_E);
   int tw1 = lcd.textWidth("SANZXCAM");
   lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
+
+  // [UPDATED] Jeda setelah teks muncul normal: 0ms → 400ms
+  delay(400); esp_task_wdt_reset();
 
   // Glitch bars lagi
   glitchBarsFlash(4, 20);
@@ -2011,7 +2005,8 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   // Divider
   lcd.drawFastHLine(cx - 80, cy + 32, 160, COL_GRAY_2);
 
-  delay(100); esp_task_wdt_reset();
+  // [UPDATED] Jeda sebelum glitch akhir: 100ms → 600ms
+  delay(600); esp_task_wdt_reset();
 
   // Satu glitch akhir sebelum transisi
   glitchBarsFlash(3, 25);
@@ -2024,12 +2019,14 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
 
-  delay(300); esp_task_wdt_reset();
+  // [UPDATED] Jeda setelah restore final: 300ms → 800ms
+  delay(800); esp_task_wdt_reset();
 
   // Fade out: wipe ke hitam
+  // [UPDATED] Stripe delay: 4ms → 10ms (lebih smooth, +~180ms)
   for (int stripe = 0; stripe < DISP_H; stripe += 8) {
     lcd.fillRect(0, stripe, DISP_W, 8, COL_BLACK);
-    delay(4); esp_task_wdt_reset();
+    delay(10); esp_task_wdt_reset();
   }
 
   // ── FASE 2: BOOT LOG FULL SCREEN ─────────────────────────────────────────
@@ -2231,7 +2228,6 @@ void updateFPS() {
   fpsFrameCount++;
   unsigned long elapsed = millis() - fpsLastTime;
   if (elapsed >= 500) {
-    // Exponential smoothing agar FPS tidak lompat-lompat
     float newFps = fpsFrameCount * 1000.0f / elapsed;
     fpsValue = fpsValue * 0.7f + newFps * 0.3f;
     fpsFrameCount = 0; fpsLastTime = millis();
@@ -2315,7 +2311,6 @@ void renderViewfinder() {
     if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
       lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
 
-      // Corner brackets: merah saat REC, putih saat face detect, abu normal
       uint16_t bktCol = recActive ? 0xF800 : (faceDetectMode ? COL_WHITE : COL_GRAY_E);
       drawCornerBrackets(bktCol);
 
@@ -2324,7 +2319,6 @@ void renderViewfinder() {
       char fpsBuf[12]; snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
       drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
 
-      // Sensor pill — tambah tanda flash jika aktif
       char sensorPill[20];
       snprintf(sensorPill, sizeof(sensorPill), "%s%s", sensorName, ledFlashEnabled ? " *" : "");
       drawPill(DISP_W-42, 10, sensorPill, COL_PILL_BG, COL_GRAY_A);
@@ -2532,7 +2526,7 @@ bool initCamera() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.9-fix ===");
-  Serial.println("[BOOT-GLITCH] boot animation baru aktif");
+  Serial.println("[BOOT-GLITCH] boot animation diperpanjang ~2.5s");
 
   galleryFiles    = (char(*)[32])    ps_malloc(GALLERY_MAX_FILES * 32);
   galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
@@ -2661,7 +2655,6 @@ void handleModeGallery(ButtonEvent evt) {
 }
 
 void handleModePhotoView(ButtonEvent evt) {
-  // Hold pan saat zoom aktif
   static unsigned long lastPanTime = 0;
   bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
   if (photoZoomLevel > 0 && (cHeld || dHeld) && millis() - lastPanTime > 120) {
@@ -2824,7 +2817,6 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
     islandNoClear = true; appMode = MODE_VIEWFINDER; return;
   }
   bool changed = false;
-  // Step adaptif: halus di shadow, cepat di highlight
   int step = (expManualVal < 100) ? 10 : (expManualVal < 400) ? 25 : 50;
   if (evt.pin == BTN_C) { expManualVal  = constrain(expManualVal  - step, 0, 1200); changed = true; }
   if (evt.pin == BTN_D) { expManualVal  = constrain(expManualVal  + step, 0, 1200); changed = true; }
@@ -2833,7 +2825,6 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
 }
 
 void handleModeDialogDelete(ButtonEvent evt) {
-  // Progress bar timeout
   unsigned long elapsed = millis() - deleteDialogOpenMs;
   if (elapsed < DELETE_TIMEOUT_MS) {
     int dw = 200, dx = (DISP_W - dw) / 2, dy = (DISP_H - 80) / 2;
