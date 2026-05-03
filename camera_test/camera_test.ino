@@ -308,7 +308,7 @@ inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btn
 //  [ISLAND-3] islandErase() tanpa parameter, pakai islandLast*
 //  [ISLAND-4] islandDraw() simpan Last* sebelum early return
 // ─────────────────────────────────────────────────────────────────────────────
-#define ISLAND_SHOW_MS      2000
+#define ISLAND_SHOW_MS      1000
 #define ISLAND_ANIM_MS       150
 #define ISLAND_MAX_STACK       3
 #define ISLAND_W_SINGLE      188
