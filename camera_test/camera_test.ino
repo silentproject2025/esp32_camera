@@ -1,6 +1,6 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.6-island-fix6 + stego-fix
+ * Version: v5.6-island-fix7 + stego-fix
  *
  * ═══════════════════════════════════════════════════════════════
  *  CHANGELOG v5.6-island-fix2 (fixes di atas v5.6):
@@ -332,15 +332,38 @@ static int           islandLastH     = 0;
 
 static unsigned long islandFreezeUntilMs = 0;
 
-// [FIX-D] islandNoClear: diset oleh renderViewfinder() setiap frame.
-// true = viewfinder aktif push frame → frame kamera yang bersihkan layar.
-// false = frozen / mode lain → clear manual diperlukan.
+// islandNoClear: true saat viewfinder push frame aktif (tidak frozen).
+// Frame kamera menimpa seluruh layar setiap loop → tidak perlu fillRect.
+// false saat frozen atau mode non-viewfinder → fillRect manual diperlukan.
 static bool islandNoClear = false;
 
-// islandNoClearSnapshot: snapshot islandNoClear saat islandPush() dipanggil.
-// Animasi pakai snapshot ini agar tidak berubah di tengah animasi
-// ketika freeze timer habis sebelum slide-out selesai.
-static bool islandNoClearSnapshot = false;
+// ─────────────────────────────────────────────────────────────────────────────
+//  PRINSIP RENDERING ISLAND (final, bersih):
+//
+//  islandDraw(offsetY) — HANYA menggambar island. Tidak ada clear di sini.
+//  islandErase(iX, iW, iH) — HANYA menghapus area island. Dipanggil eksplisit
+//    dari islandTick() sebelum menggambar posisi baru, dan dari islandHide()
+//    saat force-hide. TIDAK dipanggil saat akhir slide-out normal karena
+//    island sudah di luar layar.
+//
+//  Kenapa dipisah:
+//  - islandDraw tidak perlu tahu cara clear — single responsibility
+//  - islandTick tahu kapan perlu clear (saat animasi, posisi berubah)
+//    dan kapan tidak (saat VISIBLE statis, saat viewfinder push frame)
+//  - Tidak ada state tracking prevBottom yang bisa stale
+//
+//  Guard islandNoClear di islandErase:
+//  - Saat viewfinder aktif (tidak frozen): frame kamera pushImage setiap
+//    loop → menimpa seluruh layar → erase tidak diperlukan, skip
+//  - Saat frozen / mode lain: erase wajib agar bekas island hilang
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Hitung dimensi island berdasarkan jumlah item
+static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
+  iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
+  iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
+  iX = ISLAND_CX - iW / 2;
+}
 
 static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
@@ -376,63 +399,31 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  islandDraw — v5.6-island-fix4
-//
-//  Pendekatan: island menggambar dirinya sendiri di atas layar tanpa
-//  fillRect background apapun. Satu-satunya "clear" adalah satu baris
-//  tipis di tepi bawah island frame sebelumnya — hanya saat animasi
-//  (offsetY berubah) dan hanya saat islandNoClear=false.
-//
-//  Kenapa pendekatan ini benar:
-//  - fillRect(0,0,DISP_W,stripH) menyebabkan band hitam sepertiga layar
-//    saat frozen karena tidak ada frame kamera yang menimpa
-//  - Island selalu di top-center, roundRect sudah solid — tidak perlu
-//    background hitam, island body sendiri yang "bersihkan" area lama
-//    dengan cara menimpa piksel lama
-//  - Satu-satunya piksel yang tidak tertimpa adalah baris tepat di bawah
-//    island saat ia bergerak naik (sliding out) — itu yang di-clear
-//
-//  islandPrevBottom: tepi bawah island frame sebelumnya (iY + iH + shadow)
-//  Saat sliding: clear strip tipis dari islandPrevBottom ke bawah 3px
-//  Saat frozen/visible: tidak ada gerakan, tidak perlu clear apapun
-// ─────────────────────────────────────────────────────────────────────────────
-static int islandPrevBottom = -1; // tepi bawah island frame sebelumnya
+// Hapus area island (termasuk shadow +3px semua sisi).
+// Selalu mulai dari y=0 karena island selalu di top layar.
+// Dipanggil EKSPLISIT dari islandTick — tidak otomatis dari islandDraw.
+static void islandErase(int iX, int iW, int iH) {
+  if (islandNoClear) return; // viewfinder push frame → tidak perlu
+  // +3 kiri/kanan, +4 bawah untuk cover shadow sepenuhnya
+  lcd.fillRect(iX - 3, 0, iW + 6, iH + 4, COL_BLACK);
+}
 
+// Gambar island di offsetY. Tidak ada clear di sini — caller yang bertanggung jawab.
 static void islandDraw(int offsetY = 0) {
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
 
-  int iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
-  int iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
-  int iX = ISLAND_CX - iW / 2;
+  int iW, iH, iX;
+  islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
-  int iBottom = iY + iH + 2; // +2 untuk shadow
 
-  // Simpan bounds untuk islandClearArea() di islandHide()
+  // Simpan bounds untuk islandForceHide()
   islandLastX = iX;
-  islandLastY = 0;
   islandLastW = iW;
   islandLastH = iH;
 
-  // Saat animasi (island bergerak naik), clear strip tipis antara posisi
-  // bawah island sekarang dan posisi bawah frame sebelumnya.
-  // Pakai islandNoClearSnapshot (bukan islandNoClear) agar konsisten
-  // dari awal sampai akhir animasi walau freeze timer habis di tengah jalan.
-  if (!islandNoClearSnapshot && islandPrevBottom > iBottom && islandPrevBottom > 0) {
-    int clearY = max(0, iBottom);
-    int clearH = islandPrevBottom - clearY + 1;
-    if (clearH > 0) {
-      lcd.fillRect(iX - 2, clearY, iW + 4, clearH, COL_BLACK);
-    }
-  }
-  islandPrevBottom = (iY + iH <= 0) ? -1 : iBottom;
+  if (iY + iH <= 0) return; // sepenuhnya di luar layar, tidak perlu gambar
 
-  // Island sepenuhnya di luar layar → selesai (strip sudah di-clear di atas)
-  if (iY + iH <= 0) return;
-
-  // Gambar island: shadow → body → border dalam
-  // Island body solid menutupi piksel lama — tidak perlu fillRect background
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
   lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
   lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
@@ -451,21 +442,11 @@ static void islandDraw(int offsetY = 0) {
   }
 }
 
-static void islandClearArea() {
-  if (islandLastW > 0 && islandLastH > 0) {
-    lcd.fillRect(islandLastX - 3, 0, islandLastW + 6, islandLastH + 7, COL_BLACK);
-  }
-}
-
-// islandHide: dipanggil di akhir animasi slide-out — island sudah di luar
-// layar, tidak ada yang perlu di-clear. Reset state saja.
-// islandClearArea() TIDAK dipanggil di sini — island sudah tidak terlihat.
 static void islandHide() {
-  islandState      = ISLAND_HIDDEN;
-  islandCount      = 0;
-  islandLastW      = 0;
-  islandLastH      = 0;
-  islandPrevBottom = -1;
+  islandState = ISLAND_HIDDEN;
+  islandCount = 0;
+  islandLastW = 0;
+  islandLastH = 0;
 }
 
 void islandPush(NotifType type, const char* text) {
@@ -480,19 +461,26 @@ void islandPush(NotifType type, const char* text) {
   islandHideAt    = millis() + ISLAND_SHOW_MS;
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
-  islandPrevBottom = -1; // reset tracking setiap notif baru
-  islandNoClearSnapshot = islandNoClear; // snapshot saat push
 
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  islandTick — v5.6-island-fix3
+//  islandTick — final
 //
-//  Sekarang sangat simpel: cukup panggil islandDraw(offsetY).
-//  islandDraw() sendiri yang handle strip bersih sebelum menggambar,
-//  dengan guard islandNoClear — tidak ada lagi islandClearArea() di sini.
-//  islandClearArea() hanya dipanggil dari islandHide() dan islandForceHide().
+//  Pola untuk setiap frame animasi:
+//    1. Hitung offsetY baru
+//    2. islandErase(iX, iW, iH) — hapus area island di layar
+//    3. islandDraw(offsetY)     — gambar island di posisi baru
+//
+//  islandErase di-guard oleh islandNoClear — saat viewfinder aktif,
+//  frame kamera yang menimpa layar, erase tidak perlu.
+//
+//  ISLAND_VISIBLE: tidak ada animasi, tidak perlu erase/redraw
+//  kecuali NOTIF_REC yang butuh blink dot.
+//
+//  Akhir SLIDING_OUT: island sudah di luar layar (offsetY = -iH penuh),
+//  tidak perlu erase — langsung islandHide().
 // ─────────────────────────────────────────────────────────────────────────────
 void islandTick() {
   unsigned long now = millis();
@@ -503,15 +491,19 @@ void islandTick() {
 
     case ISLAND_SLIDING_IN: {
       unsigned long elapsed = now - islandAnimStart;
+      int nItems = min(islandCount, ISLAND_MAX_STACK);
+      int iW, iH, iX;
+      islandCalcDims(nItems, iW, iH, iX);
+
       if (elapsed >= ISLAND_ANIM_MS) {
         islandState = ISLAND_VISIBLE;
+        islandErase(iX, iW, iH);
         islandDraw(0);
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = 1.0f - pow(1.0f - progress, 3);
-        int nItems = min(islandCount, ISLAND_MAX_STACK);
-        int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
-        int offsetY = (int)(-targetH * (1.0f - progress));
+        int offsetY = (int)(-iH * (1.0f - progress));
+        islandErase(iX, iW, iH);
         islandDraw(offsetY);
       }
       break;
@@ -522,6 +514,7 @@ void islandTick() {
         islandAnimStart = now;
         islandState = ISLAND_SLIDING_OUT;
       } else {
+        // Statis — hanya redraw kalau NOTIF_REC (dot blink)
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
           islandDraw(0);
         }
@@ -530,21 +523,19 @@ void islandTick() {
 
     case ISLAND_SLIDING_OUT: {
       unsigned long elapsed = now - islandAnimStart;
+      int nItems = min(islandCount, ISLAND_MAX_STACK);
+      int iW, iH, iX;
+      islandCalcDims(nItems, iW, iH, iX);
+
       if (elapsed >= ISLAND_ANIM_MS) {
-        // Satu kali clear presisi: hapus sisa piksel island di tepi atas layar.
-        // Gunakan islandLastX/W/H yang masih valid dari frame animasi terakhir.
-        // Area yang di-clear sangat kecil (island sudah hampir keluar layar)
-        // sehingga tidak menyebabkan band hitam besar.
-        if (islandLastW > 0 && islandLastH > 0) {
-          lcd.fillRect(islandLastX - 2, 0, islandLastW + 4, min(islandLastH + 4, 10), COL_BLACK);
-        }
+        // Island sudah sepenuhnya keluar layar (offsetY = -iH).
+        // Tidak ada piksel island yang terlihat → tidak perlu erase.
         islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = pow(progress, 3);
-        int nItems = min(islandCount, ISLAND_MAX_STACK);
-        int targetH = ISLAND_PAD_V * 2 + nItems * ISLAND_H_ROW + (nItems - 1) * 2;
-        int offsetY = (int)(-targetH * progress);
+        int offsetY = (int)(-iH * progress);
+        islandErase(iX, iW, iH);
         islandDraw(offsetY);
       }
       break;
@@ -552,15 +543,15 @@ void islandTick() {
   }
 }
 
-// islandForceHide: dipanggil saat mode switch — island mungkin masih terlihat.
-// islandClearArea() wajib untuk hapus island yang masih di tengah layar.
+// islandForceHide: paksa sembunyi saat mode switch.
+// Island mungkin masih di tengah animasi dan masih terlihat di layar.
+// Erase manual diperlukan sebelum reset state.
 void islandForceHide() {
-  islandNoClear         = false;
-  islandNoClearSnapshot = false;
-  if (islandState != ISLAND_HIDDEN) {
-    islandClearArea();
-    islandHide();
+  islandNoClear = false;
+  if (islandState != ISLAND_HIDDEN && islandLastW > 0) {
+    islandErase(islandLastX, islandLastW, islandLastH);
   }
+  islandHide();
   islandFreezeUntilMs = 0;
 }
 
@@ -1569,7 +1560,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM",DISP_W/2-57,85);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("v5.6  island-fix6  stego-fix",DISP_W/2-72,103);
+  lcd.drawString("v5.6  island-fix7  stego-fix",DISP_W/2-72,103);
   lcd.drawFastHLine(20,116,DISP_W-40,COL_GRAY_2);
   esp_task_wdt_reset(); delay(200);
 
@@ -1582,7 +1573,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,bool xclkOK
   bootLogLine(146,"SENSOR PID",buf,pidOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
   snprintf(buf,sizeof(buf),"%uMHz  OK",xclkHz/1000000);
   bootLogLine(158,"XCLK",buf,xclkOK?COL_GRAY_E:COL_GRAY_5); delay(120); esp_task_wdt_reset();
-  bootLogLine(170,"ISLAND","fix6: snapshot NoClear, no-limit",COL_GRAY_E); delay(120); esp_task_wdt_reset();
+  bootLogLine(170,"ISLAND","fix7: erase/draw split, clean",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(182,"STEGO","COM marker  payLen fix  fallback",COL_GRAY_E); delay(120); esp_task_wdt_reset();
   bootLogLine(194,"EXTRACT","padding skip  null guard  8KB",COL_GRAY_E); delay(120); esp_task_wdt_reset();
 
@@ -1967,7 +1958,7 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.6-island-fix6 + stego-fix ===");
+  Serial.println("\n=== Sanzxcam v5.6-island-fix7 + stego-fix ===");
 
   galleryFiles   = (char(*)[32]) ps_malloc(GALLERY_MAX_FILES * 32);
   galleryIsVideo = (bool*)        ps_malloc(GALLERY_MAX_FILES * sizeof(bool));
