@@ -15,6 +15,7 @@
 [![Platform](https://img.shields.io/badge/platform-ESP32--S3-blue?style=flat-square)](https://www.espressif.com/en/products/socs/esp32-s3)
 [![Display](https://img.shields.io/badge/display-ILI9341%20320×240-lightgrey?style=flat-square)](#hardware)
 [![Sensor](https://img.shields.io/badge/sensor-GC2145%20%7C%20OV3660-green?style=flat-square)](#hardware)
+[![Battery](https://img.shields.io/badge/battery-3.7V%202300mAh-yellow?style=flat-square)](#-baterai--power)
 [![Version](https://img.shields.io/badge/version-v5.9--fix-orange?style=flat-square)](#changelog)
 [![UI](https://img.shields.io/badge/UI-monochrome%20terminal-black?style=flat-square)](#ui-theme)
 
@@ -24,6 +25,7 @@
 
 - [Tentang](#-tentang)
 - [Hardware](#-hardware)
+- [Baterai & Power](#-baterai--power)
 - [Pinout](#-pinout)
 - [Fitur Lengkap](#-fitur-lengkap)
 - [Peta Tombol](#-peta-tombol)
@@ -57,6 +59,89 @@ SANZXCAM adalah firmware kamera berbasis **Freenove ESP32-S3-WROOM** dengan disp
 | **Storage** | MicroSD via SDMMC 1-bit |
 | **USB** | USB Mass Storage (MSC) |
 | **LED** | Status LED (pin 48) + Flash LED (pin 2) |
+| **Baterai** | Li-ion 3.7V 2300mAh |
+| **Power Module** | MH-CD42 (IP5306) — charge + boost + proteksi |
+| **Output Power** | 5V 2.1A ke board |
+
+---
+
+## 🔋 Baterai & Power
+
+### Skema Power Chain
+
+```
+[USB 5V] ──► [MH-CD42] ──► [5V OUT] ──► [ESP32-S3]
+                │                              │
+          [Li-ion 3.7V]              (+ Display + SD + LED)
+           2300mAh
+```
+
+### Baterai
+
+| Spesifikasi | Nilai |
+|---|---|
+| **Kimia** | Li-ion (Lithium Ion) |
+| **Tegangan Nominal** | 3.7V |
+| **Tegangan Penuh** | 4.2V |
+| **Kapasitas** | 2300mAh |
+| **Energi** | ~8.5Wh |
+
+### MH-CD42 Power Module
+
+MH-CD42 menggunakan chip **IP5306** — solusi power management yang menangani charging, boosting, dan proteksi dalam satu modul berukuran 16×25mm.
+
+| Spesifikasi | Nilai |
+|---|---|
+| **Chip** | IP5306 (atau klon FM5324GA) |
+| **Input Charging** | DC 4.5V – 5.5V (rekomendasi 5V) |
+| **Arus Charging** | hingga 2.1A |
+| **Output** | 5V fixed |
+| **Arus Output Maks** | 2.1A continuous |
+| **Cut-off Charge** | 4.2V ±1% |
+| **Cut-off Discharge** | 2.8–2.9V (over-discharge protection) |
+| **Ukuran Modul** | 16 × 25mm |
+
+### Fitur Proteksi MH-CD42
+
+MH-CD42 dilengkapi proteksi overcharge, over-discharge, dan short-circuit — aman untuk penggunaan jangka panjang selama dioperasikan dalam batas spesifikasi.
+
+| Proteksi | Status |
+|---|---|
+| Overcharge | ✅ |
+| Over-discharge | ✅ (cutoff di 2.8–2.9V) |
+| Short-circuit | ✅ |
+| Over-temperature (chip) | ✅ |
+
+### Indikator Baterai (4 LED SMD)
+
+Empat LED merah SMD menampilkan status charging dan state of charge baterai dalam increment 25%.
+
+| Kondisi | LED | Keterangan |
+|---|---|---|
+| < 25% | 1 LED blink | Baterai hampir habis |
+| 25–49% | 2 LED (1 solid + 1 blink) | — |
+| 50–74% | 3 LED | — |
+| 75–100% | 4 LED solid | Penuh |
+| Charging | LED blink bertahap | Menandakan proses charge |
+
+### ⚠️ Catatan Penting
+
+> Saat charging, chip membutuhkan power supply eksternal mampu deliver hingga **22W / 4.4A** karena charging baterai (2.1A) dan output ke beban (2.4A) berjalan bersamaan dari VIN.
+
+> Jika beban sangat ringan (< 45mA) selama lebih dari **32 detik**, modul akan **auto power-off** — ini adalah fitur deteksi beban otomatis dari IP5306. Pastikan ESP32-S3 selalu menarik arus cukup saat beroperasi.
+
+> Saat power supply disambung atau dicabut, akan ada **interupsi singkat** pada output karena MH-CD42 perlu switch power path antara VIN dan baterai.
+
+### Estimasi Daya Tahan Baterai
+
+| Kondisi | Estimasi |
+|---|---|
+| Viewfinder aktif (no flash) | ~2–2.5 jam |
+| Recording MJPEG aktif | ~1.5–2 jam |
+| Flash LED sering dipakai | ~1–1.5 jam |
+| Idle / menu navigasi | ~3–4 jam |
+
+> *Estimasi kasar. Aktual tergantung kondisi baterai, suhu, dan efisiensi boost converter (~85–90%).*
 
 ---
 
