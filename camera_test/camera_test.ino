@@ -1,42 +1,36 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.9-fix
+ * Version: v5.9-fix2
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.9-fix (di atas v5.9):
+ *  CHANGELOG v5.9-fix2 (di atas v5.9-fix):
  *
- *  [FIX-STEGO-BMP] Perbaikan steganografi BMP — dua bug sekaligus:
+ *  [SETTINGS] Simpan/load preferensi ke /sdcard/settings.ini
+ *    - Format: key=value, satu per baris
+ *    - Keys: flash, exp_preset, exp_val, exp_gain, gc2145_fmt
+ *    - loadSettings() dipanggil saat boot setelah SD siap
+ *    - saveSettings() dipanggil otomatis setiap ada perubahan:
+ *        LED menu, Format menu, Exposure menu (preset & manual)
+ *    - File dibuat otomatis jika belum ada
  *
- *    Bug 1 — Bit loss saat RGB565 → BGR888:
- *      stegoBmpEmbed() lama meng-embed ke LSB rgb565Buf[p*2+1].
- *      saveBMP() lalu expand: b = (px & 0x1F) << 3  ← shift 3 bit.
- *      Akibatnya bit yang di-embed bergeser ke posisi bit-3 pada
- *      BGR888, bukan bit-0 yang dibaca stegoBmpExtract().
- *
- *    Bug 2 — Urutan pixel terbalik:
- *      stegoBmpEmbed() iterasi p=0,1,... = row y=0,1,... dari atas.
- *      saveBMP() tulis BMP bottom-up: y=H-1 ditulis pertama.
- *      stegoBmpExtract() baca dari row=bmpH-1 turun ke 0.
- *      Urutan pixel embed vs extract terbalik → payload korup.
- *
- *    Solusi: Hapus stegoBmpEmbed() yang berdiri sendiri.
- *      Embed dilakukan di DALAM saveBMP(), langsung ke byte Blue
- *      BGR888 final, iterasi y=H-1..0 (sama dengan urutan file BMP).
- *      stegoBmpExtract() tidak perlu diubah — sudah benar.
- *
- *  [BOOT-GLITCH] Boot animation baru:
- *    - Fase 1: Splash dengan efek glitch — teks acak → SANZXCAM,
- *      chromatic aberration (ghost merah & biru), glitch bars
- *      UPDATED: durasi Fase 1 diperpanjang ~1.2s → ~2.5s
- *    - Fase 2: Full screen boot log dengan 4 section:
- *      CAMERA, STORAGE, SYSTEM, BUILD
- *      Log rows muncul satu-satu, diakhiri progress bar + READY
+ *  [JUMP] Jump-to-number di Gallery
+ *    - Trigger: BOOT long-press di MODE_GALLERY
+ *    - UI: dialog overlay dengan 4 digit (0000–9999)
+ *    - C = digit aktif -1, D = digit aktif +1 (wrap 0–9)
+ *    - B short = geser kursor digit ke kanan (wrap)
+ *    - B long  = geser kursor digit ke kiri (wrap)
+ *    - BOOT short = konfirmasi, lompat ke index tersebut
+ *    - Timeout 10 detik = batal otomatis
+ *    - Index adalah posisi dalam daftar gallery (1-based)
+ *    - Pesan notif jika nomor di luar range
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.9:
+ *  TETAP dari v5.9-fix:
+ *  [FIX-STEGO-BMP] embed stego di saveBMP() langsung ke BGR888
+ *  [BOOT-GLITCH] boot animation glitch ~2.5s + boot log
  *  [FIX-BMP-COLOR] byte-swap RGB565 sebelum konversi ke BGR888
  *  [FORMAT-SELECT] Menu pilih format foto GC2145: JPG atau BMP
- *  [STEGO-BMP] stegoBmpExtract() tidak berubah — sudah benar
+ *  [STEGO-BMP] stegoBmpExtract() sudah benar
  *  [ISLAND-1..4] animasi island smooth
  *  [EXIF] inject APP1 EXIF ke JPEG
  *  [STEGO] embed payload ke COM marker JPEG
@@ -230,7 +224,8 @@ enum AppMode {
   MODE_MENU_EXP,
   MODE_MENU_EXP_ADJ,
   MODE_DIALOG_DELETE,
-  MODE_MENU_FORMAT
+  MODE_MENU_FORMAT,
+  MODE_JUMP_INPUT,    // [JUMP] mode input nomor
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
@@ -494,6 +489,62 @@ void islandForceHide() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  SETTINGS PERSISTENCE  [SETTINGS]
+//  File: /sdcard/settings.ini
+//  Format: key=value satu per baris (plain text)
+// ─────────────────────────────────────────────────────────────────────────────
+#define SETTINGS_PATH "/sdcard/settings.ini"
+
+// Forward declarations (variabel didefinisikan di bawah)
+extern bool         ledFlashEnabled;
+extern uint8_t      expPreset;
+extern int          expManualVal;
+extern int          expManualGain;
+extern GC2145Format gc2145CaptureFormat;
+
+void saveSettings() {
+  if (!sdReady) return;                    // sdReady dideklarasi nanti; ok karena dipanggil saat runtime
+  FILE* f = fopen(SETTINGS_PATH, "w");
+  if (!f) {
+    Serial.println("[SETTINGS] fopen gagal, tidak bisa simpan");
+    return;
+  }
+  fprintf(f, "# Sanzxcam v5.9-fix2 settings\n");
+  fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
+  fprintf(f, "exp_preset=%d\n", (int)expPreset);
+  fprintf(f, "exp_val=%d\n",    expManualVal);
+  fprintf(f, "exp_gain=%d\n",   expManualGain);
+  fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
+  fclose(f);
+  Serial.printf("[SETTINGS] saved — flash=%d exp=%d val=%d gain=%d fmt=%d\n",
+                ledFlashEnabled, expPreset, expManualVal, expManualGain,
+                (int)gc2145CaptureFormat);
+}
+
+void loadSettings() {
+  FILE* f = fopen(SETTINGS_PATH, "r");
+  if (!f) {
+    Serial.println("[SETTINGS] settings.ini tidak ada, pakai default");
+    return;
+  }
+  char line[64];
+  int loaded = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    int v = 0;
+    if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v;                               loaded++; }
+    else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v, 0, 3);           loaded++; }
+    else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v, 0, 1200);                  loaded++; }
+    else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v, 0, 30);                    loaded++; }
+    else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat = (v == 1) ? GFMT_JPG : GFMT_BMP;       loaded++; }
+  }
+  fclose(f);
+  Serial.printf("[SETTINGS] loaded %d keys — flash=%d exp=%d val=%d gain=%d fmt=%d\n",
+                loaded, ledFlashEnabled, expPreset, expManualVal, expManualGain,
+                (int)gc2145CaptureFormat);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  STEGANOGRAFI JPEG
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
@@ -655,11 +706,11 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
                            size_t* outLen) {
   if (!jpgIn || jpgLen < 4 || !outLen) return nullptr;
   if (jpgIn[0] != 0xFF || jpgIn[1] != 0xD8) return nullptr;
-  char strDesc[16], strMake[12], strModel[12], strSoftware[8], strDt[24];
+  char strDesc[16], strMake[12], strModel[12], strSoftware[12], strDt[24];
   snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
   snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
   snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
-  snprintf(strSoftware, sizeof(strSoftware), "v5.9");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.9-fix2");
   exifMakeTimestamp(strDt, sizeof(strDt));
   int lenDesc     = (int)strlen(strDesc)     + 1;
   int lenMake     = (int)strlen(strMake)     + 1;
@@ -964,6 +1015,215 @@ float         fpsValue      = 0.0f;
 #define PILL_PAD_X   5
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  JUMP-TO-NUMBER STATE  [JUMP]
+// ─────────────────────────────────────────────────────────────────────────────
+#define JUMP_TIMEOUT_MS  10000   // 10 detik, lalu batal otomatis
+#define JUMP_DIGIT_COUNT 4       // 4 digit: 0000 – 9999
+
+static bool          jumpActive       = false;
+static int           jumpDigits[JUMP_DIGIT_COUNT] = {0, 0, 0, 0};
+static int           jumpCursorPos    = 0;   // 0 = digit paling kiri (ribuan)
+static unsigned long jumpOpenMs       = 0;
+
+// Hitung nilai integer dari jumpDigits[]
+static int jumpGetValue() {
+  return jumpDigits[0] * 1000 + jumpDigits[1] * 100
+       + jumpDigits[2] * 10   + jumpDigits[3];
+}
+
+// Reset digits ke indeks gallery saat ini (agar tidak mulai dari 0000)
+static void jumpResetToCurrentIndex() {
+  int v = gallerySelIdx + 1;  // 1-based
+  v = constrain(v, 0, 9999);
+  jumpDigits[0] = (v / 1000) % 10;
+  jumpDigits[1] = (v /  100) % 10;
+  jumpDigits[2] = (v /   10) % 10;
+  jumpDigits[3] =  v         % 10;
+  jumpCursorPos = 3;  // mulai di digit satuan
+}
+
+// Render dialog jump-to-number
+// Layout:
+//   ┌──────────────────────────────────────────┐
+//   │  GO TO INDEX                             │
+//   │  ┌──┐ ┌──┐ ┌──┐ ┌──┐                   │
+//   │  │ X│ │ X│ │ X│ │ X│   / NNNN          │
+//   │  └──┘ └──┘ └──┘ └──┘                   │
+//   │  C=- D=+ B=kursor BOOT=ok               │
+//   │  (timeout bar)                           │
+//   └──────────────────────────────────────────┘
+
+void drawJumpDialog() {
+  const int dw = 240, dh = 100;
+  const int dx = (DISP_W - dw) / 2;
+  const int dy = (DISP_H - dh) / 2;
+
+  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(dx, dy, dw, dh, 10, COL_GRAY_5);
+  lcd.drawRoundRect(dx + 1, dy + 1, dw - 2, dh - 2, 9, COL_GRAY_3);
+
+  // Judul
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "GO TO INDEX";
+  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 7);
+
+  // Garis pemisah
+  lcd.drawFastHLine(dx + 10, dy + 19, dw - 20, COL_GRAY_3);
+
+  // 4 kotak digit
+  const int boxW = 26, boxH = 28, boxGap = 6;
+  const int totalBoxW = JUMP_DIGIT_COUNT * boxW + (JUMP_DIGIT_COUNT - 1) * boxGap;
+  int boxStartX = dx + (dw - totalBoxW) / 2;
+  const int boxY = dy + 24;
+
+  for (int i = 0; i < JUMP_DIGIT_COUNT; i++) {
+    int bx = boxStartX + i * (boxW + boxGap);
+    bool isCursor = (i == jumpCursorPos);
+
+    // Background kotak
+    uint16_t boxBg  = isCursor ? COL_GRAY_5 : COL_GRAY_2;
+    uint16_t boxBdr = isCursor ? COL_WHITE  : COL_GRAY_3;
+    lcd.fillRoundRect(bx, boxY, boxW, boxH, 4, boxBg);
+    lcd.drawRoundRect(bx, boxY, boxW, boxH, 4, boxBdr);
+
+    // Digit
+    char dBuf[2]; snprintf(dBuf, sizeof(dBuf), "%d", jumpDigits[i]);
+    lcd.setFont(&fonts::FreeSansBold9pt7b);
+    int tw = lcd.textWidth(dBuf);
+    lcd.setTextColor(isCursor ? COL_WHITE : COL_GRAY_A);
+    lcd.drawString(dBuf, bx + (boxW - tw) / 2, boxY + 6);
+
+    // Cursor indikator (segitiga kecil di bawah kotak aktif)
+    if (isCursor) {
+      int cx2 = bx + boxW / 2;
+      int cy2 = boxY + boxH + 3;
+      lcd.fillTriangle(cx2 - 4, cy2, cx2 + 4, cy2, cx2, cy2 + 5, COL_GRAY_A);
+    }
+  }
+
+  // Total items info di sebelah kanan digit
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_5);
+  char totalBuf[12]; snprintf(totalBuf, sizeof(totalBuf), "/ %d", galleryCount);
+  int totalX = boxStartX + totalBoxW + 8;
+  lcd.drawString(totalBuf, totalX, boxY + 10);
+
+  // Hint tombol
+  lcd.drawFastHLine(dx + 10, dy + dh - 22, dw - 20, COL_GRAY_2);
+  lcd.setTextColor(COL_GRAY_5);
+  const char* hint = "C=- D=+  B=kursor  BOOT=ok";
+  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + dh - 18);
+
+  // Timeout progress bar
+  unsigned long elapsed = millis() - jumpOpenMs;
+  int barW = dw - 20;
+  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
+  prog = constrain(prog, 0, barW);
+  lcd.fillRect(dx + 10, dy + dh - 6, barW, 3, COL_GRAY_2);
+  lcd.fillRect(dx + 10, dy + dh - 6, prog, 3, COL_GRAY_5);
+}
+
+// Buka dialog jump — dipanggil dari handleModeGallery
+void openJumpDialog() {
+  jumpResetToCurrentIndex();
+  jumpOpenMs    = millis();
+  jumpActive    = true;
+  drawJumpDialog();
+  resetAllButtons();
+  appMode = MODE_JUMP_INPUT;
+}
+
+// Handler untuk MODE_JUMP_INPUT
+void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
+                          ButtonEvent evtC,    ButtonEvent evtD) {
+  // Cek timeout
+  if (millis() - jumpOpenMs >= JUMP_TIMEOUT_MS) {
+    jumpActive = false;
+    resetAllButtons();
+    appMode = MODE_GALLERY;
+    drawGallery();
+    islandPush(NOTIF_INFO, "JUMP BATAL (timeout)");
+    return;
+  }
+
+  bool redraw = false;
+
+  // D = digit aktif + 1 (wrap 9 → 0)
+  if (evtD.valid && evtD.isShort) {
+    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 1) % 10;
+    redraw = true;
+  }
+  // C = digit aktif - 1 (wrap 0 → 9)
+  if (evtC.valid && evtC.isShort) {
+    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 9) % 10;
+    redraw = true;
+  }
+  // B short = geser kursor ke kanan (wrap)
+  if (evtB.valid && evtB.isShort) {
+    jumpCursorPos = (jumpCursorPos + 1) % JUMP_DIGIT_COUNT;
+    redraw = true;
+  }
+  // B long = geser kursor ke kiri (wrap)
+  if (evtB.valid && evtB.isLong) {
+    jumpCursorPos = (jumpCursorPos + JUMP_DIGIT_COUNT - 1) % JUMP_DIGIT_COUNT;
+    redraw = true;
+  }
+  // BOOT = konfirmasi
+  if (evtBoot.valid && evtBoot.isShort) {
+    int target = jumpGetValue();
+    jumpActive = false;
+    if (target < 1 || target > galleryCount) {
+      // Out of range — kembali ke gallery dan notif
+      resetAllButtons();
+      appMode = MODE_GALLERY;
+      drawGallery();
+      char warnBuf[32];
+      snprintf(warnBuf, sizeof(warnBuf), "INDEX %d diluar range", target);
+      islandPush(NOTIF_WARN, warnBuf);
+    } else {
+      // Lompat ke index (1-based → 0-based)
+      int newIdx = target - 1;
+      newIdx = constrain(newIdx, 0, galleryCount - 1);
+      // Hitung scroll agar newIdx terlihat
+      gallerySelIdx  = newIdx;
+      galleryScroll  = (newIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
+      galleryHoldDir = 0;
+      resetAllButtons();
+      appMode = MODE_GALLERY;
+      drawGallery();
+      char infoBuf[24];
+      snprintf(infoBuf, sizeof(infoBuf), "JUMP #%d", target);
+      islandPush(NOTIF_INFO, infoBuf);
+    }
+    return;
+  }
+  // BOOT long = batal
+  if (evtBoot.valid && evtBoot.isLong) {
+    jumpActive = false;
+    resetAllButtons();
+    appMode = MODE_GALLERY;
+    drawGallery();
+    islandPush(NOTIF_INFO, "JUMP BATAL");
+    return;
+  }
+
+  if (redraw) drawJumpDialog();
+
+  // Update timeout bar setiap frame
+  unsigned long elapsed = millis() - jumpOpenMs;
+  int barW = 240 - 20;
+  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
+  prog = constrain(prog, 0, barW);
+  int dx = (DISP_W - 240) / 2;
+  int dy = (DISP_H - 100) / 2;
+  lcd.fillRect(dx + 10, dy + 100 - 6, barW, 3, COL_GRAY_2);
+  lcd.fillRect(dx + 10, dy + 100 - 6, prog, 3, COL_GRAY_5);
+
+  esp_task_wdt_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  MJPEG Player state
 // ─────────────────────────────────────────────────────────────────────────────
 #define MJPEG_BUF_SIZE   (150 * 1024)
@@ -1206,6 +1466,7 @@ void drawGallery() {
   snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
   lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
   lcd.setTextColor(COL_GRAY_5);
+  // [JUMP] hint tambah "BOOT-long=jump"
   lcd.drawString("B=BACK", DISP_W - 46, 6);
   char pageInfo[8];
   snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
@@ -1264,6 +1525,11 @@ void drawGallery() {
     lcd.fillRect(DISP_W - 4, 22, 4, barH, COL_GRAY_2);
     lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
   }
+
+  // [JUMP] hint kecil di footer
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
+  const char* jumpHint = "BOOT-long=jump";
+  lcd.drawString(jumpHint, (DISP_W - lcd.textWidth(jumpHint)) / 2, DISP_H - 10);
 }
 
 void galleryUpdateHighlight(int oldSel, int newSel) {
@@ -1869,52 +2135,33 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BOOT ANIMATION — v5.9-fix  [UPDATED: durasi diperpanjang ~1.2s → ~2.5s]
-//
-//  Perubahan dari versi sebelumnya:
-//    - glitchScrambleText step delay: 30ms → 50ms  (+~160ms total)
-//    - Delay setelah teks utama muncul: 0ms → 400ms (+400ms)
-//    - Delay sebelum wipe (subtitle): 100ms → 600ms (+500ms)
-//    - Delay setelah glitch akhir: 300ms → 800ms   (+500ms)
-//    - Wipe stripe delay: 4ms → 10ms               (+~180ms)
+//  BOOT ANIMATION — v5.9-fix  [durasi ~2.5s]
 // ─────────────────────────────────────────────────────────────────────────────
-
 static const char GLITCH_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
 static const int  GLITCH_CHAR_COUNT = sizeof(GLITCH_CHARS) - 1;
 
-char glitchRandChar() {
-  return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)];
-}
+char glitchRandChar() { return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)]; }
 
 void glitchScrambleText(const char* target, int cx, int cy,
                         uint16_t col, int steps, int stepDelayMs) {
   int len = strlen(target);
   char buf[16]; memset(buf, 0, sizeof(buf));
-
   for (int step = 0; step <= len; step++) {
-    for (int i = 0; i < len; i++) {
-      buf[i] = (i < step) ? target[i] : glitchRandChar();
-    }
+    for (int i = 0; i < len; i++) buf[i] = (i < step) ? target[i] : glitchRandChar();
     buf[len] = '\0';
-
     lcd.fillRect(cx - 70, cy - 8, 140, 16, COL_BLACK);
     lcd.setFont(&fonts::FreeSansBold9pt7b);
     int tw = lcd.textWidth(buf);
     lcd.setTextColor(col);
     lcd.drawString(buf, cx - tw / 2, cy - 7);
-
-    for (int r = 0; r < stepDelayMs / 10; r++) {
-      delay(10); esp_task_wdt_reset();
-    }
+    for (int r = 0; r < stepDelayMs / 10; r++) { delay(10); esp_task_wdt_reset(); }
   }
 }
 
 void glitchBarsFlash(int count, int delayMs) {
   for (int i = 0; i < count; i++) {
-    int barY = random(DISP_H);
-    int barX = random(DISP_W - 60);
-    int barW = random(30, 120);
-    int barH = (random(10) > 7) ? 5 : 2;
+    int barY = random(DISP_H), barX = random(DISP_W - 60);
+    int barW = random(30, 120), barH = (random(10) > 7) ? 5 : 2;
     uint16_t barCol = (random(3) == 0) ? COL_GRAY_5 : COL_GRAY_3;
     lcd.fillRect(barX, barY, barW, barH, barCol);
     delay(delayMs); esp_task_wdt_reset();
@@ -1922,223 +2169,155 @@ void glitchBarsFlash(int count, int delayMs) {
   }
 }
 
-void glitchChromatic(const char* text, int cx, int cy, int offsetX, uint16_t colR, uint16_t colB) {
+void glitchChromatic(const char* text, int cx, int cy, int offsetX,
+                     uint16_t colR, uint16_t colB) {
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   int tw = lcd.textWidth(text);
-  lcd.setTextColor(colR);
-  lcd.drawString(text, cx - tw / 2 - offsetX, cy - 7);
-  lcd.setTextColor(colB);
-  lcd.drawString(text, cx - tw / 2 + offsetX, cy - 7);
+  lcd.setTextColor(colR); lcd.drawString(text, cx - tw / 2 - offsetX, cy - 7);
+  lcd.setTextColor(colB); lcd.drawString(text, cx - tw / 2 + offsetX, cy - 7);
 }
 
 void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString(label, 8, y);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label, 8, y);
   int lx = 8 + lcd.textWidth(label) + 2;
   for (int dx = lx; dx < 230; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_2);
-  lcd.setTextColor(valCol);
-  lcd.drawString(value, 234, y);
+  lcd.setTextColor(valCol); lcd.drawString(value, 234, y);
   esp_task_wdt_reset();
 }
 
 void bootLogSection(int y, const char* title) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString(title, 8, y);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString(title, 8, y);
   lcd.drawFastHLine(8, y + 9, DISP_W - 16, COL_GRAY_2);
 }
 
 void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
                      bool xclkOK, uint32_t xclkHz) {
-
   // ── FASE 1: SPLASH GLITCH ────────────────────────────────────────────────
-  // Total durasi Fase 1: ~2.5 detik (sebelumnya ~1.2 detik)
   lcd.fillScreen(COL_BLACK);
-
-  int cx = DISP_W / 2;
-  int cy = DISP_H / 2 - 10;
-
-  // Teks acak pertama kali
+  int cx = DISP_W / 2, cy = DISP_H / 2 - 10;
   lcd.setFont(&fonts::FreeSansBold9pt7b);
   char scramBuf[10];
   for (int i = 0; i < 8; i++) scramBuf[i] = glitchRandChar();
   scramBuf[8] = '\0';
   int tw0 = lcd.textWidth(scramBuf);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString(scramBuf, cx - tw0 / 2, cy - 7);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString(scramBuf, cx - tw0 / 2, cy - 7);
   delay(80); esp_task_wdt_reset();
-
-  // Glitch bars awal
   glitchBarsFlash(6, 15);
-
-  // Scramble teks → SANZXCAM
-  // [UPDATED] step delay 30ms → 50ms: total ~240ms → ~400ms
   glitchScrambleText("SANZXCAM", cx, cy, COL_GRAY_C, 8, 50);
-
-  // Chromatic aberration
   glitchChromatic("SANZXCAM", cx, cy, 3, 0xF000, 0x001F);
   delay(60); esp_task_wdt_reset();
-
-  // Teks utama kembali normal di atas ghost
   lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
-  lcd.setFont(&fonts::FreeSansBold9pt7b);
-  lcd.setTextColor(COL_GRAY_E);
+  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   int tw1 = lcd.textWidth("SANZXCAM");
   lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
-
-  // [UPDATED] Jeda setelah teks muncul normal: 0ms → 400ms
   delay(400); esp_task_wdt_reset();
-
-  // Glitch bars lagi
   glitchBarsFlash(4, 20);
-
-  // Subtitle muncul
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_5);
   const char* sub = "ESP32-S3  CAMERA SYSTEM";
   lcd.drawString(sub, cx - lcd.textWidth(sub) / 2, cy + 10);
   lcd.setTextColor(COL_GRAY_3);
-  const char* ver = "v5.9-fix";
+  const char* ver = "v5.9-fix2";
   lcd.drawString(ver, cx - lcd.textWidth(ver) / 2, cy + 22);
-
-  // Divider
   lcd.drawFastHLine(cx - 80, cy + 32, 160, COL_GRAY_2);
-
-  // [UPDATED] Jeda sebelum glitch akhir: 100ms → 600ms
   delay(600); esp_task_wdt_reset();
-
-  // Satu glitch akhir sebelum transisi
   glitchBarsFlash(3, 25);
   glitchChromatic("SANZXCAM", cx, cy, 2, 0xA000, 0x000F);
   delay(40); esp_task_wdt_reset();
-
-  // Restore teks setelah ghost
   lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
-  lcd.setFont(&fonts::FreeSansBold9pt7b);
-  lcd.setTextColor(COL_GRAY_E);
+  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
-
-  // [UPDATED] Jeda setelah restore final: 300ms → 800ms
   delay(800); esp_task_wdt_reset();
-
-  // Fade out: wipe ke hitam
-  // [UPDATED] Stripe delay: 4ms → 10ms (lebih smooth, +~180ms)
   for (int stripe = 0; stripe < DISP_H; stripe += 8) {
     lcd.fillRect(0, stripe, DISP_W, 8, COL_BLACK);
     delay(10); esp_task_wdt_reset();
   }
 
-  // ── FASE 2: BOOT LOG FULL SCREEN ─────────────────────────────────────────
+  // ── FASE 2: BOOT LOG ──────────────────────────────────────────────────────
   lcd.fillScreen(COL_BLACK);
-
-  // Header bar
   lcd.fillRect(0, 0, DISP_W, 14, COL_GRAY_D);
   lcd.drawFastHLine(0, 14, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_7);
-  lcd.drawString("SANZXCAM", 8, 3);
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("v5.9-fix", DISP_W - 44, 3);
-  lcd.setTextColor(COL_GRAY_2);
-  lcd.drawString("boot sequence", cx - 32, 3);
-
+  lcd.setTextColor(COL_GRAY_7); lcd.drawString("SANZXCAM", 8, 3);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix2", DISP_W - 52, 3);
+  lcd.setTextColor(COL_GRAY_2); lcd.drawString("boot sequence", cx - 32, 3);
   delay(80); esp_task_wdt_reset();
 
-  // ── SECTION: CAMERA ──────────────────────────────────────────────────────
   int y = 20;
   bootLogSection(y, "CAMERA"); y += 13;
-
   bootLogRow(y, "SENSOR PID",
              pidOK ? (pid == PID_GC2145 ? "0x2145  GC2145" : "0x3660  OV3660") : "NOT FOUND",
              pidOK ? COL_GRAY_E : COL_GRAY_5);
   delay(100); y += 10; esp_task_wdt_reset();
-
   char xclkBuf[20];
   snprintf(xclkBuf, sizeof(xclkBuf), "%uMHz  %s", xclkHz / 1000000, xclkOK ? "OK" : "ERR");
   bootLogRow(y, "XCLK", xclkBuf, xclkOK ? COL_GRAY_E : COL_GRAY_5);
   delay(100); y += 10; esp_task_wdt_reset();
-
   bootLogRow(y, "RESOLUTION", "320x240  QVGA", COL_GRAY_7);
   delay(100); y += 10; esp_task_wdt_reset();
-
   bootLogRow(y, "FORMAT",
              (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP)
-             ? "RGB565  BMP" : "RGB565  JPG",
-             COL_GRAY_7);
+             ? "RGB565  BMP" : "RGB565  JPG", COL_GRAY_7);
   delay(100); y += 10; esp_task_wdt_reset();
 
-  // ── SECTION: STORAGE ─────────────────────────────────────────────────────
-  y += 4;
-  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
   bootLogSection(y, "STORAGE"); y += 13;
-
   char sdBuf[20];
   if (sdOK) snprintf(sdBuf, sizeof(sdBuf), "OK  %lluMB", sdMB);
   else       snprintf(sdBuf, sizeof(sdBuf), "NOT FOUND");
   bootLogRow(y, "SD CARD", sdBuf, sdOK ? COL_GRAY_E : COL_GRAY_5);
   delay(100); y += 10; esp_task_wdt_reset();
-
   if (sdOK) {
     bootLogRow(y, "FILESYSTEM", "FAT32", COL_GRAY_7);
     delay(100); y += 10; esp_task_wdt_reset();
-
-    char photoBuf[16];
-    snprintf(photoBuf, sizeof(photoBuf), "%04d files", photoCount);
+    char photoBuf[16]; snprintf(photoBuf, sizeof(photoBuf), "%04d files", photoCount);
     bootLogRow(y, "PHOTOS", photoBuf, COL_GRAY_7);
+    delay(100); y += 10; esp_task_wdt_reset();
+    // [SETTINGS] tampilkan status settings.ini di boot log
+    char settingsBuf[20];
+    FILE* stChk = fopen(SETTINGS_PATH, "r");
+    if (stChk) { fclose(stChk); snprintf(settingsBuf, sizeof(settingsBuf), "OK  loaded"); }
+    else        { snprintf(settingsBuf, sizeof(settingsBuf), "not found, default"); }
+    bootLogRow(y, "SETTINGS", settingsBuf, COL_GRAY_7);
     delay(100); y += 10; esp_task_wdt_reset();
   }
 
-  // ── SECTION: SYSTEM ──────────────────────────────────────────────────────
-  y += 4;
-  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
   bootLogSection(y, "SYSTEM"); y += 13;
-
   bootLogRow(y, "CPU FREQ", "240MHz  OK", COL_GRAY_E);
   delay(100); y += 10; esp_task_wdt_reset();
-
   bootLogRow(y, "PSRAM", psramFound() ? "8MB  OK" : "NOT FOUND",
              psramFound() ? COL_GRAY_E : COL_GRAY_5);
   delay(100); y += 10; esp_task_wdt_reset();
-
-  char heapBuf[16];
-  snprintf(heapBuf, sizeof(heapBuf), "%uKB", (unsigned)(ESP.getFreeHeap() / 1024));
+  char heapBuf[16]; snprintf(heapBuf, sizeof(heapBuf), "%uKB", (unsigned)(ESP.getFreeHeap() / 1024));
   bootLogRow(y, "HEAP FREE", heapBuf, COL_GRAY_7);
   delay(100); y += 10; esp_task_wdt_reset();
 
-  // ── SECTION: BUILD ───────────────────────────────────────────────────────
-  y += 4;
-  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
+  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
   bootLogSection(y, "BUILD"); y += 13;
-
-  bootLogRow(y, "VERSION", "v5.9-fix", COL_GRAY_7);
+  bootLogRow(y, "VERSION", "v5.9-fix2", COL_GRAY_7);
   delay(100); y += 10; esp_task_wdt_reset();
-
   bootLogRow(y, "STEGO-BMP", "embed in saveBMP OK", COL_GRAY_E);
   delay(100); y += 10; esp_task_wdt_reset();
-
-  bootLogRow(y, "FEATURES", "EXIF+STEGO+FACE+REC", COL_GRAY_7);
+  // [SETTINGS]+[JUMP] info di build section
+  bootLogRow(y, "NEW FEAT", "SETTINGS+JUMP-INDEX", COL_GRAY_E);
   delay(100); y += 10; esp_task_wdt_reset();
 
-  // ── PROGRESS BAR ─────────────────────────────────────────────────────────
-  y += 4;
-  lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 4;
-
+  // ── PROGRESS BAR ──────────────────────────────────────────────────────────
+  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 4;
   int barX = 8, barW = DISP_W - 16, barH = 3;
   lcd.fillRect(barX, y, barW, barH, COL_GRAY_2);
   lcd.drawRect(barX, y, barW, barH, COL_GRAY_3);
-
   for (int i = 0; i <= barW; i += 3) {
     lcd.fillRect(barX, y + 1, i, barH - 2, COL_GRAY_7);
     if (i % 15 == 0) { delay(8); esp_task_wdt_reset(); }
   }
   lcd.fillRect(barX, y + 1, barW, barH - 2, COL_GRAY_C);
-
   y += barH + 4;
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
   const char* readyMsg = "READY";
   lcd.drawString(readyMsg, cx - lcd.textWidth(readyMsg) / 2, y);
-
   delay(600); esp_task_wdt_reset();
 }
 
@@ -2163,7 +2342,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix",DISP_W-46,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix2",DISP_W-52,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -2207,6 +2386,8 @@ void exitUSBMode() {
   sdReady = remountVFSOnly();
   if (sdReady) {
     scanPhotoCount();
+    loadSettings();          // [SETTINGS] reload setelah USB session
+    applyExpPreset(expPreset);
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
     lcd.setTextColor(COL_GRAY_C); lcd.drawString(buf,(DISP_W-lcd.textWidth(buf))/2,DISP_H/2-6);
@@ -2280,11 +2461,9 @@ void applyExpPreset(uint8_t preset) {
   s->set_gainceiling(s, (gainceiling_t)c.gainceiling);
   s->set_ae_level(s, c.ae_level);
   if (detectedSensor == PID_GC2145) {
-    s->set_hmirror(s, HMIRROR_GC2145);
-    s->set_vflip(s,   VFLIP_GC2145);
+    s->set_hmirror(s, HMIRROR_GC2145); s->set_vflip(s, VFLIP_GC2145);
   } else if (detectedSensor == PID_OV3660) {
-    s->set_hmirror(s, HMIRROR_OV3660);
-    s->set_vflip(s,   VFLIP_OV3660);
+    s->set_hmirror(s, HMIRROR_OV3660); s->set_vflip(s, VFLIP_OV3660);
   }
   delay(150); esp_task_wdt_reset();
   for (int i = 0; i < 2; i++) {
@@ -2310,19 +2489,14 @@ void renderViewfinder() {
   if (!frozen) {
     if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
       lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-
       uint16_t bktCol = recActive ? 0xF800 : (faceDetectMode ? COL_WHITE : COL_GRAY_E);
       drawCornerBrackets(bktCol);
-
       if (faceDetectMode) runFaceDetect(fb);
-
       char fpsBuf[12]; snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
       drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
-
       char sensorPill[20];
       snprintf(sensorPill, sizeof(sensorPill), "%s%s", sensorName, ledFlashEnabled ? " *" : "");
       drawPill(DISP_W-42, 10, sensorPill, COL_PILL_BG, COL_GRAY_A);
-
       if (faceDetectMode) {
         char faceBuf[12];
         snprintf(faceBuf, sizeof(faceBuf),
@@ -2334,19 +2508,15 @@ void renderViewfinder() {
         else                snprintf(expBuf, sizeof(expBuf), "%s", expPresetNames[expPreset]);
         drawPill(DISP_W/2, 10, expBuf, COL_PILL_BG, COL_GRAY_E);
       }
-
       const char* fmtTag;
       if (detectedSensor == PID_GC2145)
         fmtTag = (gc2145CaptureFormat == GFMT_BMP) ? "BMP" : "JPG";
-      else
-        fmtTag = "JPG";
-
+      else fmtTag = "JPG";
       char shotBuf[12];
       snprintf(shotBuf, sizeof(shotBuf), "#%04d %s", photoCount + 1, fmtTag);
       drawPill(38, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
       drawPill(DISP_W-36, DISP_H-10, sdReady ? "SD  OK" : "SD  --",
                COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
-
       if (recActive) drawRecIndicator();
       updateFPS();
     } else {
@@ -2356,24 +2526,21 @@ void renderViewfinder() {
     }
     esp_camera_fb_return(fb);
   }
-
   islandTick();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview — v5.9-fix
+//  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
-    digitalWrite(LED_FLASH, HIGH);
-    delay(150);
+    digitalWrite(LED_FLASH, HIGH); delay(150);
     for (int i = 0; i < 2; i++) {
       camera_fb_t *tfb = esp_camera_fb_get();
       if (tfb) esp_camera_fb_return(tfb);
       esp_task_wdt_reset();
     }
   }
-
   camera_fb_t *fb = esp_camera_fb_get();
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) { blinkLED(5, 50, 50); return; }
@@ -2384,67 +2551,47 @@ void captureAndPreview() {
   }
 
   bool saved = false;
-
   if (sdReady) {
     photoCount++;
-
     bool isGC2145rgb = (detectedSensor == PID_GC2145 &&
                         fb->format == PIXFORMAT_RGB565 &&
                         fb->width == DISP_W && fb->height == DISP_H);
 
     if (isGC2145rgb && gc2145CaptureFormat == GFMT_BMP) {
-      char path[48];
-      snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
+      char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
       char payload[STEGO_BMP_MAX_PAYLOAD];
       stegoMakePayload(payload, sizeof(payload), photoCount);
       int payLen = (int)strlen(payload);
       saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, payLen);
       Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  stego=%s  %s\n",
-                    photoCount, fb->width, fb->height, payload,
-                    saved ? "OK" : "GAGAL");
+                    photoCount, fb->width, fb->height, payload, saved ? "OK" : "GAGAL");
     } else {
-      uint8_t *jpg_buf  = nullptr;
-      size_t   jpg_len  = 0;
-      bool     ok       = false;
-
-      if (fb->format == PIXFORMAT_RGB565) {
-        ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len);
-      } else if (fb->format == PIXFORMAT_JPEG) {
-        jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
-      }
-
+      uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
+      if (fb->format == PIXFORMAT_RGB565)       { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
+      else if (fb->format == PIXFORMAT_JPEG)    { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
       if (ok && jpg_buf && jpg_len > 0) {
         char payload[STEGO_PAYLOAD_LEN];
         stegoMakePayload(payload, sizeof(payload), photoCount);
         int payLen = (int)strlen(payload);
         size_t stegoLen = 0;
-        uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len,
-                                              payload, payLen, &stegoLen);
+        uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len, payload, payLen, &stegoLen);
         if (!stegoBuf) { stegoBuf = jpg_buf; stegoLen = jpg_len; }
-
         size_t finalLen = 0;
-        uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen,
-                                              photoCount, sensorName, &finalLen);
+        uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen, photoCount, sensorName, &finalLen);
         if (!finalBuf) { finalBuf = stegoBuf; finalLen = stegoLen; }
-
-        char path[40];
-        snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
+        char path[40]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
         FILE* f = fopen(path, "wb");
         if (f) {
-          size_t w = fwrite(finalBuf, 1, finalLen, f);
-          fclose(f);
+          size_t w = fwrite(finalBuf, 1, finalLen, f); fclose(f);
           saved = (w == finalLen);
-          if (saved)
-            Serial.printf("[CAPTURE-JPG] photo_%04d.jpg  %u bytes\n",
-                          photoCount, (unsigned)finalLen);
+          if (saved) Serial.printf("[CAPTURE-JPG] photo_%04d.jpg  %u bytes\n",
+                                   photoCount, (unsigned)finalLen);
         }
-
         if (finalBuf != stegoBuf) free(finalBuf);
         if (stegoBuf != jpg_buf)  free(stegoBuf);
         if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
       }
     }
-
     if (!saved) photoCount--;
   }
 
@@ -2461,7 +2608,6 @@ void captureAndPreview() {
     islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD");
     blinkLED(5, 50, 50);
   }
-
   fpsLastTime = millis(); fpsFrameCount = 0;
   resetAllButtons();
 }
@@ -2525,14 +2671,14 @@ bool initCamera() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.9-fix ===");
-  Serial.println("[BOOT-GLITCH] boot animation diperpanjang ~2.5s");
+  Serial.println("\n=== Sanzxcam v5.9-fix2 ===");
+  Serial.println("[SETTINGS] akan load dari /sdcard/settings.ini");
+  Serial.println("[JUMP] BOOT-long di gallery = jump-to-number");
 
-  galleryFiles    = (char(*)[32])    ps_malloc(GALLERY_MAX_FILES * 32);
+  galleryFiles    = (char(*)[32])     ps_malloc(GALLERY_MAX_FILES * 32);
   galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
   if (!galleryFiles || !galleryFileType) {
-    Serial.println("PSRAM alloc failed!");
-    ESP.restart();
+    Serial.println("PSRAM alloc failed!"); ESP.restart();
   }
 
   pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
@@ -2543,7 +2689,6 @@ void setup() {
   pinMode(BTN_D,     INPUT_PULLUP);
 
   setCpuFrequencyMhz(240);
-
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
 
   static uint16_t touchCalData[8] = {3851,3630,673,3277,3965,160,772,136};
@@ -2552,7 +2697,13 @@ void setup() {
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
 
   sdReady = mountSDFull();
-  if (sdReady) { scanPhotoCount(); scanVideoCount(); }
+  if (sdReady) {
+    scanPhotoCount();
+    scanVideoCount();
+    loadSettings();           // [SETTINGS] load dari SD setelah mount
+    // expPreset sudah ter-set oleh loadSettings, tapi camera belum init
+    // applyExpPreset dipanggil setelah initCamera() di bawah
+  }
 
   msc.vendorID("ESP32S3"); msc.productID("SD Card"); msc.productRevision("1.0");
   msc.onRead(onRead); msc.onWrite(onWrite);
@@ -2562,6 +2713,12 @@ void setup() {
   bool camOK = initCamera();
   bool pidOK = (detectedSensor == PID_GC2145 || detectedSensor == PID_OV3660);
   uint32_t xclkHz = (detectedSensor == PID_OV3660) ? 24000000 : 20000000;
+
+  // [SETTINGS] terapkan preset yang dimuat SETELAH kamera siap
+  if (camOK && sdReady) {
+    applyExpPreset(expPreset);
+  }
+
   runBootSequence(sdReady, sdSizeMB, pidOK, detectedSensor, camOK, xclkHz);
 
   if (!camOK) {
@@ -2582,7 +2739,6 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt) {
   if (!evt.valid) { renderViewfinder(); return; }
-
   if (evt.pin == BTN_BOOT) {
     if (evt.isLong) { if (sdReady) enterUSBMode(); }
     else            { captureAndPreview(); }
@@ -2593,17 +2749,13 @@ void handleModeViewfinder(ButtonEvent evt) {
   }
   else if (evt.pin == BTN_C) {
     if (evt.isLong) {
-      if (detectedSensor == PID_GC2145) {
-        openFormatMenu();
-      } else {
-        islandPush(NOTIF_INFO, "FORMAT: hanya GC2145");
-      }
+      if (detectedSensor == PID_GC2145) openFormatMenu();
+      else islandPush(NOTIF_INFO, "FORMAT: hanya GC2145");
     } else {
       if (sdReady) {
         scanGalleryFiles();
         gallerySelIdx = 0; galleryScroll = 0; galleryHoldDir = 0;
-        islandForceHide();
-        islandNoClear = false;
+        islandForceHide(); islandNoClear = false;
         resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
       }
     }
@@ -2635,13 +2787,16 @@ void handleModeGallery(ButtonEvent evt) {
   }
   if (!evt.valid) return;
 
-  if (evt.pin == BTN_BOOT && evt.isShort) {
-    if (galleryCount > 0 && gallerySelIdx >= 0 && gallerySelIdx < galleryCount) {
-      GalleryFileType ft = galleryFileType[gallerySelIdx];
-      if (ft == GFILE_VIDEO) {
-        openMjpegPlayer(galleryFiles[gallerySelIdx]);
-      } else {
-        showPhotoView(gallerySelIdx);
+  if (evt.pin == BTN_BOOT) {
+    if (evt.isLong) {
+      // [JUMP] BOOT long di gallery = buka jump dialog
+      if (galleryCount > 0) openJumpDialog();
+      else islandPush(NOTIF_WARN, "GALLERY KOSONG");
+    } else if (evt.isShort) {
+      if (galleryCount > 0 && gallerySelIdx >= 0 && gallerySelIdx < galleryCount) {
+        GalleryFileType ft = galleryFileType[gallerySelIdx];
+        if (ft == GFILE_VIDEO) openMjpegPlayer(galleryFiles[gallerySelIdx]);
+        else                   showPhotoView(gallerySelIdx);
       }
     }
   }
@@ -2663,11 +2818,8 @@ void handleModePhotoView(ButtonEvent evt) {
     int maxOffY = max(0, (int)photoBufH - (int)(DISP_H / zf));
     if (cHeld) photoZoomOffX = constrain(photoZoomOffX - PAN_STEP, 0, maxOffX);
     if (dHeld) photoZoomOffX = constrain(photoZoomOffX + PAN_STEP, 0, maxOffX);
-    photoViewRender();
-    lastPanTime = millis();
-    return;
+    photoViewRender(); lastPanTime = millis(); return;
   }
-
   if (!evt.valid) return;
   static unsigned long lastActionTime = 0;
   if (millis() - lastActionTime < 150) return;
@@ -2745,6 +2897,7 @@ void handleModeMenuLed(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     ledFlashEnabled = (menuLedSel == 0);
     islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
+    saveSettings();   // [SETTINGS] simpan perubahan flash
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2765,6 +2918,7 @@ void handleModeMenuFormat(ButtonEvent evt) {
     snprintf(fbBuf, sizeof(fbBuf), "FORMAT: %s",
              gc2145CaptureFormat == GFMT_BMP ? "BMP+stego" : "JPG+EXIF+stego");
     islandPush(NOTIF_INFO, fbBuf);
+    saveSettings();   // [SETTINGS] simpan perubahan format
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2773,8 +2927,7 @@ void handleModeMenuFormat(ButtonEvent evt) {
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
   else if (evt.pin == BTN_C || evt.pin == BTN_D) {
-    menuFormatSel = (menuFormatSel == 0) ? 1 : 0;
-    drawFormatMenu(menuFormatSel);
+    menuFormatSel = (menuFormatSel == 0) ? 1 : 0; drawFormatMenu(menuFormatSel);
   }
 }
 
@@ -2783,10 +2936,12 @@ void handleModeMenuExp(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
     if (menuExpSel == 3) {
+      // Masuk ke mode adj; simpan settings SETELAH user confirm di adj
       lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode = MODE_MENU_EXP_ADJ; return;
     }
     char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[menuExpSel]);
     islandPush(NOTIF_INFO, fbBuf);
+    saveSettings();   // [SETTINGS] simpan preset (non-manual)
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2813,6 +2968,7 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[3]);
     islandPush(NOTIF_INFO, fbBuf);
+    saveSettings();   // [SETTINGS] simpan manual exp saat konfirmasi
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER; return;
   }
@@ -2864,8 +3020,7 @@ void loop() {
     photoViewClearCaption();
 
   if (usbModeActive) { if (evtBoot.valid) exitUSBMode(); return; }
-
-  if (recActive) { if (evtB.valid) stopRecording(); else recordFrame(); return; }
+  if (recActive)     { if (evtB.valid) stopRecording(); else recordFrame(); return; }
 
   switch (appMode) {
     case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                  break;
@@ -2877,9 +3032,11 @@ void loop() {
     case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                  break;
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                break;
     case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                  break;
+    // [JUMP] mode input nomor — butuh semua 4 event tombol
+    case MODE_JUMP_INPUT:    handleModeJumpInput(evtBoot,evtB,evtC,evtD);      break;
   }
 
-  if (appMode != MODE_VIEWFINDER) {
+  if (appMode != MODE_VIEWFINDER && appMode != MODE_JUMP_INPUT) {
     islandNoClear = false;
     islandTick();
   }
