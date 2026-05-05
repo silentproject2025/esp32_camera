@@ -39,6 +39,10 @@
  *
  * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY : ILI9341 2.4" 320x240 landscape
+ *
+ * FIX: Pindahkan sdReady, ledFlashEnabled, expPreset, expManualVal,
+ *      expManualGain, gc2145CaptureFormat ke sebelum saveSettings()
+ *      agar tidak ada error "not declared in this scope".
  */
 
 #include "esp_camera.h"
@@ -225,7 +229,7 @@ enum AppMode {
   MODE_MENU_EXP_ADJ,
   MODE_DIALOG_DELETE,
   MODE_MENU_FORMAT,
-  MODE_JUMP_INPUT,    // [JUMP] mode input nomor
+  MODE_JUMP_INPUT,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
@@ -237,7 +241,6 @@ enum GC2145Format : uint8_t {
   GFMT_BMP = 0,
   GFMT_JPG = 1,
 };
-GC2145Format gc2145CaptureFormat = GFMT_BMP;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
@@ -489,21 +492,45 @@ void islandForceHide() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  VARIABEL GLOBAL UTAMA
+//  Didefinisikan di sini (sebelum saveSettings/loadSettings) agar
+//  tidak ada "not declared in this scope" saat kompilasi.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SD / storage
+sdmmc_card_t* sdCard         = nullptr;
+bool          sdReady         = false;
+uint32_t      sdTotalSectors  = 0;
+bool          sdmmcDriverInit = false;
+uint64_t      sdSizeMB        = 0;
+
+// LED flash
+bool ledFlashEnabled = false;
+
+// Exposure
+uint8_t expPreset    = 0;
+int     expManualVal = 300;
+int     expManualGain= 0;
+
+// GC2145 capture format
+GC2145Format gc2145CaptureFormat = GFMT_BMP;
+
+// Sensor info
+uint16_t detectedSensor= 0;
+char     sensorName[16]= "UNKNOWN";
+
+// Photo count
+int      photoCount    = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  SETTINGS PERSISTENCE  [SETTINGS]
 //  File: /sdcard/settings.ini
 //  Format: key=value satu per baris (plain text)
 // ─────────────────────────────────────────────────────────────────────────────
 #define SETTINGS_PATH "/sdcard/settings.ini"
 
-// Forward declarations (variabel didefinisikan di bawah)
-extern bool         ledFlashEnabled;
-extern uint8_t      expPreset;
-extern int          expManualVal;
-extern int          expManualGain;
-extern GC2145Format gc2145CaptureFormat;
-
 void saveSettings() {
-  if (!sdReady) return;                    // sdReady dideklarasi nanti; ok karena dipanggil saat runtime
+  if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) {
     Serial.println("[SETTINGS] fopen gagal, tidak bisa simpan");
@@ -607,7 +634,7 @@ bool stegoExtractFromJpeg(const uint8_t* jpgBuf, size_t jpgLen,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  STEGANOGRAFI BMP — v5.9-fix
+//  STEGANOGRAFI BMP
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_BMP_MAX_PAYLOAD 64
 
@@ -771,7 +798,7 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BMP SAVE — v5.9-fix
+//  BMP SAVE
 // ─────────────────────────────────────────────────────────────────────────────
 bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
              const char* stegoPayload = nullptr, int stegoPayLen = 0) {
@@ -915,10 +942,8 @@ uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  State variabel
+//  State variabel lanjutan (yang tidak dibutuhkan oleh saveSettings)
 // ─────────────────────────────────────────────────────────────────────────────
-bool ledFlashEnabled = false;
-
 enum GalleryFileType : uint8_t {
   GFILE_JPG   = 0,
   GFILE_BMP   = 1,
@@ -967,10 +992,6 @@ unsigned long recStartMs    = 0;
 bool faceDetectMode  = false;
 int  faceDetectCount = 0;
 
-uint8_t expPreset    = 0;
-int     expManualVal = 300;
-int     expManualGain= 0;
-
 const char* expPresetNames[4] = { "AUTO", "MOON", "NIGHT", "MANUAL" };
 
 struct ExpPresetCfg {
@@ -995,16 +1016,6 @@ unsigned long deleteDialogOpenMs = 0;
 USBMSC msc;
 bool   usbModeActive = false;
 
-sdmmc_card_t* sdCard         = nullptr;
-bool          sdReady         = false;
-uint32_t      sdTotalSectors  = 0;
-bool          sdmmcDriverInit = false;
-uint64_t      sdSizeMB        = 0;
-
-int      photoCount    = 0;
-uint16_t detectedSensor= 0;
-char     sensorName[16]= "UNKNOWN";
-
 unsigned long fpsLastTime   = 0;
 int           fpsFrameCount = 0;
 float         fpsValue      = 0.0f;
@@ -1017,210 +1028,27 @@ float         fpsValue      = 0.0f;
 // ─────────────────────────────────────────────────────────────────────────────
 //  JUMP-TO-NUMBER STATE  [JUMP]
 // ─────────────────────────────────────────────────────────────────────────────
-#define JUMP_TIMEOUT_MS  10000   // 10 detik, lalu batal otomatis
-#define JUMP_DIGIT_COUNT 4       // 4 digit: 0000 – 9999
+#define JUMP_TIMEOUT_MS  10000
+#define JUMP_DIGIT_COUNT 4
 
 static bool          jumpActive       = false;
 static int           jumpDigits[JUMP_DIGIT_COUNT] = {0, 0, 0, 0};
-static int           jumpCursorPos    = 0;   // 0 = digit paling kiri (ribuan)
+static int           jumpCursorPos    = 0;
 static unsigned long jumpOpenMs       = 0;
 
-// Hitung nilai integer dari jumpDigits[]
 static int jumpGetValue() {
   return jumpDigits[0] * 1000 + jumpDigits[1] * 100
        + jumpDigits[2] * 10   + jumpDigits[3];
 }
 
-// Reset digits ke indeks gallery saat ini (agar tidak mulai dari 0000)
 static void jumpResetToCurrentIndex() {
-  int v = gallerySelIdx + 1;  // 1-based
+  int v = gallerySelIdx + 1;
   v = constrain(v, 0, 9999);
   jumpDigits[0] = (v / 1000) % 10;
   jumpDigits[1] = (v /  100) % 10;
   jumpDigits[2] = (v /   10) % 10;
   jumpDigits[3] =  v         % 10;
-  jumpCursorPos = 3;  // mulai di digit satuan
-}
-
-// Render dialog jump-to-number
-// Layout:
-//   ┌──────────────────────────────────────────┐
-//   │  GO TO INDEX                             │
-//   │  ┌──┐ ┌──┐ ┌──┐ ┌──┐                   │
-//   │  │ X│ │ X│ │ X│ │ X│   / NNNN          │
-//   │  └──┘ └──┘ └──┘ └──┘                   │
-//   │  C=- D=+ B=kursor BOOT=ok               │
-//   │  (timeout bar)                           │
-//   └──────────────────────────────────────────┘
-
-void drawJumpDialog() {
-  const int dw = 240, dh = 100;
-  const int dx = (DISP_W - dw) / 2;
-  const int dy = (DISP_H - dh) / 2;
-
-  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(dx, dy, dw, dh, 10, COL_GRAY_5);
-  lcd.drawRoundRect(dx + 1, dy + 1, dw - 2, dh - 2, 9, COL_GRAY_3);
-
-  // Judul
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_E);
-  const char* title = "GO TO INDEX";
-  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 7);
-
-  // Garis pemisah
-  lcd.drawFastHLine(dx + 10, dy + 19, dw - 20, COL_GRAY_3);
-
-  // 4 kotak digit
-  const int boxW = 26, boxH = 28, boxGap = 6;
-  const int totalBoxW = JUMP_DIGIT_COUNT * boxW + (JUMP_DIGIT_COUNT - 1) * boxGap;
-  int boxStartX = dx + (dw - totalBoxW) / 2;
-  const int boxY = dy + 24;
-
-  for (int i = 0; i < JUMP_DIGIT_COUNT; i++) {
-    int bx = boxStartX + i * (boxW + boxGap);
-    bool isCursor = (i == jumpCursorPos);
-
-    // Background kotak
-    uint16_t boxBg  = isCursor ? COL_GRAY_5 : COL_GRAY_2;
-    uint16_t boxBdr = isCursor ? COL_WHITE  : COL_GRAY_3;
-    lcd.fillRoundRect(bx, boxY, boxW, boxH, 4, boxBg);
-    lcd.drawRoundRect(bx, boxY, boxW, boxH, 4, boxBdr);
-
-    // Digit
-    char dBuf[2]; snprintf(dBuf, sizeof(dBuf), "%d", jumpDigits[i]);
-    lcd.setFont(&fonts::FreeSansBold9pt7b);
-    int tw = lcd.textWidth(dBuf);
-    lcd.setTextColor(isCursor ? COL_WHITE : COL_GRAY_A);
-    lcd.drawString(dBuf, bx + (boxW - tw) / 2, boxY + 6);
-
-    // Cursor indikator (segitiga kecil di bawah kotak aktif)
-    if (isCursor) {
-      int cx2 = bx + boxW / 2;
-      int cy2 = boxY + boxH + 3;
-      lcd.fillTriangle(cx2 - 4, cy2, cx2 + 4, cy2, cx2, cy2 + 5, COL_GRAY_A);
-    }
-  }
-
-  // Total items info di sebelah kanan digit
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5);
-  char totalBuf[12]; snprintf(totalBuf, sizeof(totalBuf), "/ %d", galleryCount);
-  int totalX = boxStartX + totalBoxW + 8;
-  lcd.drawString(totalBuf, totalX, boxY + 10);
-
-  // Hint tombol
-  lcd.drawFastHLine(dx + 10, dy + dh - 22, dw - 20, COL_GRAY_2);
-  lcd.setTextColor(COL_GRAY_5);
-  const char* hint = "C=- D=+  B=kursor  BOOT=ok";
-  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + dh - 18);
-
-  // Timeout progress bar
-  unsigned long elapsed = millis() - jumpOpenMs;
-  int barW = dw - 20;
-  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
-  prog = constrain(prog, 0, barW);
-  lcd.fillRect(dx + 10, dy + dh - 6, barW, 3, COL_GRAY_2);
-  lcd.fillRect(dx + 10, dy + dh - 6, prog, 3, COL_GRAY_5);
-}
-
-// Buka dialog jump — dipanggil dari handleModeGallery
-void openJumpDialog() {
-  jumpResetToCurrentIndex();
-  jumpOpenMs    = millis();
-  jumpActive    = true;
-  drawJumpDialog();
-  resetAllButtons();
-  appMode = MODE_JUMP_INPUT;
-}
-
-// Handler untuk MODE_JUMP_INPUT
-void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
-                          ButtonEvent evtC,    ButtonEvent evtD) {
-  // Cek timeout
-  if (millis() - jumpOpenMs >= JUMP_TIMEOUT_MS) {
-    jumpActive = false;
-    resetAllButtons();
-    appMode = MODE_GALLERY;
-    drawGallery();
-    islandPush(NOTIF_INFO, "JUMP BATAL (timeout)");
-    return;
-  }
-
-  bool redraw = false;
-
-  // D = digit aktif + 1 (wrap 9 → 0)
-  if (evtD.valid && evtD.isShort) {
-    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 1) % 10;
-    redraw = true;
-  }
-  // C = digit aktif - 1 (wrap 0 → 9)
-  if (evtC.valid && evtC.isShort) {
-    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 9) % 10;
-    redraw = true;
-  }
-  // B short = geser kursor ke kanan (wrap)
-  if (evtB.valid && evtB.isShort) {
-    jumpCursorPos = (jumpCursorPos + 1) % JUMP_DIGIT_COUNT;
-    redraw = true;
-  }
-  // B long = geser kursor ke kiri (wrap)
-  if (evtB.valid && evtB.isLong) {
-    jumpCursorPos = (jumpCursorPos + JUMP_DIGIT_COUNT - 1) % JUMP_DIGIT_COUNT;
-    redraw = true;
-  }
-  // BOOT = konfirmasi
-  if (evtBoot.valid && evtBoot.isShort) {
-    int target = jumpGetValue();
-    jumpActive = false;
-    if (target < 1 || target > galleryCount) {
-      // Out of range — kembali ke gallery dan notif
-      resetAllButtons();
-      appMode = MODE_GALLERY;
-      drawGallery();
-      char warnBuf[32];
-      snprintf(warnBuf, sizeof(warnBuf), "INDEX %d diluar range", target);
-      islandPush(NOTIF_WARN, warnBuf);
-    } else {
-      // Lompat ke index (1-based → 0-based)
-      int newIdx = target - 1;
-      newIdx = constrain(newIdx, 0, galleryCount - 1);
-      // Hitung scroll agar newIdx terlihat
-      gallerySelIdx  = newIdx;
-      galleryScroll  = (newIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
-      galleryHoldDir = 0;
-      resetAllButtons();
-      appMode = MODE_GALLERY;
-      drawGallery();
-      char infoBuf[24];
-      snprintf(infoBuf, sizeof(infoBuf), "JUMP #%d", target);
-      islandPush(NOTIF_INFO, infoBuf);
-    }
-    return;
-  }
-  // BOOT long = batal
-  if (evtBoot.valid && evtBoot.isLong) {
-    jumpActive = false;
-    resetAllButtons();
-    appMode = MODE_GALLERY;
-    drawGallery();
-    islandPush(NOTIF_INFO, "JUMP BATAL");
-    return;
-  }
-
-  if (redraw) drawJumpDialog();
-
-  // Update timeout bar setiap frame
-  unsigned long elapsed = millis() - jumpOpenMs;
-  int barW = 240 - 20;
-  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
-  prog = constrain(prog, 0, barW);
-  int dx = (DISP_W - 240) / 2;
-  int dy = (DISP_H - 100) / 2;
-  lcd.fillRect(dx + 10, dy + 100 - 6, barW, 3, COL_GRAY_2);
-  lcd.fillRect(dx + 10, dy + 100 - 6, prog, 3, COL_GRAY_5);
-
-  esp_task_wdt_reset();
+  jumpCursorPos = 3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1466,7 +1294,6 @@ void drawGallery() {
   snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
   lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
   lcd.setTextColor(COL_GRAY_5);
-  // [JUMP] hint tambah "BOOT-long=jump"
   lcd.drawString("B=BACK", DISP_W - 46, 6);
   char pageInfo[8];
   snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
@@ -1526,7 +1353,6 @@ void drawGallery() {
     lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
   }
 
-  // [JUMP] hint kecil di footer
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
   const char* jumpHint = "BOOT-long=jump";
   lcd.drawString(jumpHint, (DISP_W - lcd.textWidth(jumpHint)) / 2, DISP_H - 10);
@@ -2135,7 +1961,7 @@ static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  BOOT ANIMATION — v5.9-fix  [durasi ~2.5s]
+//  BOOT ANIMATION
 // ─────────────────────────────────────────────────────────────────────────────
 static const char GLITCH_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
 static const int  GLITCH_CHAR_COUNT = sizeof(GLITCH_CHARS) - 1;
@@ -2194,7 +2020,6 @@ void bootLogSection(int y, const char* title) {
 
 void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
                      bool xclkOK, uint32_t xclkHz) {
-  // ── FASE 1: SPLASH GLITCH ────────────────────────────────────────────────
   lcd.fillScreen(COL_BLACK);
   int cx = DISP_W / 2, cy = DISP_H / 2 - 10;
   lcd.setFont(&fonts::FreeSansBold9pt7b);
@@ -2234,7 +2059,6 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
     delay(10); esp_task_wdt_reset();
   }
 
-  // ── FASE 2: BOOT LOG ──────────────────────────────────────────────────────
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 14, COL_GRAY_D);
   lcd.drawFastHLine(0, 14, DISP_W, COL_GRAY_3);
@@ -2274,7 +2098,6 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
     char photoBuf[16]; snprintf(photoBuf, sizeof(photoBuf), "%04d files", photoCount);
     bootLogRow(y, "PHOTOS", photoBuf, COL_GRAY_7);
     delay(100); y += 10; esp_task_wdt_reset();
-    // [SETTINGS] tampilkan status settings.ini di boot log
     char settingsBuf[20];
     FILE* stChk = fopen(SETTINGS_PATH, "r");
     if (stChk) { fclose(stChk); snprintf(settingsBuf, sizeof(settingsBuf), "OK  loaded"); }
@@ -2300,11 +2123,9 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   delay(100); y += 10; esp_task_wdt_reset();
   bootLogRow(y, "STEGO-BMP", "embed in saveBMP OK", COL_GRAY_E);
   delay(100); y += 10; esp_task_wdt_reset();
-  // [SETTINGS]+[JUMP] info di build section
   bootLogRow(y, "NEW FEAT", "SETTINGS+JUMP-INDEX", COL_GRAY_E);
   delay(100); y += 10; esp_task_wdt_reset();
 
-  // ── PROGRESS BAR ──────────────────────────────────────────────────────────
   y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 4;
   int barX = 8, barW = DISP_W - 16, barH = 3;
   lcd.fillRect(barX, y, barW, barH, COL_GRAY_2);
@@ -2386,7 +2207,7 @@ void exitUSBMode() {
   sdReady = remountVFSOnly();
   if (sdReady) {
     scanPhotoCount();
-    loadSettings();          // [SETTINGS] reload setelah USB session
+    loadSettings();
     applyExpPreset(expPreset);
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
@@ -2667,6 +2488,157 @@ bool initCamera() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  JUMP INPUT DIALOG  [JUMP]
+// ─────────────────────────────────────────────────────────────────────────────
+void drawJumpDialog() {
+  const int dw = 240, dh = 100;
+  const int dx = (DISP_W - dw) / 2;
+  const int dy = (DISP_H - dh) / 2;
+
+  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(dx, dy, dw, dh, 10, COL_GRAY_5);
+  lcd.drawRoundRect(dx + 1, dy + 1, dw - 2, dh - 2, 9, COL_GRAY_3);
+
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "GO TO INDEX";
+  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 7);
+
+  lcd.drawFastHLine(dx + 10, dy + 19, dw - 20, COL_GRAY_3);
+
+  const int boxW = 26, boxH = 28, boxGap = 6;
+  const int totalBoxW = JUMP_DIGIT_COUNT * boxW + (JUMP_DIGIT_COUNT - 1) * boxGap;
+  int boxStartX = dx + (dw - totalBoxW) / 2;
+  const int boxY = dy + 24;
+
+  for (int i = 0; i < JUMP_DIGIT_COUNT; i++) {
+    int bx = boxStartX + i * (boxW + boxGap);
+    bool isCursor = (i == jumpCursorPos);
+
+    uint16_t boxBg  = isCursor ? COL_GRAY_5 : COL_GRAY_2;
+    uint16_t boxBdr = isCursor ? COL_WHITE  : COL_GRAY_3;
+    lcd.fillRoundRect(bx, boxY, boxW, boxH, 4, boxBg);
+    lcd.drawRoundRect(bx, boxY, boxW, boxH, 4, boxBdr);
+
+    char dBuf[2]; snprintf(dBuf, sizeof(dBuf), "%d", jumpDigits[i]);
+    lcd.setFont(&fonts::FreeSansBold9pt7b);
+    int tw = lcd.textWidth(dBuf);
+    lcd.setTextColor(isCursor ? COL_WHITE : COL_GRAY_A);
+    lcd.drawString(dBuf, bx + (boxW - tw) / 2, boxY + 6);
+
+    if (isCursor) {
+      int cx2 = bx + boxW / 2;
+      int cy2 = boxY + boxH + 3;
+      lcd.fillTriangle(cx2 - 4, cy2, cx2 + 4, cy2, cx2, cy2 + 5, COL_GRAY_A);
+    }
+  }
+
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_5);
+  char totalBuf[12]; snprintf(totalBuf, sizeof(totalBuf), "/ %d", galleryCount);
+  int totalX = boxStartX + totalBoxW + 8;
+  lcd.drawString(totalBuf, totalX, boxY + 10);
+
+  lcd.drawFastHLine(dx + 10, dy + dh - 22, dw - 20, COL_GRAY_2);
+  lcd.setTextColor(COL_GRAY_5);
+  const char* hint = "C=- D=+  B=kursor  BOOT=ok";
+  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + dh - 18);
+
+  unsigned long elapsed = millis() - jumpOpenMs;
+  int barW = dw - 20;
+  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
+  prog = constrain(prog, 0, barW);
+  lcd.fillRect(dx + 10, dy + dh - 6, barW, 3, COL_GRAY_2);
+  lcd.fillRect(dx + 10, dy + dh - 6, prog, 3, COL_GRAY_5);
+}
+
+void openJumpDialog() {
+  jumpResetToCurrentIndex();
+  jumpOpenMs    = millis();
+  jumpActive    = true;
+  drawJumpDialog();
+  resetAllButtons();
+  appMode = MODE_JUMP_INPUT;
+}
+
+void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
+                          ButtonEvent evtC,    ButtonEvent evtD) {
+  if (millis() - jumpOpenMs >= JUMP_TIMEOUT_MS) {
+    jumpActive = false;
+    resetAllButtons();
+    appMode = MODE_GALLERY;
+    drawGallery();
+    islandPush(NOTIF_INFO, "JUMP BATAL (timeout)");
+    return;
+  }
+
+  bool redraw = false;
+
+  if (evtD.valid && evtD.isShort) {
+    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 1) % 10;
+    redraw = true;
+  }
+  if (evtC.valid && evtC.isShort) {
+    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 9) % 10;
+    redraw = true;
+  }
+  if (evtB.valid && evtB.isShort) {
+    jumpCursorPos = (jumpCursorPos + 1) % JUMP_DIGIT_COUNT;
+    redraw = true;
+  }
+  if (evtB.valid && evtB.isLong) {
+    jumpCursorPos = (jumpCursorPos + JUMP_DIGIT_COUNT - 1) % JUMP_DIGIT_COUNT;
+    redraw = true;
+  }
+  if (evtBoot.valid && evtBoot.isShort) {
+    int target = jumpGetValue();
+    jumpActive = false;
+    if (target < 1 || target > galleryCount) {
+      resetAllButtons();
+      appMode = MODE_GALLERY;
+      drawGallery();
+      char warnBuf[32];
+      snprintf(warnBuf, sizeof(warnBuf), "INDEX %d diluar range", target);
+      islandPush(NOTIF_WARN, warnBuf);
+    } else {
+      int newIdx = target - 1;
+      newIdx = constrain(newIdx, 0, galleryCount - 1);
+      gallerySelIdx  = newIdx;
+      galleryScroll  = (newIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
+      galleryHoldDir = 0;
+      resetAllButtons();
+      appMode = MODE_GALLERY;
+      drawGallery();
+      char infoBuf[24];
+      snprintf(infoBuf, sizeof(infoBuf), "JUMP #%d", target);
+      islandPush(NOTIF_INFO, infoBuf);
+    }
+    return;
+  }
+  if (evtBoot.valid && evtBoot.isLong) {
+    jumpActive = false;
+    resetAllButtons();
+    appMode = MODE_GALLERY;
+    drawGallery();
+    islandPush(NOTIF_INFO, "JUMP BATAL");
+    return;
+  }
+
+  if (redraw) drawJumpDialog();
+
+  unsigned long elapsed = millis() - jumpOpenMs;
+  int barW = 240 - 20;
+  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
+  prog = constrain(prog, 0, barW);
+  int dx = (DISP_W - 240) / 2;
+  int dy = (DISP_H - 100) / 2;
+  lcd.fillRect(dx + 10, dy + 100 - 6, barW, 3, COL_GRAY_2);
+  lcd.fillRect(dx + 10, dy + 100 - 6, prog, 3, COL_GRAY_5);
+
+  esp_task_wdt_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
@@ -2700,9 +2672,7 @@ void setup() {
   if (sdReady) {
     scanPhotoCount();
     scanVideoCount();
-    loadSettings();           // [SETTINGS] load dari SD setelah mount
-    // expPreset sudah ter-set oleh loadSettings, tapi camera belum init
-    // applyExpPreset dipanggil setelah initCamera() di bawah
+    loadSettings();
   }
 
   msc.vendorID("ESP32S3"); msc.productID("SD Card"); msc.productRevision("1.0");
@@ -2714,7 +2684,6 @@ void setup() {
   bool pidOK = (detectedSensor == PID_GC2145 || detectedSensor == PID_OV3660);
   uint32_t xclkHz = (detectedSensor == PID_OV3660) ? 24000000 : 20000000;
 
-  // [SETTINGS] terapkan preset yang dimuat SETELAH kamera siap
   if (camOK && sdReady) {
     applyExpPreset(expPreset);
   }
@@ -2789,7 +2758,6 @@ void handleModeGallery(ButtonEvent evt) {
 
   if (evt.pin == BTN_BOOT) {
     if (evt.isLong) {
-      // [JUMP] BOOT long di gallery = buka jump dialog
       if (galleryCount > 0) openJumpDialog();
       else islandPush(NOTIF_WARN, "GALLERY KOSONG");
     } else if (evt.isShort) {
@@ -2897,7 +2865,7 @@ void handleModeMenuLed(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     ledFlashEnabled = (menuLedSel == 0);
     islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
-    saveSettings();   // [SETTINGS] simpan perubahan flash
+    saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2918,7 +2886,7 @@ void handleModeMenuFormat(ButtonEvent evt) {
     snprintf(fbBuf, sizeof(fbBuf), "FORMAT: %s",
              gc2145CaptureFormat == GFMT_BMP ? "BMP+stego" : "JPG+EXIF+stego");
     islandPush(NOTIF_INFO, fbBuf);
-    saveSettings();   // [SETTINGS] simpan perubahan format
+    saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2936,12 +2904,11 @@ void handleModeMenuExp(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
     if (menuExpSel == 3) {
-      // Masuk ke mode adj; simpan settings SETELAH user confirm di adj
       lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode = MODE_MENU_EXP_ADJ; return;
     }
     char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[menuExpSel]);
     islandPush(NOTIF_INFO, fbBuf);
-    saveSettings();   // [SETTINGS] simpan preset (non-manual)
+    saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER;
   }
@@ -2968,7 +2935,7 @@ void handleModeMenuExpAdj(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) {
     char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[3]);
     islandPush(NOTIF_INFO, fbBuf);
-    saveSettings();   // [SETTINGS] simpan manual exp saat konfirmasi
+    saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
     islandNoClear = true; appMode = MODE_VIEWFINDER; return;
   }
@@ -3032,7 +2999,6 @@ void loop() {
     case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                  break;
     case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                break;
     case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                  break;
-    // [JUMP] mode input nomor — butuh semua 4 event tombol
     case MODE_JUMP_INPUT:    handleModeJumpInput(evtBoot,evtB,evtC,evtD);      break;
   }
 
