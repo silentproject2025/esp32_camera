@@ -1,48 +1,41 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.9-fix2
+ * Version: v5.9-fix3
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.9-fix2 (di atas v5.9-fix):
+ *  CHANGELOG v5.9-fix3 (di atas v5.9-fix2):
  *
+ *  [AI-DESCRIBE] Fitur deskripsi foto via Google Gemini Vision API
+ *    - Trigger: D long-press di MODE_PHOTO_VIEW
+ *    - Model  : gemini-2.5-flash (gratis 250 req/hari)
+ *    - Config : /sdcard/gemini.ini  → key=AIzaXXXX
+ *    - Config : /sdcard/wifi.ini    → ssid=... / pass=...
+ *    - Jika file belum ada → dibuat otomatis template + instruksi LCD
+ *    - Hasil deskripsi ditampilkan dengan word-wrap di LCD
+ *    - C=scroll up, D=scroll down, B=kembali ke photo view
+ *    - Foto BMP di-convert ke JPEG dulu sebelum dikirim (hemat token)
+ *    - Base64 encode dilakukan in-place dari PSRAM
+ *
+ *  [WIFI-SD] WiFi config dari SD card
+ *    - File /sdcard/wifi.ini dibuat otomatis jika belum ada
+ *    - loadWifiConfig() dipanggil saat AI Describe pertama kali
+ *    - Koneksi WiFi di-cache, tidak reconnect jika sudah tersambung
+ *
+ * ═══════════════════════════════════════════════════════════════
+ *  TETAP dari v5.9-fix2:
  *  [SETTINGS] Simpan/load preferensi ke /sdcard/settings.ini
- *    - Format: key=value, satu per baris
- *    - Keys: flash, exp_preset, exp_val, exp_gain, gc2145_fmt
- *    - loadSettings() dipanggil saat boot setelah SD siap
- *    - saveSettings() dipanggil otomatis setiap ada perubahan:
- *        LED menu, Format menu, Exposure menu (preset & manual)
- *    - File dibuat otomatis jika belum ada
- *
- *  [JUMP] Jump-to-number di Gallery
- *    - Trigger: BOOT long-press di MODE_GALLERY
- *    - UI: dialog overlay dengan 4 digit (0000–9999)
- *    - C = digit aktif -1, D = digit aktif +1 (wrap 0–9)
- *    - B short = geser kursor digit ke kanan (wrap)
- *    - B long  = geser kursor digit ke kiri (wrap)
- *    - BOOT short = konfirmasi, lompat ke index tersebut
- *    - Timeout 10 detik = batal otomatis
- *    - Index adalah posisi dalam daftar gallery (1-based)
- *    - Pesan notif jika nomor di luar range
- *
- * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.9-fix:
- *  [FIX-STEGO-BMP] embed stego di saveBMP() langsung ke BGR888
- *  [BOOT-GLITCH] boot animation glitch ~2.5s + boot log
- *  [FIX-BMP-COLOR] byte-swap RGB565 sebelum konversi ke BGR888
- *  [FORMAT-SELECT] Menu pilih format foto GC2145: JPG atau BMP
- *  [STEGO-BMP] stegoBmpExtract() sudah benar
- *  [ISLAND-1..4] animasi island smooth
- *  [EXIF] inject APP1 EXIF ke JPEG
- *  [STEGO] embed payload ke COM marker JPEG
- *  [FIX-B] applyExpPreset jaga hmirror/vflip
+ *  [JUMP]     Jump-to-number di Gallery (BOOT long-press)
+ *  [STEGO]    Steganografi JPEG & BMP
+ *  [EXIF]     Inject EXIF ke JPEG
+ *  [FACE]     Human face detection (tetap ada)
+ *  [FORMAT]   Pilih format GC2145: JPG atau BMP
  * ═══════════════════════════════════════════════════════════════
  *
- * UI THEME: Monochrome — full black/gray/white, terminal aesthetic
- * DISPLAY : ILI9341 2.4" 320x240 landscape
+ * UI THEME : Monochrome — full black/gray/white, terminal aesthetic
+ * DISPLAY  : ILI9341 2.4" 320x240 landscape
  *
- * FIX: Pindahkan sdReady, ledFlashEnabled, expPreset, expManualVal,
- *      expManualGain, gc2145CaptureFormat ke sebelum saveSettings()
- *      agar tidak ada error "not declared in this scope".
+ * LIBRARY TAMBAHAN (install via Arduino Library Manager):
+ *   - ArduinoJson by Benoit Blanchon  (v6.x)
  */
 
 #include "esp_camera.h"
@@ -50,6 +43,12 @@
 #include "img_converters.h"
 #include "FS.h"
 #include "esp_task_wdt.h"
+
+// WiFi & HTTP
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 #include "human_face_detect_msr01.hpp"
 #include "human_face_detect_mnp01.hpp"
@@ -195,6 +194,7 @@ static LGFX lcd;
 #define COL_BMP_ACCENT  0x051F
 #define COL_VID_ACCENT  0x6000
 #define COL_JPG_ACCENT  0x3186
+#define COL_AI_ACCENT   0x07E0   // hijau untuk AI
 
 #define PID_GC2145 0x2145
 #define PID_OV3660 0x3660
@@ -230,6 +230,8 @@ enum AppMode {
   MODE_DIALOG_DELETE,
   MODE_MENU_FORMAT,
   MODE_JUMP_INPUT,
+  MODE_AI_DESCRIBE,     // ← baru v5.9-fix3
+  MODE_AI_NO_CONFIG,    // ← baru v5.9-fix3: tampil instruksi setup
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
@@ -241,6 +243,25 @@ enum GC2145Format : uint8_t {
   GFMT_BMP = 0,
   GFMT_JPG = 1,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WiFi & Gemini AI config  [WIFI-SD] [AI]
+// ─────────────────────────────────────────────────────────────────────────────
+#define WIFI_INI_PATH    "/sdcard/wifi.ini"
+#define GEMINI_INI_PATH  "/sdcard/gemini.ini"
+#define GEMINI_URL_BASE  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="
+#define AI_RESULT_MAX    600
+#define AI_LINE_MAX       28
+#define AI_LINE_W         56
+
+static char wifiSSID[64]               = "";
+static char wifiPass[64]               = "";
+static char geminiApiKey[80]           = "";
+static char aiResult[AI_RESULT_MAX+1]  = "";
+static bool aiDescribeBusy             = false;
+static char aiLines[AI_LINE_MAX][AI_LINE_W] = {};
+static int  aiTotalLines               = 0;
+static int  aiScrollLine               = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
@@ -493,8 +514,6 @@ void islandForceHide() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  VARIABEL GLOBAL UTAMA
-//  Didefinisikan di sini (sebelum saveSettings/loadSettings) agar
-//  tidak ada "not declared in this scope" saat kompilasi.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SD / storage
@@ -523,52 +542,139 @@ char     sensorName[16]= "UNKNOWN";
 int      photoCount    = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  SETTINGS PERSISTENCE  [SETTINGS]
-//  File: /sdcard/settings.ini
-//  Format: key=value satu per baris (plain text)
+//  SETTINGS PERSISTENCE
 // ─────────────────────────────────────────────────────────────────────────────
 #define SETTINGS_PATH "/sdcard/settings.ini"
 
 void saveSettings() {
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
-  if (!f) {
-    Serial.println("[SETTINGS] fopen gagal, tidak bisa simpan");
-    return;
-  }
-  fprintf(f, "# Sanzxcam v5.9-fix2 settings\n");
+  if (!f) return;
+  fprintf(f, "# Sanzxcam v5.9-fix3 settings\n");
   fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
   fprintf(f, "exp_preset=%d\n", (int)expPreset);
   fprintf(f, "exp_val=%d\n",    expManualVal);
   fprintf(f, "exp_gain=%d\n",   expManualGain);
   fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
   fclose(f);
-  Serial.printf("[SETTINGS] saved — flash=%d exp=%d val=%d gain=%d fmt=%d\n",
-                ledFlashEnabled, expPreset, expManualVal, expManualGain,
-                (int)gc2145CaptureFormat);
 }
 
 void loadSettings() {
   FILE* f = fopen(SETTINGS_PATH, "r");
-  if (!f) {
-    Serial.println("[SETTINGS] settings.ini tidak ada, pakai default");
-    return;
-  }
+  if (!f) return;
   char line[64];
-  int loaded = 0;
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     int v = 0;
-    if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v;                               loaded++; }
-    else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v, 0, 3);           loaded++; }
-    else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v, 0, 1200);                  loaded++; }
-    else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v, 0, 30);                    loaded++; }
-    else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat = (v == 1) ? GFMT_JPG : GFMT_BMP;       loaded++; }
+    if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
+    else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v,0,3); }
+    else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
+    else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
+    else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat= (v==1)?GFMT_JPG:GFMT_BMP; }
   }
   fclose(f);
-  Serial.printf("[SETTINGS] loaded %d keys — flash=%d exp=%d val=%d gain=%d fmt=%d\n",
-                loaded, ledFlashEnabled, expPreset, expManualVal, expManualGain,
-                (int)gc2145CaptureFormat);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WIFI & GEMINI CONFIG LOADER  [WIFI-SD]
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void createFileTemplate(const char* path, const char* content) {
+  FILE* f = fopen(path, "w");
+  if (!f) return;
+  fputs(content, f);
+  fclose(f);
+  Serial.printf("[CFG] template dibuat: %s\n", path);
+}
+
+// Kembalikan true jika berhasil load & bukan template default
+bool loadWifiConfig() {
+  FILE* f = fopen(WIFI_INI_PATH, "r");
+  if (!f) {
+    createFileTemplate(WIFI_INI_PATH,
+      "# Konfigurasi WiFi Sanzxcam\n"
+      "# Isi ssid dan pass lalu restart kamera\n"
+      "ssid=NamaWiFiKamu\n"
+      "pass=PasswordWiFiKamu\n");
+    return false;
+  }
+  char line[128]; bool gotSSID=false, gotPass=false;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
+    char val[64]="";
+    if      (sscanf(line,"ssid=%63[^\r\n]",val)==1) { strncpy(wifiSSID,val,63); gotSSID=true; }
+    else if (sscanf(line,"pass=%63[^\r\n]",val)==1) { strncpy(wifiPass,val,63); gotPass=true; }
+  }
+  fclose(f);
+  if (strcmp(wifiSSID,"NamaWiFiKamu")==0) return false;
+  Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
+  return gotSSID && gotPass;
+}
+
+// Kembalikan true jika berhasil load & bukan template default
+bool loadGeminiConfig() {
+  FILE* f = fopen(GEMINI_INI_PATH, "r");
+  if (!f) {
+    createFileTemplate(GEMINI_INI_PATH,
+      "# Gemini API Key untuk Sanzxcam AI Describe\n"
+      "# Dapatkan key GRATIS di: aistudio.google.com\n"
+      "# Login Google -> Get API Key -> Create API Key\n"
+      "# Salin key (format: AIza...) ke baris di bawah\n"
+      "key=AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n");
+    return false;
+  }
+  char line[128]; bool gotKey=false;
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
+    char val[80]="";
+    if (sscanf(line,"key=%79[^\r\n]",val)==1) {
+      strncpy(geminiApiKey,val,79);
+      gotKey=true;
+    }
+  }
+  fclose(f);
+  if (strncmp(geminiApiKey,"AIzaXXXX",8)==0) return false;
+  Serial.printf("[GEMINI] key loaded (len=%d)\n", strlen(geminiApiKey));
+  return gotKey;
+}
+
+// Tampilkan layar instruksi setup jika config belum ada/diisi
+void drawAINoConfigScreen(bool missingWifi, bool missingGemini) {
+  lcd.fillScreen(COL_BLACK);
+  lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
+  lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title="SETUP AI DESCRIBE";
+  lcd.drawString(title,(DISP_W-lcd.textWidth(title))/2,6);
+
+  int y=26;
+  lcd.setTextColor(COL_GRAY_7);
+  lcd.drawString("File config sudah dibuat di SD card.",4,y); y+=12;
+  lcd.drawString("Cabut SD, isi file berikut di PC:",4,y); y+=14;
+
+  if (missingWifi) {
+    lcd.setTextColor(COL_AI_ACCENT);
+    lcd.drawString("/sdcard/wifi.ini",4,y); y+=11;
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("  ssid=NamaWiFiKamu",4,y); y+=11;
+    lcd.drawString("  pass=PasswordKamu",4,y); y+=13;
+  }
+  if (missingGemini) {
+    lcd.setTextColor(COL_AI_ACCENT);
+    lcd.drawString("/sdcard/gemini.ini",4,y); y+=11;
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("  key=AIzaXXXXXXXXXXXX",4,y); y+=11;
+    lcd.setTextColor(COL_GRAY_3);
+    lcd.drawString("  (dari aistudio.google.com)",4,y); y+=13;
+  }
+
+  lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=4;
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString("Setelah diisi, pasang SD & restart.",4,y);
+
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("B=kembali",DISP_W-52,DISP_H-10);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -642,11 +748,9 @@ bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
   if (!path || !outPayload || maxLen < 2) return false;
   FILE* f = fopen(path, "rb");
   if (!f) return false;
-
   uint8_t hdr[54];
   if (fread(hdr, 1, 54, f) != 54) { fclose(f); return false; }
   if (hdr[0] != 'B' || hdr[1] != 'M') { fclose(f); return false; }
-
   uint32_t dataOffset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8)
                       | ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
   int32_t bmpW = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19] << 8)
@@ -655,31 +759,20 @@ bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
                           | ((uint32_t)hdr[24] << 16) | ((uint32_t)hdr[25] << 24));
   if (bmpH < 0) bmpH = -bmpH;
   if (bmpW <= 0 || bmpH <= 0) { fclose(f); return false; }
-
   uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
   if (bpp != 24) { fclose(f); return false; }
-
   fseek(f, (long)dataOffset, SEEK_SET);
-
   int rowSize = ((bmpW * 3 + 3) / 4) * 4;
   int totalPayloadBits = (maxLen - 1) * 8;
-
   memset(outPayload, 0, maxLen);
-  int bitIdx = 0;
-  int charIdx = 0;
+  int bitIdx = 0, charIdx = 0;
   uint8_t curChar = 0;
   bool found = false;
-
-  long rowDataStart = (long)dataOffset;
-
   uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
   if (!rowBuf) { fclose(f); return false; }
-
   for (int row = bmpH - 1; row >= 0 && bitIdx < totalPayloadBits; row--) {
-    long offset = rowDataStart + (long)row * rowSize;
-    fseek(f, offset, SEEK_SET);
+    fseek(f, (long)dataOffset + (long)row * rowSize, SEEK_SET);
     if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize) break;
-
     for (int x = 0; x < bmpW && bitIdx < totalPayloadBits; x++) {
       uint8_t bit = rowBuf[x * 3 + 0] & 0x01;
       int bitPos = 7 - (bitIdx % 8);
@@ -696,30 +789,22 @@ bool stegoBmpExtract(const char* path, char* outPayload, int maxLen) {
     if (found) break;
   }
   outPayload[maxLen - 1] = '\0';
-
   free(rowBuf);
   fclose(f);
-
   return (strncmp(outPayload, STEGO_MAGIC, strlen(STEGO_MAGIC)) == 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  EXIF INJECT
 // ─────────────────────────────────────────────────────────────────────────────
-static inline void exifL16(uint8_t* b, uint16_t v) {
-  b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
-}
+static inline void exifL16(uint8_t* b, uint16_t v) { b[0]=v&0xFF; b[1]=(v>>8)&0xFF; }
 static inline void exifL32(uint8_t* b, uint32_t v) {
-  b[0] = v & 0xFF; b[1] = (v >> 8) & 0xFF;
-  b[2] = (v >> 16) & 0xFF; b[3] = (v >> 24) & 0xFF;
+  b[0]=v&0xFF; b[1]=(v>>8)&0xFF; b[2]=(v>>16)&0xFF; b[3]=(v>>24)&0xFF;
 }
-
 static void exifEntry(uint8_t* b, uint16_t tag, uint16_t type,
                       uint32_t count, uint32_t valOrOff) {
-  exifL16(b + 0, tag); exifL16(b + 2, type);
-  exifL32(b + 4, count); exifL32(b + 8, valOrOff);
+  exifL16(b+0,tag); exifL16(b+2,type); exifL32(b+4,count); exifL32(b+8,valOrOff);
 }
-
 static void exifMakeTimestamp(char* buf, size_t bufLen) {
   unsigned long totalSec = millis() / 1000;
   unsigned long sec  = totalSec % 60;
@@ -737,63 +822,49 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
   snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
   snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
-  snprintf(strSoftware, sizeof(strSoftware), "v5.9-fix2");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.9-fix3");
   exifMakeTimestamp(strDt, sizeof(strDt));
-  int lenDesc     = (int)strlen(strDesc)     + 1;
-  int lenMake     = (int)strlen(strMake)     + 1;
-  int lenModel    = (int)strlen(strModel)    + 1;
-  int lenSoftware = (int)strlen(strSoftware) + 1;
-  int lenDt       = 20;
-  const uint32_t offIFD0     = 8;
-  const int      nIFD0       = 5;
-  const uint32_t offExifIFD  = offIFD0 + 2 + nIFD0 * 12 + 4;
-  const int      nExifIFD    = 2;
-  const uint32_t offDataArea = offExifIFD + 2 + nExifIFD * 12 + 4;
-  uint32_t offDesc     = offDataArea;
-  uint32_t offMake     = offDesc     + (uint32_t)lenDesc;
-  uint32_t offModel    = offMake     + (uint32_t)lenMake;
-  uint32_t offSoftware = offModel    + (uint32_t)lenModel;
-  uint32_t offDt       = offSoftware + (uint32_t)lenSoftware;
-  uint32_t tiffSize    = offDt + (uint32_t)lenDt;
-  uint32_t app1DataSize = 6 + tiffSize;
-  uint16_t app1Len      = (uint16_t)(2 + app1DataSize);
-  size_t totalSize = 2 + 2 + 2 + app1DataSize + (jpgLen - 2);
-  uint8_t* out = (uint8_t*)ps_malloc(totalSize);
-  if (!out) { out = (uint8_t*)malloc(totalSize); if (!out) return nullptr; }
-  size_t pos = 0;
-  out[pos++] = 0xFF; out[pos++] = 0xD8;
-  out[pos++] = 0xFF; out[pos++] = 0xE1;
-  out[pos++] = (app1Len >> 8) & 0xFF;
-  out[pos++] = app1Len & 0xFF;
-  out[pos++] = 'E'; out[pos++] = 'x'; out[pos++] = 'i'; out[pos++] = 'f';
-  out[pos++] = 0x00; out[pos++] = 0x00;
-  uint8_t* tiff = out + pos;
-  size_t   tp   = 0;
-  tiff[tp++] = 'I'; tiff[tp++] = 'I';
-  tiff[tp++] = 0x2A; tiff[tp++] = 0x00;
-  exifL32(tiff + tp, offIFD0); tp += 4;
-  exifL16(tiff + tp, (uint16_t)nIFD0); tp += 2;
-  exifEntry(tiff + tp, 0x010E, 2, (uint32_t)lenDesc, offDesc);         tp += 12;
-  exifEntry(tiff + tp, 0x010F, 2, (uint32_t)lenMake, offMake);         tp += 12;
-  exifEntry(tiff + tp, 0x0110, 2, (uint32_t)lenModel, offModel);       tp += 12;
-  exifEntry(tiff + tp, 0x0131, 2, (uint32_t)lenSoftware, offSoftware); tp += 12;
-  exifEntry(tiff + tp, 0x8769, 4, 1, offExifIFD);                      tp += 12;
-  exifL32(tiff + tp, 0); tp += 4;
-  exifL16(tiff + tp, (uint16_t)nExifIFD); tp += 2;
-  exifEntry(tiff + tp, 0x9000, 7, 4, 0x30323230); tp += 12;
-  exifEntry(tiff + tp, 0x9003, 2, (uint32_t)lenDt, offDt); tp += 12;
-  exifL32(tiff + tp, 0); tp += 4;
-  memcpy(tiff + tp, strDesc,     (size_t)lenDesc);     tp += lenDesc;
-  memcpy(tiff + tp, strMake,     (size_t)lenMake);     tp += lenMake;
-  memcpy(tiff + tp, strModel,    (size_t)lenModel);    tp += lenModel;
-  memcpy(tiff + tp, strSoftware, (size_t)lenSoftware); tp += lenSoftware;
-  memset(tiff + tp, 0, (size_t)lenDt);
-  memcpy(tiff + tp, strDt, min((int)strlen(strDt), lenDt - 1));
-  tp += lenDt;
-  pos += tp;
-  memcpy(out + pos, jpgIn + 2, jpgLen - 2);
-  pos += jpgLen - 2;
-  *outLen = pos;
+  int lenDesc=strlen(strDesc)+1, lenMake=strlen(strMake)+1;
+  int lenModel=strlen(strModel)+1, lenSoftware=strlen(strSoftware)+1, lenDt=20;
+  const uint32_t offIFD0=8, nIFD0=5;
+  const uint32_t offExifIFD=offIFD0+2+nIFD0*12+4, nExifIFD=2;
+  const uint32_t offDataArea=offExifIFD+2+nExifIFD*12+4;
+  uint32_t offDesc=offDataArea, offMake=offDesc+lenDesc;
+  uint32_t offModel=offMake+lenMake, offSoftware=offModel+lenModel;
+  uint32_t offDt=offSoftware+lenSoftware, tiffSize=offDt+lenDt;
+  uint32_t app1DataSize=6+tiffSize;
+  uint16_t app1Len=(uint16_t)(2+app1DataSize);
+  size_t totalSize=2+2+2+app1DataSize+(jpgLen-2);
+  uint8_t* out=(uint8_t*)ps_malloc(totalSize);
+  if (!out) { out=(uint8_t*)malloc(totalSize); if (!out) return nullptr; }
+  size_t pos=0;
+  out[pos++]=0xFF; out[pos++]=0xD8; out[pos++]=0xFF; out[pos++]=0xE1;
+  out[pos++]=(app1Len>>8)&0xFF; out[pos++]=app1Len&0xFF;
+  out[pos++]='E'; out[pos++]='x'; out[pos++]='i'; out[pos++]='f';
+  out[pos++]=0x00; out[pos++]=0x00;
+  uint8_t* tiff=out+pos; size_t tp=0;
+  tiff[tp++]='I'; tiff[tp++]='I'; tiff[tp++]=0x2A; tiff[tp++]=0x00;
+  exifL32(tiff+tp,offIFD0); tp+=4;
+  exifL16(tiff+tp,(uint16_t)nIFD0); tp+=2;
+  exifEntry(tiff+tp,0x010E,2,(uint32_t)lenDesc,offDesc);         tp+=12;
+  exifEntry(tiff+tp,0x010F,2,(uint32_t)lenMake,offMake);         tp+=12;
+  exifEntry(tiff+tp,0x0110,2,(uint32_t)lenModel,offModel);       tp+=12;
+  exifEntry(tiff+tp,0x0131,2,(uint32_t)lenSoftware,offSoftware); tp+=12;
+  exifEntry(tiff+tp,0x8769,4,1,offExifIFD);                      tp+=12;
+  exifL32(tiff+tp,0); tp+=4;
+  exifL16(tiff+tp,(uint16_t)nExifIFD); tp+=2;
+  exifEntry(tiff+tp,0x9000,7,4,0x30323230); tp+=12;
+  exifEntry(tiff+tp,0x9003,2,(uint32_t)lenDt,offDt); tp+=12;
+  exifL32(tiff+tp,0); tp+=4;
+  memcpy(tiff+tp,strDesc,(size_t)lenDesc);     tp+=lenDesc;
+  memcpy(tiff+tp,strMake,(size_t)lenMake);     tp+=lenMake;
+  memcpy(tiff+tp,strModel,(size_t)lenModel);   tp+=lenModel;
+  memcpy(tiff+tp,strSoftware,(size_t)lenSoftware); tp+=lenSoftware;
+  memset(tiff+tp,0,(size_t)lenDt);
+  memcpy(tiff+tp,strDt,min((int)strlen(strDt),lenDt-1)); tp+=lenDt;
+  pos+=tp;
+  memcpy(out+pos,jpgIn+2,jpgLen-2); pos+=jpgLen-2;
+  *outLen=pos;
   return out;
 }
 
@@ -802,60 +873,35 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
 // ─────────────────────────────────────────────────────────────────────────────
 bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
              const char* stegoPayload = nullptr, int stegoPayLen = 0) {
-
   FILE* f = fopen(path, "wb");
   if (!f) return false;
-
   int rowSize  = ((w * 3 + 3) / 4) * 4;
   int dataSize = rowSize * h;
   int fileSize = 54 + dataSize;
-
-  uint8_t hdr[54];
-  memset(hdr, 0, sizeof(hdr));
-
-  hdr[0] = 'B'; hdr[1] = 'M';
-  hdr[2] = fileSize & 0xFF;
-  hdr[3] = (fileSize >> 8)  & 0xFF;
-  hdr[4] = (fileSize >> 16) & 0xFF;
-  hdr[5] = (fileSize >> 24) & 0xFF;
-  hdr[10] = 54;
-  hdr[14] = 40;
-  hdr[18] = w & 0xFF;
-  hdr[19] = (w >> 8) & 0xFF;
-  hdr[20] = (w >> 16) & 0xFF;
-  hdr[21] = (w >> 24) & 0xFF;
-  hdr[22] = h & 0xFF;
-  hdr[23] = (h >> 8) & 0xFF;
-  hdr[24] = (h >> 16) & 0xFF;
-  hdr[25] = (h >> 24) & 0xFF;
-  hdr[26] = 1;
-  hdr[28] = 24;
-  hdr[34] = dataSize & 0xFF;
-  hdr[35] = (dataSize >> 8)  & 0xFF;
-  hdr[36] = (dataSize >> 16) & 0xFF;
-  hdr[37] = (dataSize >> 24) & 0xFF;
-  hdr[38] = 0x13; hdr[39] = 0x0B;
-  hdr[42] = 0x13; hdr[43] = 0x0B;
-
+  uint8_t hdr[54]; memset(hdr, 0, sizeof(hdr));
+  hdr[0]='B'; hdr[1]='M';
+  hdr[2]=fileSize&0xFF; hdr[3]=(fileSize>>8)&0xFF;
+  hdr[4]=(fileSize>>16)&0xFF; hdr[5]=(fileSize>>24)&0xFF;
+  hdr[10]=54; hdr[14]=40;
+  hdr[18]=w&0xFF; hdr[19]=(w>>8)&0xFF; hdr[20]=(w>>16)&0xFF; hdr[21]=(w>>24)&0xFF;
+  hdr[22]=h&0xFF; hdr[23]=(h>>8)&0xFF; hdr[24]=(h>>16)&0xFF; hdr[25]=(h>>24)&0xFF;
+  hdr[26]=1; hdr[28]=24;
+  hdr[34]=dataSize&0xFF; hdr[35]=(dataSize>>8)&0xFF;
+  hdr[36]=(dataSize>>16)&0xFF; hdr[37]=(dataSize>>24)&0xFF;
+  hdr[38]=0x13; hdr[39]=0x0B; hdr[42]=0x13; hdr[43]=0x0B;
   fwrite(hdr, 1, 54, f);
-
   int totalStegoBits = (stegoPayload && stegoPayLen > 0) ? stegoPayLen * 8 : 0;
   int stegoPixelIdx  = 0;
-
   static uint8_t rowBuf[320 * 3 + 4];
-
   for (int y = h - 1; y >= 0; y--) {
     memset(rowBuf, 0, rowSize);
     const uint16_t* srcRow = (const uint16_t*)rgb565Buf + (size_t)y * w;
-
     for (int x = 0; x < w; x++) {
       uint16_t raw = srcRow[x];
       uint16_t px = (raw << 8) | (raw >> 8);
-
       uint8_t r = ((px >> 11) & 0x1F) << 3;
       uint8_t g = ((px >>  5) & 0x3F) << 2;
       uint8_t b = ( px        & 0x1F) << 3;
-
       if (stegoPixelIdx < totalStegoBits) {
         int charIdx = stegoPixelIdx / 8;
         int bitPos  = 7 - (stegoPixelIdx % 8);
@@ -863,16 +909,11 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
         b = (b & 0xFE) | bit;
         stegoPixelIdx++;
       }
-
-      rowBuf[x * 3 + 0] = b;
-      rowBuf[x * 3 + 1] = g;
-      rowBuf[x * 3 + 2] = r;
+      rowBuf[x*3+0]=b; rowBuf[x*3+1]=g; rowBuf[x*3+2]=r;
     }
-
     fwrite(rowBuf, 1, rowSize, f);
     if (y % 30 == 0) esp_task_wdt_reset();
   }
-
   fclose(f);
   return true;
 }
@@ -883,66 +924,46 @@ bool saveBMP(const uint8_t* rgb565Buf, int w, int h, const char* path,
 uint16_t* loadBMP(const char* path, uint16_t* outW, uint16_t* outH) {
   FILE* f = fopen(path, "rb");
   if (!f) return nullptr;
-
   uint8_t hdr[54];
-  if (fread(hdr, 1, 54, f) != 54) { fclose(f); return nullptr; }
-  if (hdr[0] != 'B' || hdr[1] != 'M') { fclose(f); return nullptr; }
-
-  uint32_t dataOffset = (uint32_t)hdr[10] | ((uint32_t)hdr[11] << 8)
-                      | ((uint32_t)hdr[12] << 16) | ((uint32_t)hdr[13] << 24);
-  int32_t bmpW = (int32_t)((uint32_t)hdr[18] | ((uint32_t)hdr[19] << 8)
-                          | ((uint32_t)hdr[20] << 16) | ((uint32_t)hdr[21] << 24));
-  int32_t bmpH = (int32_t)((uint32_t)hdr[22] | ((uint32_t)hdr[23] << 8)
-                          | ((uint32_t)hdr[24] << 16) | ((uint32_t)hdr[25] << 24));
-
-  bool topDown = false;
-  if (bmpH < 0) { topDown = true; bmpH = -bmpH; }
-
-  uint16_t bpp = (uint16_t)hdr[28] | ((uint16_t)hdr[29] << 8);
-  if (bpp != 24) { fclose(f); return nullptr; }
-  if (bmpW <= 0 || bmpH <= 0 || bmpW > 4096 || bmpH > 4096) { fclose(f); return nullptr; }
-
-  size_t pixCount = (size_t)bmpW * (size_t)bmpH;
-  uint16_t* buf = (uint16_t*)ps_malloc(pixCount * sizeof(uint16_t));
-  if (!buf) { buf = (uint16_t*)malloc(pixCount * sizeof(uint16_t)); }
+  if (fread(hdr,1,54,f)!=54) { fclose(f); return nullptr; }
+  if (hdr[0]!='B'||hdr[1]!='M') { fclose(f); return nullptr; }
+  uint32_t dataOffset=(uint32_t)hdr[10]|((uint32_t)hdr[11]<<8)
+                     |((uint32_t)hdr[12]<<16)|((uint32_t)hdr[13]<<24);
+  int32_t bmpW=(int32_t)((uint32_t)hdr[18]|((uint32_t)hdr[19]<<8)
+                        |((uint32_t)hdr[20]<<16)|((uint32_t)hdr[21]<<24));
+  int32_t bmpH=(int32_t)((uint32_t)hdr[22]|((uint32_t)hdr[23]<<8)
+                        |((uint32_t)hdr[24]<<16)|((uint32_t)hdr[25]<<24));
+  bool topDown=false;
+  if (bmpH<0) { topDown=true; bmpH=-bmpH; }
+  uint16_t bpp=(uint16_t)hdr[28]|((uint16_t)hdr[29]<<8);
+  if (bpp!=24) { fclose(f); return nullptr; }
+  if (bmpW<=0||bmpH<=0||bmpW>4096||bmpH>4096) { fclose(f); return nullptr; }
+  size_t pixCount=(size_t)bmpW*(size_t)bmpH;
+  uint16_t* buf=(uint16_t*)ps_malloc(pixCount*sizeof(uint16_t));
+  if (!buf) buf=(uint16_t*)malloc(pixCount*sizeof(uint16_t));
   if (!buf) { fclose(f); return nullptr; }
-
-  int rowSize = ((bmpW * 3 + 3) / 4) * 4;
-  uint8_t* rowBuf = (uint8_t*)malloc(rowSize);
+  int rowSize=((bmpW*3+3)/4)*4;
+  uint8_t* rowBuf=(uint8_t*)malloc(rowSize);
   if (!rowBuf) { free(buf); fclose(f); return nullptr; }
-
-  fseek(f, (long)dataOffset, SEEK_SET);
-
-  for (int row = 0; row < bmpH; row++) {
-    if (fread(rowBuf, 1, rowSize, f) != (size_t)rowSize)
-      memset(rowBuf, 0, rowSize);
-
-    int destRow = topDown ? row : (bmpH - 1 - row);
-    uint16_t* destLine = buf + (size_t)destRow * bmpW;
-
-    for (int x = 0; x < bmpW; x++) {
-      uint8_t b = rowBuf[x * 3 + 0];
-      uint8_t g = rowBuf[x * 3 + 1];
-      uint8_t r = rowBuf[x * 3 + 2];
-      uint16_t px_le = ((uint16_t)(r & 0xF8) << 8)
-                     | ((uint16_t)(g & 0xFC) << 3)
-                     | ((uint16_t)(b >> 3));
-      destLine[x] = (px_le << 8) | (px_le >> 8);
+  fseek(f,(long)dataOffset,SEEK_SET);
+  for (int row=0;row<bmpH;row++) {
+    if (fread(rowBuf,1,rowSize,f)!=(size_t)rowSize) memset(rowBuf,0,rowSize);
+    int destRow=topDown?row:(bmpH-1-row);
+    uint16_t* destLine=buf+(size_t)destRow*bmpW;
+    for (int x=0;x<bmpW;x++) {
+      uint8_t b=rowBuf[x*3+0],g=rowBuf[x*3+1],r=rowBuf[x*3+2];
+      uint16_t px_le=((uint16_t)(r&0xF8)<<8)|((uint16_t)(g&0xFC)<<3)|((uint16_t)(b>>3));
+      destLine[x]=(px_le<<8)|(px_le>>8);
     }
-
-    if (row % 30 == 0) esp_task_wdt_reset();
+    if (row%30==0) esp_task_wdt_reset();
   }
-
-  free(rowBuf);
-  fclose(f);
-
-  *outW = (uint16_t)bmpW;
-  *outH = (uint16_t)bmpH;
+  free(rowBuf); fclose(f);
+  *outW=(uint16_t)bmpW; *outH=(uint16_t)bmpH;
   return buf;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  State variabel lanjutan (yang tidak dibutuhkan oleh saveSettings)
+//  Gallery
 // ─────────────────────────────────────────────────────────────────────────────
 enum GalleryFileType : uint8_t {
   GFILE_JPG   = 0,
@@ -998,7 +1019,6 @@ struct ExpPresetCfg {
   bool aec_on; bool aec2_on; int aec_val;
   bool agc_on; int agc_gain; int gainceiling; int ae_level;
 };
-
 const ExpPresetCfg expPresets[4] = {
   { true,  true,  300,  true,  0, 2,  0 },
   { false, false,  20,  false, 0, 0, -2 },
@@ -1026,29 +1046,24 @@ float         fpsValue      = 0.0f;
 #define PILL_PAD_X   5
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  JUMP-TO-NUMBER STATE  [JUMP]
+//  JUMP-TO-NUMBER STATE
 // ─────────────────────────────────────────────────────────────────────────────
 #define JUMP_TIMEOUT_MS  10000
 #define JUMP_DIGIT_COUNT 4
 
 static bool          jumpActive       = false;
-static int           jumpDigits[JUMP_DIGIT_COUNT] = {0, 0, 0, 0};
+static int           jumpDigits[JUMP_DIGIT_COUNT] = {0,0,0,0};
 static int           jumpCursorPos    = 0;
 static unsigned long jumpOpenMs       = 0;
 
 static int jumpGetValue() {
-  return jumpDigits[0] * 1000 + jumpDigits[1] * 100
-       + jumpDigits[2] * 10   + jumpDigits[3];
+  return jumpDigits[0]*1000+jumpDigits[1]*100+jumpDigits[2]*10+jumpDigits[3];
 }
-
 static void jumpResetToCurrentIndex() {
-  int v = gallerySelIdx + 1;
-  v = constrain(v, 0, 9999);
-  jumpDigits[0] = (v / 1000) % 10;
-  jumpDigits[1] = (v /  100) % 10;
-  jumpDigits[2] = (v /   10) % 10;
-  jumpDigits[3] =  v         % 10;
-  jumpCursorPos = 3;
+  int v=constrain(gallerySelIdx+1,0,9999);
+  jumpDigits[0]=(v/1000)%10; jumpDigits[1]=(v/100)%10;
+  jumpDigits[2]=(v/10)%10;   jumpDigits[3]=v%10;
+  jumpCursorPos=3;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1063,24 +1078,24 @@ public:
   size_t write(uint8_t) override { return 0; }
   int available() override {
     if (!f) return 0;
-    long cur = ftell(f); fseek(f, 0, SEEK_END);
-    long end = ftell(f); fseek(f, cur, SEEK_SET);
-    return (int)(end - cur);
+    long cur=ftell(f); fseek(f,0,SEEK_END);
+    long end=ftell(f); fseek(f,cur,SEEK_SET);
+    return (int)(end-cur);
   }
   int read() override {
     if (!f) return -1;
     uint8_t b;
-    return (fread(&b, 1, 1, f) == 1) ? b : -1;
+    return (fread(&b,1,1,f)==1)?b:-1;
   }
   int peek() override {
     if (!f) return -1;
-    int c = fgetc(f);
-    if (c != EOF) ungetc(c, f);
+    int c=fgetc(f);
+    if (c!=EOF) ungetc(c,f);
     return c;
   }
-  size_t readBytes(uint8_t* buf, size_t len) override {
+  size_t readBytes(uint8_t* buf,size_t len) override {
     if (!f) return 0;
-    return fread(buf, 1, len, f);
+    return fread(buf,1,len,f);
   }
 } fileStream;
 
@@ -1114,14 +1129,13 @@ static uint16_t  _decodeTargetW   = 0;
 
 bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   if (_decodeTargetBuf) {
-    for (int row = 0; row < h; row++) {
-      int destY = y + row;
-      if (destY < 0 || destY >= DISP_H) continue;
-      memcpy(_decodeTargetBuf + destY * _decodeTargetW + x,
-             bitmap + row * w, w * sizeof(uint16_t));
+    for (int row=0;row<h;row++) {
+      int destY=y+row;
+      if (destY<0||destY>=DISP_H) continue;
+      memcpy(_decodeTargetBuf+destY*_decodeTargetW+x, bitmap+row*w, w*sizeof(uint16_t));
     }
   } else {
-    lcd.pushImage(x, y, w, h, bitmap);
+    lcd.pushImage(x,y,w,h,bitmap);
   }
   return 1;
 }
@@ -1129,26 +1143,26 @@ bool tjpgdecOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitma
 // ─────────────────────────────────────────────────────────────────────────────
 //  Helper umum
 // ─────────────────────────────────────────────────────────────────────────────
-static void blockingWaitAllRelease(uint32_t timeoutMs = 500) {
-  unsigned long t0 = millis();
-  while (millis() - t0 < timeoutMs) {
-    bool anyLow = (digitalRead(BTN_BOOT)==LOW || digitalRead(BTN_B)==LOW ||
-                   digitalRead(BTN_C)==LOW    || digitalRead(BTN_D)==LOW);
+static void blockingWaitAllRelease(uint32_t timeoutMs=500) {
+  unsigned long t0=millis();
+  while (millis()-t0<timeoutMs) {
+    bool anyLow=(digitalRead(BTN_BOOT)==LOW||digitalRead(BTN_B)==LOW||
+                 digitalRead(BTN_C)==LOW   ||digitalRead(BTN_D)==LOW);
     if (!anyLow) break;
     delay(10); esp_task_wdt_reset();
   }
   delay(50);
 }
 
-void blinkLED(int n, int on_ms = 100, int off_ms = 100) {
-  for (int i = 0; i < n; i++) {
-    digitalWrite(LED_PIN, HIGH); delay(on_ms);
-    digitalWrite(LED_PIN, LOW);  if (i < n-1) delay(off_ms);
+void blinkLED(int n, int on_ms=100, int off_ms=100) {
+  for (int i=0;i<n;i++) {
+    digitalWrite(LED_PIN,HIGH); delay(on_ms);
+    digitalWrite(LED_PIN,LOW);  if (i<n-1) delay(off_ms);
     esp_task_wdt_reset();
   }
 }
 
-void drawCornerBrackets(uint16_t col = COL_WHITE) {
+void drawCornerBrackets(uint16_t col=COL_WHITE) {
   int x0=3,y0=3,x1=DISP_W-4,y1=DISP_H-4,L=BRACKET_LEN;
   lcd.drawFastHLine(x0,y0,L,col);   lcd.drawFastVLine(x0,y0,L,col);
   lcd.drawFastHLine(x1-L+1,y0,L,col); lcd.drawFastVLine(x1,y0,L,col);
@@ -1158,30 +1172,29 @@ void drawCornerBrackets(uint16_t col = COL_WHITE) {
 
 void drawPill(int cx, int cy, const char* text, uint16_t bgCol, uint16_t fgCol) {
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  int tw = lcd.textWidth(text);
-  int pw = tw + PILL_PAD_X * 2;
-  int px = cx - pw/2, py = cy - PILL_H/2;
-  lcd.fillRoundRect(px, py, pw, PILL_H, PILL_R, bgCol);
-  lcd.drawRoundRect(px, py, pw, PILL_H, PILL_R, COL_GRAY_3);
+  int tw=lcd.textWidth(text);
+  int pw=tw+PILL_PAD_X*2;
+  int px=cx-pw/2, py=cy-PILL_H/2;
+  lcd.fillRoundRect(px,py,pw,PILL_H,PILL_R,bgCol);
+  lcd.drawRoundRect(px,py,pw,PILL_H,PILL_R,COL_GRAY_3);
   lcd.setTextColor(fgCol);
-  lcd.drawString(text, px + PILL_PAD_X, py + 2);
+  lcd.drawString(text,px+PILL_PAD_X,py+2);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  SD Mount / Unmount / Remount
 // ─────────────────────────────────────────────────────────────────────────────
 bool mountSDFull() {
-  sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-  host.max_freq_khz = SDMMC_FREQ_DEFAULT;
-  sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+  sdmmc_host_t host=SDMMC_HOST_DEFAULT();
+  host.max_freq_khz=SDMMC_FREQ_DEFAULT;
+  sdmmc_slot_config_t slot=SDMMC_SLOT_CONFIG_DEFAULT();
   slot.clk=(gpio_num_t)SD_MMC_CLK_PIN; slot.cmd=(gpio_num_t)SD_MMC_CMD_PIN;
   slot.d0=(gpio_num_t)SD_MMC_D0_PIN;   slot.width=1;
-  slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-  esp_vfs_fat_sdmmc_mount_config_t mountCfg = {
-    .format_if_mount_failed=false,.max_files=5,.allocation_unit_size=16*1024
-  };
-  esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard",&host,&slot,&mountCfg,&sdCard);
-  if (ret != ESP_OK) {
+  slot.flags|=SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+  esp_vfs_fat_sdmmc_mount_config_t mountCfg={
+    .format_if_mount_failed=false,.max_files=5,.allocation_unit_size=16*1024};
+  esp_err_t ret=esp_vfs_fat_sdmmc_mount("/sdcard",&host,&slot,&mountCfg,&sdCard);
+  if (ret!=ESP_OK) {
     sdCard=nullptr; sdTotalSectors=0; sdmmcDriverInit=false; sdSizeMB=0;
     return false;
   }
@@ -1199,7 +1212,7 @@ bool remountVFSOnly() {
   if (fr!=FR_OK) return false;
   FATFS* fatfsPtr=&fatfs;
   esp_err_t err=esp_vfs_fat_register("/sdcard","",5,&fatfsPtr);
-  if (err!=ESP_OK && err!=ESP_ERR_INVALID_STATE) return false;
+  if (err!=ESP_OK&&err!=ESP_ERR_INVALID_STATE) return false;
   return true;
 }
 
@@ -1212,17 +1225,16 @@ void unmountVFSOnly() {
 //  scanPhotoCount / scanVideoCount
 // ─────────────────────────────────────────────────────────────────────────────
 void scanPhotoCount() {
-  photoCount = 0;
-  DIR* dir = opendir("/sdcard");
-  if (!dir) return;
+  photoCount=0;
+  DIR* dir=opendir("/sdcard"); if (!dir) return;
   struct dirent* entry;
-  while ((entry = readdir(dir)) != nullptr) {
-    String name = entry->d_name;
-    bool isJpg = name.startsWith("photo_") && name.endsWith(".jpg");
-    bool isBmp = name.startsWith("photo_") && name.endsWith(".bmp");
-    if (isJpg || isBmp) {
-      int num = name.substring(6, name.length() - 4).toInt();
-      if (num > photoCount) photoCount = num;
+  while ((entry=readdir(dir))!=nullptr) {
+    String name=entry->d_name;
+    bool isJpg=name.startsWith("photo_")&&name.endsWith(".jpg");
+    bool isBmp=name.startsWith("photo_")&&name.endsWith(".bmp");
+    if (isJpg||isBmp) {
+      int num=name.substring(6,name.length()-4).toInt();
+      if (num>photoCount) photoCount=num;
     }
   }
   closedir(dir);
@@ -1230,199 +1242,171 @@ void scanPhotoCount() {
 
 void scanVideoCount() {
   recVideoCount=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
+  DIR* dir=opendir("/sdcard"); if (!dir) return;
   struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr) {
+  while ((entry=readdir(dir))!=nullptr) {
     String name=entry->d_name;
-    if(name.startsWith("video_")&&name.endsWith(".mjpeg")) {
+    if (name.startsWith("video_")&&name.endsWith(".mjpeg")) {
       int num=name.substring(6,name.length()-6).toInt();
-      if(num>recVideoCount) recVideoCount=num;
+      if (num>recVideoCount) recVideoCount=num;
     }
   }
   closedir(dir);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery
+//  Gallery functions
 // ─────────────────────────────────────────────────────────────────────────────
 void scanGalleryFiles() {
-  galleryCount = 0; galleryScroll = 0;
-  DIR* dir = opendir("/sdcard");
-  if (!dir) return;
+  galleryCount=0; galleryScroll=0;
+  DIR* dir=opendir("/sdcard"); if (!dir) return;
   struct dirent* entry;
-  while ((entry = readdir(dir)) != nullptr && galleryCount < GALLERY_MAX_FILES) {
-    String name = entry->d_name;
-    bool isJpg   = name.endsWith(".jpg")   || name.endsWith(".JPG");
-    bool isBmp   = name.endsWith(".bmp")   || name.endsWith(".BMP");
-    bool isMjpeg = name.endsWith(".mjpeg") || name.endsWith(".MJPEG");
-    if (isJpg || isBmp || isMjpeg) {
-      strncpy(galleryFiles[galleryCount], entry->d_name, 31);
-      galleryFiles[galleryCount][31] = '\0';
-      if (isMjpeg)      galleryFileType[galleryCount] = GFILE_VIDEO;
-      else if (isBmp)   galleryFileType[galleryCount] = GFILE_BMP;
-      else              galleryFileType[galleryCount] = GFILE_JPG;
+  while ((entry=readdir(dir))!=nullptr&&galleryCount<GALLERY_MAX_FILES) {
+    String name=entry->d_name;
+    bool isJpg=name.endsWith(".jpg")||name.endsWith(".JPG");
+    bool isBmp=name.endsWith(".bmp")||name.endsWith(".BMP");
+    bool isMjpeg=name.endsWith(".mjpeg")||name.endsWith(".MJPEG");
+    if (isJpg||isBmp||isMjpeg) {
+      strncpy(galleryFiles[galleryCount],entry->d_name,31);
+      galleryFiles[galleryCount][31]='\0';
+      if (isMjpeg)     galleryFileType[galleryCount]=GFILE_VIDEO;
+      else if (isBmp)  galleryFileType[galleryCount]=GFILE_BMP;
+      else             galleryFileType[galleryCount]=GFILE_JPG;
       galleryCount++;
     }
   }
   closedir(dir);
-
-  for (int i = 1; i < galleryCount; i++) {
-    char tmpN[32];
-    strncpy(tmpN, galleryFiles[i], 31); tmpN[31] = '\0';
-    GalleryFileType tmpT = galleryFileType[i];
-    int j = i - 1;
-    while (j >= 0 && strcmp(galleryFiles[j], tmpN) > 0) {
-      strncpy(galleryFiles[j+1], galleryFiles[j], 31);
-      galleryFileType[j+1] = galleryFileType[j];
+  for (int i=1;i<galleryCount;i++) {
+    char tmpN[32]; strncpy(tmpN,galleryFiles[i],31); tmpN[31]='\0';
+    GalleryFileType tmpT=galleryFileType[i];
+    int j=i-1;
+    while (j>=0&&strcmp(galleryFiles[j],tmpN)>0) {
+      strncpy(galleryFiles[j+1],galleryFiles[j],31);
+      galleryFileType[j+1]=galleryFileType[j];
       j--;
-      if (j % 20 == 0) esp_task_wdt_reset();
+      if (j%20==0) esp_task_wdt_reset();
     }
-    strncpy(galleryFiles[j+1], tmpN, 31);
-    galleryFileType[j+1] = tmpT;
+    strncpy(galleryFiles[j+1],tmpN,31);
+    galleryFileType[j+1]=tmpT;
   }
 }
 
 void drawGallery() {
   lcd.fillScreen(COL_BLACK);
-  lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
-  lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
+  lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
+  lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-
-  int currentPage = galleryScroll / GALLERY_ITEMS_PAGE + 1;
-  int totalPage   = max(1, (galleryCount + GALLERY_ITEMS_PAGE - 1) / GALLERY_ITEMS_PAGE);
+  int currentPage=galleryScroll/GALLERY_ITEMS_PAGE+1;
+  int totalPage=max(1,(galleryCount+GALLERY_ITEMS_PAGE-1)/GALLERY_ITEMS_PAGE);
   char hdr[32];
-  snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
-  lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("B=BACK", DISP_W - 46, 6);
-  char pageInfo[8];
-  snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString(pageInfo, 4, 6);
-
-  if (galleryCount == 0) {
+  snprintf(hdr,sizeof(hdr),"GALLERY  %d item",galleryCount);
+  lcd.drawString(hdr,(DISP_W-lcd.textWidth(hdr))/2,6);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK",DISP_W-46,6);
+  char pageInfo[8]; snprintf(pageInfo,sizeof(pageInfo),"%d/%d",currentPage,totalPage);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo,4,6);
+  if (galleryCount==0) {
     lcd.setTextColor(COL_GRAY_5);
-    const char* msg = "SD kosong / tidak ada file";
-    lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, DISP_H / 2);
+    const char* msg="SD kosong / tidak ada file";
+    lcd.drawString(msg,(DISP_W-lcd.textWidth(msg))/2,DISP_H/2);
     return;
   }
-
-  int visibleEnd = min(galleryScroll + GALLERY_ITEMS_PAGE, galleryCount);
-  for (int i = galleryScroll; i < visibleEnd; i++) {
-    int rowY = 24 + (i - galleryScroll) * GALLERY_ITEM_H;
-    uint16_t rowBg = (i % 2 == 0) ? COL_GRAY_D : COL_BLACK;
-    lcd.fillRect(0, rowY, DISP_W, GALLERY_ITEM_H - 1, rowBg);
-    lcd.drawFastHLine(0, rowY + GALLERY_ITEM_H - 1, DISP_W, COL_GRAY_2);
-
+  int visibleEnd=min(galleryScroll+GALLERY_ITEMS_PAGE,galleryCount);
+  for (int i=galleryScroll;i<visibleEnd;i++) {
+    int rowY=24+(i-galleryScroll)*GALLERY_ITEM_H;
+    uint16_t rowBg=(i%2==0)?COL_GRAY_D:COL_BLACK;
+    lcd.fillRect(0,rowY,DISP_W,GALLERY_ITEM_H-1,rowBg);
+    lcd.drawFastHLine(0,rowY+GALLERY_ITEM_H-1,DISP_W,COL_GRAY_2);
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    char num[6]; snprintf(num, sizeof(num), "%3d", i + 1);
-    lcd.drawString(num, 6, rowY + 8);
-
-    GalleryFileType ft = galleryFileType[i];
-    if (ft == GFILE_VIDEO) {
-      lcd.setTextColor(COL_VID_ACCENT);
-      lcd.drawString("\x10", 26, rowY + 8);
-    } else if (ft == GFILE_BMP) {
-      lcd.drawRect(26, rowY + 5, 9, 9, COL_BMP_ACCENT);
-      lcd.setTextColor(COL_BMP_ACCENT);
-      lcd.drawString("B", 28, rowY + 6);
+    char num[6]; snprintf(num,sizeof(num),"%3d",i+1);
+    lcd.drawString(num,6,rowY+8);
+    GalleryFileType ft=galleryFileType[i];
+    if (ft==GFILE_VIDEO) {
+      lcd.setTextColor(COL_VID_ACCENT); lcd.drawString("\x10",26,rowY+8);
+    } else if (ft==GFILE_BMP) {
+      lcd.drawRect(26,rowY+5,9,9,COL_BMP_ACCENT);
+      lcd.setTextColor(COL_BMP_ACCENT); lcd.drawString("B",28,rowY+6);
     } else {
-      lcd.drawRect(26, rowY + 6, 7, 7, COL_GRAY_5);
+      lcd.drawRect(26,rowY+6,7,7,COL_GRAY_5);
     }
-
-    uint16_t nameCol = (ft == GFILE_VIDEO) ? COL_GRAY_A : COL_GRAY_C;
-    lcd.setTextColor(nameCol);
-    lcd.drawString(galleryFiles[i], 38, rowY + 8);
-
-    const char* typeLabel = (ft == GFILE_VIDEO) ? "VID" :
-                            (ft == GFILE_BMP)   ? "BMP" : "JPG";
-    uint16_t typeCol = (ft == GFILE_VIDEO) ? COL_VID_ACCENT :
-                       (ft == GFILE_BMP)   ? COL_BMP_ACCENT : COL_JPG_ACCENT;
-    lcd.setTextColor(typeCol);
-    lcd.drawString(typeLabel, DISP_W - 28, rowY + 8);
+    uint16_t nameCol=(ft==GFILE_VIDEO)?COL_GRAY_A:COL_GRAY_C;
+    lcd.setTextColor(nameCol); lcd.drawString(galleryFiles[i],38,rowY+8);
+    const char* typeLabel=(ft==GFILE_VIDEO)?"VID":(ft==GFILE_BMP)?"BMP":"JPG";
+    uint16_t typeCol=(ft==GFILE_VIDEO)?COL_VID_ACCENT:(ft==GFILE_BMP)?COL_BMP_ACCENT:COL_JPG_ACCENT;
+    lcd.setTextColor(typeCol); lcd.drawString(typeLabel,DISP_W-28,rowY+8);
   }
-
-  int selY = 24 + (gallerySelIdx - galleryScroll) * GALLERY_ITEM_H;
-  lcd.drawRect(0, selY, DISP_W - 4, GALLERY_ITEM_H - 1, COL_GRAY_5);
-
-  if (galleryCount > GALLERY_ITEMS_PAGE) {
-    int barH  = DISP_H - 22;
-    int indH  = max(10, barH * GALLERY_ITEMS_PAGE / galleryCount);
-    int indY  = 22 + (barH - indH) * galleryScroll / max(1, galleryCount - GALLERY_ITEMS_PAGE);
-    lcd.fillRect(DISP_W - 4, 22, 4, barH, COL_GRAY_2);
-    lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
+  int selY=24+(gallerySelIdx-galleryScroll)*GALLERY_ITEM_H;
+  lcd.drawRect(0,selY,DISP_W-4,GALLERY_ITEM_H-1,COL_GRAY_5);
+  if (galleryCount>GALLERY_ITEMS_PAGE) {
+    int barH=DISP_H-22;
+    int indH=max(10,barH*GALLERY_ITEMS_PAGE/galleryCount);
+    int indY=22+(barH-indH)*galleryScroll/max(1,galleryCount-GALLERY_ITEMS_PAGE);
+    lcd.fillRect(DISP_W-4,22,4,barH,COL_GRAY_2);
+    lcd.fillRect(DISP_W-4,indY,4,indH,COL_GRAY_7);
   }
-
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
-  const char* jumpHint = "BOOT-long=jump";
-  lcd.drawString(jumpHint, (DISP_W - lcd.textWidth(jumpHint)) / 2, DISP_H - 10);
+  const char* jumpHint="BOOT-long=jump";
+  lcd.drawString(jumpHint,(DISP_W-lcd.textWidth(jumpHint))/2,DISP_H-10);
 }
 
 void galleryUpdateHighlight(int oldSel, int newSel) {
-  int oldRow = oldSel - galleryScroll;
-  if (oldRow >= 0 && oldRow < GALLERY_ITEMS_PAGE) {
-    int y = 24 + oldRow * GALLERY_ITEM_H;
-    lcd.drawRect(0, y, DISP_W - 4, GALLERY_ITEM_H - 1,
-                 (oldSel % 2 == 0) ? COL_GRAY_D : COL_BLACK);
+  int oldRow=oldSel-galleryScroll;
+  if (oldRow>=0&&oldRow<GALLERY_ITEMS_PAGE) {
+    int y=24+oldRow*GALLERY_ITEM_H;
+    lcd.drawRect(0,y,DISP_W-4,GALLERY_ITEM_H-1,(oldSel%2==0)?COL_GRAY_D:COL_BLACK);
   }
-  int newRow = newSel - galleryScroll;
-  if (newRow >= 0 && newRow < GALLERY_ITEMS_PAGE) {
-    int y = 24 + newRow * GALLERY_ITEM_H;
-    lcd.drawRect(0, y, DISP_W - 4, GALLERY_ITEM_H - 1, COL_GRAY_5);
+  int newRow=newSel-galleryScroll;
+  if (newRow>=0&&newRow<GALLERY_ITEMS_PAGE) {
+    int y=24+newRow*GALLERY_ITEM_H;
+    lcd.drawRect(0,y,DISP_W-4,GALLERY_ITEM_H-1,COL_GRAY_5);
   }
 }
 
 void galleryStep(int delta) {
-  if (galleryCount <= 0) return;
-  int oldSel = gallerySelIdx;
-  gallerySelIdx = (gallerySelIdx + delta % galleryCount + galleryCount) % galleryCount;
-  if (gallerySelIdx == oldSel) return;
-  bool needRedraw = false;
-  if (gallerySelIdx < galleryScroll) {
-    galleryScroll = gallerySelIdx; needRedraw = true;
-  } else if (gallerySelIdx >= galleryScroll + GALLERY_ITEMS_PAGE) {
-    galleryScroll = gallerySelIdx - GALLERY_ITEMS_PAGE + 1; needRedraw = true;
+  if (galleryCount<=0) return;
+  int oldSel=gallerySelIdx;
+  gallerySelIdx=(gallerySelIdx+delta%galleryCount+galleryCount)%galleryCount;
+  if (gallerySelIdx==oldSel) return;
+  bool needRedraw=false;
+  if (gallerySelIdx<galleryScroll) { galleryScroll=gallerySelIdx; needRedraw=true; }
+  else if (gallerySelIdx>=galleryScroll+GALLERY_ITEMS_PAGE) {
+    galleryScroll=gallerySelIdx-GALLERY_ITEMS_PAGE+1; needRedraw=true;
   }
   if (needRedraw) drawGallery();
-  else            galleryUpdateHighlight(oldSel, gallerySelIdx);
+  else galleryUpdateHighlight(oldSel,gallerySelIdx);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Photo pixel buffer
 // ─────────────────────────────────────────────────────────────────────────────
 bool photoLoadPixelBuf(int idx) {
-  if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return false;
-  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
-  photoBufW = 0; photoBufH = 0;
-
-  char path[56];
-  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
-
+  if (idx<0||idx>=galleryCount||gIsVideo(idx)) return false;
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+  photoBufW=0; photoBufH=0;
+  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
   if (gIsBmp(idx)) {
-    uint16_t bw = 0, bh = 0;
-    uint16_t* buf = loadBMP(path, &bw, &bh);
-    if (!buf || bw == 0 || bh == 0) return false;
-    photoPixelBuf = buf; photoBufW = bw; photoBufH = bh;
+    uint16_t bw=0,bh=0;
+    uint16_t* buf=loadBMP(path,&bw,&bh);
+    if (!buf||bw==0||bh==0) return false;
+    photoPixelBuf=buf; photoBufW=bw; photoBufH=bh;
     return true;
   } else {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    fseek(f, 0, SEEK_END); size_t fsize = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t* jpgBuf = (uint8_t*)ps_malloc(fsize);
+    FILE* f=fopen(path,"rb"); if (!f) return false;
+    fseek(f,0,SEEK_END); size_t fsize=ftell(f); fseek(f,0,SEEK_SET);
+    uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize);
     if (!jpgBuf) { fclose(f); return false; }
-    fread(jpgBuf, 1, fsize, f); fclose(f);
+    fread(jpgBuf,1,fsize,f); fclose(f);
     TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
-    uint16_t iw = 0, ih = 0;
-    TJpgDec.getJpgSize(&iw, &ih, jpgBuf, fsize);
-    if (iw == 0 || ih == 0) { free(jpgBuf); return false; }
-    uint16_t* buf = (uint16_t*)ps_malloc((size_t)iw * ih * sizeof(uint16_t));
+    uint16_t iw=0,ih=0;
+    TJpgDec.getJpgSize(&iw,&ih,jpgBuf,fsize);
+    if (iw==0||ih==0) { free(jpgBuf); return false; }
+    uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t));
     if (!buf) { free(jpgBuf); return false; }
-    memset(buf, 0, (size_t)iw * ih * sizeof(uint16_t));
-    _decodeTargetBuf = buf; _decodeTargetW = iw;
-    TJpgDec.drawJpg(0, 0, jpgBuf, fsize);
-    _decodeTargetBuf = nullptr;
+    memset(buf,0,(size_t)iw*ih*sizeof(uint16_t));
+    _decodeTargetBuf=buf; _decodeTargetW=iw;
+    TJpgDec.drawJpg(0,0,jpgBuf,fsize);
+    _decodeTargetBuf=nullptr;
     free(jpgBuf);
-    photoPixelBuf = buf; photoBufW = iw; photoBufH = ih;
+    photoPixelBuf=buf; photoBufW=iw; photoBufH=ih;
     return true;
   }
 }
@@ -1432,79 +1416,76 @@ bool photoLoadPixelBuf(int idx) {
 // ─────────────────────────────────────────────────────────────────────────────
 void photoViewRender() {
   if (!photoPixelBuf) return;
-  float zf = photoZoomFactors[photoZoomLevel];
+  float zf=photoZoomFactors[photoZoomLevel];
   lcd.fillScreen(COL_BLACK);
-  if (zf <= 1.0f) {
-    int ox = (DISP_W - min((int)photoBufW, DISP_W)) / 2;
-    int oy = (DISP_H - min((int)photoBufH, DISP_H)) / 2;
-    int renderW = min((int)photoBufW, DISP_W);
-    int renderH = min((int)photoBufH, DISP_H);
-    for (int row = 0; row < renderH; row++) {
-      lcd.pushImage(ox, oy + row, renderW, 1, photoPixelBuf + row * photoBufW);
-      if (row % 20 == 0) esp_task_wdt_reset();
+  if (zf<=1.0f) {
+    int ox=(DISP_W-min((int)photoBufW,DISP_W))/2;
+    int oy=(DISP_H-min((int)photoBufH,DISP_H))/2;
+    int renderW=min((int)photoBufW,DISP_W);
+    int renderH=min((int)photoBufH,DISP_H);
+    for (int row=0;row<renderH;row++) {
+      lcd.pushImage(ox,oy+row,renderW,1,photoPixelBuf+row*photoBufW);
+      if (row%20==0) esp_task_wdt_reset();
     }
   } else {
-    int vpW = (int)(DISP_W / zf), vpH = (int)(DISP_H / zf);
-    int maxOffX = max(0, (int)photoBufW - vpW);
-    int maxOffY = max(0, (int)photoBufH - vpH);
-    photoZoomOffX = constrain(photoZoomOffX, 0, maxOffX);
-    photoZoomOffY = constrain(photoZoomOffY, 0, maxOffY);
+    int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
+    int maxOffX=max(0,(int)photoBufW-vpW);
+    int maxOffY=max(0,(int)photoBufH-vpH);
+    photoZoomOffX=constrain(photoZoomOffX,0,maxOffX);
+    photoZoomOffY=constrain(photoZoomOffY,0,maxOffY);
     static uint16_t lineBuf[DISP_W];
-    for (int sy = 0; sy < DISP_H; sy++) {
-      int srcY = constrain(photoZoomOffY + (int)(sy / zf), 0, (int)photoBufH - 1);
-      for (int sx = 0; sx < DISP_W; sx++) {
-        int srcX = constrain(photoZoomOffX + (int)(sx / zf), 0, (int)photoBufW - 1);
-        lineBuf[sx] = photoPixelBuf[srcY * photoBufW + srcX];
+    for (int sy=0;sy<DISP_H;sy++) {
+      int srcY=constrain(photoZoomOffY+(int)(sy/zf),0,(int)photoBufH-1);
+      for (int sx=0;sx<DISP_W;sx++) {
+        int srcX=constrain(photoZoomOffX+(int)(sx/zf),0,(int)photoBufW-1);
+        lineBuf[sx]=photoPixelBuf[srcY*photoBufW+srcX];
       }
-      lcd.pushImage(0, sy, DISP_W, 1, lineBuf);
-      if (sy % 20 == 0) esp_task_wdt_reset();
+      lcd.pushImage(0,sy,DISP_W,1,lineBuf);
+      if (sy%20==0) esp_task_wdt_reset();
     }
   }
-  if (photoZoomLevel > 0) {
-    char zBuf[8]; snprintf(zBuf, sizeof(zBuf), "%.0f\xd7", (double)zf);
-    drawPill(DISP_W / 2, DISP_H - 10, zBuf, COL_PILL_BG, COL_GRAY_A);
+  if (photoZoomLevel>0) {
+    char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f\xd7",(double)zf);
+    drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
   }
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("B=zoom", 2, 2);
-  lcd.drawString("BOOT=back", DISP_W - 58, 2);
-  if (photoZoomLevel == 0) {
-    lcd.drawString("C=prev", 2, DISP_H - 10);
-    lcd.drawString("D=next", DISP_W - 44, DISP_H - 10);
+  lcd.drawString("B=zoom",2,2);
+  lcd.drawString("BOOT=back",DISP_W-58,2);
+  if (photoZoomLevel==0) {
+    lcd.drawString("C=prev",2,DISP_H-10);
+    // Tampilkan hint D long = AI
+    lcd.setTextColor(COL_AI_ACCENT);
+    lcd.drawString("Dlong=AI",DISP_W-52,DISP_H-10);
   } else {
-    lcd.drawString("C/D=pan", 2, DISP_H - 10);
-    lcd.drawString("Blong=del", DISP_W - 58, DISP_H - 10);
+    lcd.drawString("C/D=pan",2,DISP_H-10);
+    lcd.drawString("Blong=del",DISP_W-58,DISP_H-10);
   }
 }
 
 void photoViewDrawCaption(int idx) {
-  char stegoInfo[48] = "";
-  char path[56];
-  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
-
+  char stegoInfo[48]="";
+  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
   if (gIsJpg(idx)) {
-    FILE* f = fopen(path, "rb");
+    FILE* f=fopen(path,"rb");
     if (f) {
-      fseek(f, 0, SEEK_END);
-      long fsize_l = ftell(f); fseek(f, 0, SEEK_SET);
-      if (fsize_l > 0) {
-        size_t fsize   = (size_t)fsize_l;
-        size_t readSize = (fsize < 8192) ? fsize : 8192;
-        uint8_t* buf = (uint8_t*)ps_malloc(readSize);
-        if (!buf) buf = (uint8_t*)malloc(readSize);
+      fseek(f,0,SEEK_END); long fsize_l=ftell(f); fseek(f,0,SEEK_SET);
+      if (fsize_l>0) {
+        size_t fsize=(size_t)fsize_l;
+        size_t readSize=(fsize<8192)?fsize:8192;
+        uint8_t* buf=(uint8_t*)ps_malloc(readSize);
+        if (!buf) buf=(uint8_t*)malloc(readSize);
         if (buf) {
-          size_t readN = fread(buf, 1, readSize, f);
-          char payload[STEGO_PAYLOAD_LEN + 1];
-          if (stegoExtractFromJpeg(buf, readN, payload, sizeof(payload))) {
-            char* p1 = strchr(payload, '|');
-            char* p2 = p1 ? strchr(p1+1, '|') : nullptr;
-            if (p1 && p2) {
-              char num[8], ver[12];
-              int numLen = p2 - p1 - 1;
-              strncpy(num, p1+1, numLen); num[numLen] = '\0';
-              strncpy(ver, p2+1, sizeof(ver)-1); ver[sizeof(ver)-1] = '\0';
-              snprintf(stegoInfo, sizeof(stegoInfo), " [#%s %s]", num, ver);
-            } else if (p1) {
-              snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1+1);
+          size_t readN=fread(buf,1,readSize,f);
+          char payload[STEGO_PAYLOAD_LEN+1];
+          if (stegoExtractFromJpeg(buf,readN,payload,sizeof(payload))) {
+            char* p1=strchr(payload,'|');
+            char* p2=p1?strchr(p1+1,'|'):nullptr;
+            if (p1&&p2) {
+              char num[8],ver[12];
+              int numLen=p2-p1-1;
+              strncpy(num,p1+1,numLen); num[numLen]='\0';
+              strncpy(ver,p2+1,sizeof(ver)-1); ver[sizeof(ver)-1]='\0';
+              snprintf(stegoInfo,sizeof(stegoInfo)," [#%s %s]",num,ver);
             }
           }
           free(buf);
@@ -1513,53 +1494,42 @@ void photoViewDrawCaption(int idx) {
       fclose(f);
     }
   } else if (gIsBmp(idx)) {
-    char payload[STEGO_BMP_MAX_PAYLOAD + 1];
-    if (stegoBmpExtract(path, payload, sizeof(payload))) {
-      char* p1 = strchr(payload, '|');
-      char* p2 = p1 ? strchr(p1+1, '|') : nullptr;
-      if (p1 && p2) {
-        char num[8], ver[12];
-        int numLen = p2 - p1 - 1;
-        strncpy(num, p1+1, numLen); num[numLen] = '\0';
-        strncpy(ver, p2+1, sizeof(ver)-1); ver[sizeof(ver)-1] = '\0';
-        snprintf(stegoInfo, sizeof(stegoInfo), " [#%s %s]", num, ver);
-      } else if (p1) {
-        snprintf(stegoInfo, sizeof(stegoInfo), " [%s]", p1+1);
+    char payload[STEGO_BMP_MAX_PAYLOAD+1];
+    if (stegoBmpExtract(path,payload,sizeof(payload))) {
+      char* p1=strchr(payload,'|');
+      char* p2=p1?strchr(p1+1,'|'):nullptr;
+      if (p1&&p2) {
+        char num[8],ver[12];
+        int numLen=p2-p1-1;
+        strncpy(num,p1+1,numLen); num[numLen]='\0';
+        strncpy(ver,p2+1,sizeof(ver)-1); ver[sizeof(ver)-1]='\0';
+        snprintf(stegoInfo,sizeof(stegoInfo)," [#%s %s]",num,ver);
       }
     }
   }
-
-  int photoSeq = 0, photoTotal = 0;
-  for (int i = 0; i < galleryCount; i++) {
-    if (gIsPhoto(i)) {
-      photoTotal++;
-      if (i <= idx) photoSeq = photoTotal;
-    }
+  int photoSeq=0,photoTotal=0;
+  for (int i=0;i<galleryCount;i++) {
+    if (gIsPhoto(i)) { photoTotal++; if (i<=idx) photoSeq=photoTotal; }
   }
-
-  const char* typeTag = gIsBmp(idx) ? " [BMP]" : "";
-
-  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_GRAY_D);
+  const char* typeTag=gIsBmp(idx)?" [BMP]":"";
+  lcd.fillRect(0,DISP_H-16,DISP_W,16,COL_GRAY_D);
   lcd.setFont(&fonts::Font0);
-  char bar[56], barFull[88];
-  snprintf(bar,     sizeof(bar),
-           "< %d / %d >%s%s", photoSeq, photoTotal, typeTag, stegoInfo);
-  snprintf(barFull, sizeof(barFull),
-           "< %d / %d >  %s%s%s", photoSeq, photoTotal,
-           galleryFiles[idx], typeTag, stegoInfo);
-  const char* barStr = (lcd.textWidth(barFull) < DISP_W - 4) ? barFull : bar;
+  char bar[56],barFull[88];
+  snprintf(bar,sizeof(bar),"< %d / %d >%s%s",photoSeq,photoTotal,typeTag,stegoInfo);
+  snprintf(barFull,sizeof(barFull),"< %d / %d >  %s%s%s",photoSeq,photoTotal,galleryFiles[idx],typeTag,stegoInfo);
+  const char* barStr=(lcd.textWidth(barFull)<DISP_W-4)?barFull:bar;
   lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString(barStr, (DISP_W - lcd.textWidth(barStr)) / 2, DISP_H - 13);
+  lcd.drawString(barStr,(DISP_W-lcd.textWidth(barStr))/2,DISP_H-13);
 }
 
 void photoViewClearCaption() {
-  lcd.fillRect(0, DISP_H - 16, DISP_W, 16, COL_BLACK);
-  if (photoZoomLevel > 0) {
-    float zf = photoZoomFactors[photoZoomLevel];
-    char zBuf[8]; snprintf(zBuf, sizeof(zBuf), "%.0f\xd7", (double)zf);
-    drawPill(DISP_W / 2, DISP_H - 10, zBuf, COL_PILL_BG, COL_GRAY_A);
+  lcd.fillRect(0,DISP_H-16,DISP_W,16,COL_BLACK);
+  if (photoZoomLevel>0) {
+    float zf=photoZoomFactors[photoZoomLevel];
+    char zBuf[8]; snprintf(zBuf,sizeof(zBuf),"%.0f\xd7",(double)zf);
+    drawPill(DISP_W/2,DISP_H-10,zBuf,COL_PILL_BG,COL_GRAY_A);
   }
-  photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
+  photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1571,37 +1541,36 @@ void drawDeleteDialog(const char* filename) {
   lcd.drawRoundRect(dx,dy,dw,dh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title = "HAPUS FILE?";
-  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 8);
+  const char* title="HAPUS FILE?";
+  lcd.drawString(title,dx+(dw-lcd.textWidth(title))/2,dy+8);
   lcd.setTextColor(COL_GRAY_7);
-  char truncName[28]; strncpy(truncName, filename, 27); truncName[27] = '\0';
-  lcd.drawString(truncName, dx + (dw - lcd.textWidth(truncName)) / 2, dy + 22);
-  lcd.drawFastHLine(dx + 10, dy + 36, dw - 20, COL_GRAY_3);
+  char truncName[28]; strncpy(truncName,filename,27); truncName[27]='\0';
+  lcd.drawString(truncName,dx+(dw-lcd.textWidth(truncName))/2,dy+22);
+  lcd.drawFastHLine(dx+10,dy+36,dw-20,COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_A);
-  const char* hint = "BOOT=YES   B/C/D=NO";
-  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + 46);
+  const char* hint="BOOT=YES   B/C/D=NO";
+  lcd.drawString(hint,dx+(dw-lcd.textWidth(hint))/2,dy+46);
   lcd.setTextColor(COL_GRAY_5);
-  const char* hint2 = "(timeout 8s = NO)";
-  lcd.drawString(hint2, dx + (dw - lcd.textWidth(hint2)) / 2, dy + 60);
+  const char* hint2="(timeout 8s = NO)";
+  lcd.drawString(hint2,dx+(dw-lcd.textWidth(hint2))/2,dy+60);
 }
 
 void openDeleteDialog() {
   drawDeleteDialog(galleryFiles[photoViewIndex]);
-  deleteDialogOpenMs = millis();
+  deleteDialogOpenMs=millis();
   resetAllButtons();
-  appMode = MODE_DIALOG_DELETE;
+  appMode=MODE_DIALOG_DELETE;
 }
 
 void photoViewDeleteCurrent() {
-  char path[56];
-  snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[photoViewIndex]);
-  bool ok = (remove(path) == 0);
-  islandPush(ok ? NOTIF_OK : NOTIF_WARN, ok ? "FILE DIHAPUS" : "GAGAL HAPUS");
-  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
+  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[photoViewIndex]);
+  bool ok=(remove(path)==0);
+  islandPush(ok?NOTIF_OK:NOTIF_WARN,ok?"FILE DIHAPUS":"GAGAL HAPUS");
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
   scanGalleryFiles(); scanPhotoCount();
-  gallerySelIdx = 0;
+  gallerySelIdx=0;
   resetAllButtons();
-  appMode = MODE_GALLERY;
+  appMode=MODE_GALLERY;
   drawGallery();
 }
 
@@ -1609,41 +1578,41 @@ void photoViewDeleteCurrent() {
 //  showPhotoView
 // ─────────────────────────────────────────────────────────────────────────────
 void showPhotoView(int idx) {
-  if (idx < 0 || idx >= galleryCount || gIsVideo(idx)) return;
-  photoViewIndex = idx;
-  strncpy(photoViewPath, galleryFiles[idx], sizeof(photoViewPath) - 1);
-  photoZoomLevel = 0; photoZoomOffX = 0; photoZoomOffY = 0;
+  if (idx<0||idx>=galleryCount||gIsVideo(idx)) return;
+  photoViewIndex=idx;
+  strncpy(photoViewPath,galleryFiles[idx],sizeof(photoViewPath)-1);
+  photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
   lcd.fillScreen(COL_BLACK);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  const char* loadMsg = gIsBmp(idx) ? "loading BMP..." : "loading...";
-  lcd.drawString(loadMsg, DISP_W / 2 - 30, DISP_H / 2 - 4);
+  const char* loadMsg=gIsBmp(idx)?"loading BMP...":"loading...";
+  lcd.drawString(loadMsg,DISP_W/2-30,DISP_H/2-4);
   if (!photoLoadPixelBuf(idx)) {
     lcd.fillScreen(COL_BLACK);
-    lcd.drawString("gagal load foto", 20, DISP_H / 2);
-    delay(1500); resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
+    lcd.drawString("gagal load foto",20,DISP_H/2);
+    delay(1500); resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
     return;
   }
   photoViewRender();
   photoViewDrawCaption(idx);
-  photoViewCaptionUntilMs = millis() + 2000; photoViewCaptionVisible = true;
-  resetAllButtons(); appMode = MODE_PHOTO_VIEW;
+  photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true;
+  resetAllButtons(); appMode=MODE_PHOTO_VIEW;
 }
 
 void photoViewPrev() {
-  int idx = photoViewIndex - 1;
-  if (idx < 0) idx = galleryCount - 1;
-  for (int t = 0; t < galleryCount; t++) {
+  int idx=photoViewIndex-1;
+  if (idx<0) idx=galleryCount-1;
+  for (int t=0;t<galleryCount;t++) {
     if (gIsPhoto(idx)) { showPhotoView(idx); return; }
-    idx--; if (idx < 0) idx = galleryCount - 1;
+    idx--; if (idx<0) idx=galleryCount-1;
   }
 }
 
 void photoViewNext() {
-  int idx = photoViewIndex + 1;
-  if (idx >= galleryCount) idx = 0;
-  for (int t = 0; t < galleryCount; t++) {
+  int idx=photoViewIndex+1;
+  if (idx>=galleryCount) idx=0;
+  for (int t=0;t<galleryCount;t++) {
     if (gIsPhoto(idx)) { showPhotoView(idx); return; }
-    idx++; if (idx >= galleryCount) idx = 0;
+    idx++; if (idx>=galleryCount) idx=0;
   }
 }
 
@@ -1659,14 +1628,14 @@ void drawLedMenu(int sel) {
   const char* title="LED FLASH";
   lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
   lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
-  for(int i=0;i<2;i++) {
+  for (int i=0;i<2;i++) {
     int iy=my+24+i*24;
     bool isChecked=(i==0)?ledFlashEnabled:!ledFlashEnabled;
     bool isHighlight=(i==sel);
     lcd.fillRect(mx+8,iy,mw-16,18,isHighlight?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor(isHighlight?COL_WHITE:(isChecked?COL_GRAY_E:COL_GRAY_7));
     lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
-    if(isChecked){
+    if (isChecked) {
       lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);
       lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);
     }
@@ -1678,61 +1647,53 @@ void drawLedMenu(int sel) {
 }
 
 void openLedMenu() {
-  menuLedSel = ledFlashEnabled ? 0 : 1;
+  menuLedSel=ledFlashEnabled?0:1;
   drawLedMenu(menuLedSel);
-  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_LED;
+  resetAllButtons(); prevMode=appMode; appMode=MODE_MENU_LED;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Menu Format
 // ─────────────────────────────────────────────────────────────────────────────
 void drawFormatMenu(int sel) {
-  int mw=220, mh=120, mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
-  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
+  int mw=220,mh=120,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
+  lcd.fillRoundRect(mx,my,mw,mh,10,COL_GRAY_D);
+  lcd.drawRoundRect(mx,my,mw,mh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title = "FORMAT FOTO  GC2145";
-  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
-  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
+  const char* title="FORMAT FOTO  GC2145";
+  lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
+  lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("pilih format simpan foto:", mx + 10, my + 24);
-  const char* labels[2] = {
+  lcd.drawString("pilih format simpan foto:",mx+10,my+24);
+  const char* labels[2]={
     "BMP  - raw RGB, warna asli, stego",
     "JPG  - kompresi, stego+EXIF"
   };
-  for (int i = 0; i < 2; i++) {
-    int iy = my + 38 + i * 26;
-    bool isSelected    = (i == (int)gc2145CaptureFormat);
-    bool isHighlighted = (i == sel);
-    lcd.fillRect(mx + 8, iy, mw - 16, 20,
-                 isHighlighted ? COL_GRAY_5 : COL_GRAY_D);
-    int cbX = mx + 14, cbY = iy + 6;
-    lcd.drawRect(cbX, cbY, 10, 10,
-                 isHighlighted ? COL_WHITE : COL_GRAY_7);
+  for (int i=0;i<2;i++) {
+    int iy=my+38+i*26;
+    bool isSelected=(i==(int)gc2145CaptureFormat);
+    bool isHighlighted=(i==sel);
+    lcd.fillRect(mx+8,iy,mw-16,20,isHighlighted?COL_GRAY_5:COL_GRAY_D);
+    int cbX=mx+14,cbY=iy+6;
+    lcd.drawRect(cbX,cbY,10,10,isHighlighted?COL_WHITE:COL_GRAY_7);
     if (isSelected) {
-      lcd.drawFastHLine(cbX + 2, cbY + 5, 6,
-                        isHighlighted ? COL_WHITE : COL_GRAY_E);
-      lcd.drawFastVLine(cbX + 2, cbY + 3, 4,
-                        isHighlighted ? COL_WHITE : COL_GRAY_E);
-      lcd.drawPixel(cbX + 4, cbY + 7,
-                    isHighlighted ? COL_WHITE : COL_GRAY_E);
+      lcd.drawFastHLine(cbX+2,cbY+5,6,isHighlighted?COL_WHITE:COL_GRAY_E);
+      lcd.drawFastVLine(cbX+2,cbY+3,4,isHighlighted?COL_WHITE:COL_GRAY_E);
+      lcd.drawPixel(cbX+4,cbY+7,isHighlighted?COL_WHITE:COL_GRAY_E);
     }
-    lcd.setTextColor(isHighlighted ? COL_WHITE :
-                     (isSelected   ? COL_GRAY_E : COL_GRAY_7));
-    lcd.drawString(labels[i], cbX + 14, iy + 6);
+    lcd.setTextColor(isHighlighted?COL_WHITE:(isSelected?COL_GRAY_E:COL_GRAY_7));
+    lcd.drawString(labels[i],cbX+14,iy+6);
   }
   lcd.setTextColor(COL_GRAY_3);
-  const char* hint = "C/D=pilih  BOOT=ok  B=batal";
-  lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 13);
+  const char* hint="C/D=pilih  BOOT=ok  B=batal";
+  lcd.drawString(hint,mx+(mw-lcd.textWidth(hint))/2,my+mh-13);
 }
 
 void openFormatMenu() {
-  menuFormatSel = (int)gc2145CaptureFormat;
+  menuFormatSel=(int)gc2145CaptureFormat;
   drawFormatMenu(menuFormatSel);
-  resetAllButtons();
-  prevMode = appMode;
-  appMode  = MODE_MENU_FORMAT;
+  resetAllButtons(); prevMode=appMode; appMode=MODE_MENU_FORMAT;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1753,7 +1714,7 @@ void drawExpMenu(int sel) {
     "NIGHT   - malam gelap",
     "MANUAL  - atur sendiri"
   };
-  for(int i=0;i<4;i++) {
+  for (int i=0;i<4;i++) {
     int iy=my+24+i*22;
     lcd.fillRect(mx+8,iy,mw-16,18,(i==sel)?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor((i==sel)?COL_WHITE:COL_GRAY_7);
@@ -1785,36 +1746,36 @@ void drawExpAdjOverlay() {
 }
 
 void openExpMenu() {
-  menuExpSel = (int)expPreset;
+  menuExpSel=(int)expPreset;
   drawExpMenu(menuExpSel);
-  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_EXP;
+  resetAllButtons(); prevMode=appMode; appMode=MODE_MENU_EXP;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  MJPEG Player
 // ─────────────────────────────────────────────────────────────────────────────
 bool mjpegOpen(const char* filename) {
-  char path[48]; snprintf(path, sizeof(path), "/sdcard/%s", filename);
-  if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
-  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
-  mjpegBuf = (uint8_t*)malloc(MJPEG_BUF_SIZE);
+  char path[48]; snprintf(path,sizeof(path),"/sdcard/%s",filename);
+  if (mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
+  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf=nullptr; }
+  mjpegBuf=(uint8_t*)malloc(MJPEG_BUF_SIZE);
   if (!mjpegBuf) return false;
-  mjpegFile = fopen(path, "rb");
-  if (!mjpegFile) { free(mjpegBuf); mjpegBuf = nullptr; return false; }
-  fileStream.f = mjpegFile;
-  mjpeg.setup(&fileStream, mjpegBuf, jpegDrawCallback, true, 0, 0, DISP_W, DISP_H);
-  strncpy(mjpegPath, filename, sizeof(mjpegPath) - 1);
-  strncpy(mjpegPathSaved, filename, sizeof(mjpegPathSaved) - 1);
-  mjpegFrame = 0; mjpegPlaying = true; mjpegPaused = false; mjpegNotifUntilMs = 0;
+  mjpegFile=fopen(path,"rb");
+  if (!mjpegFile) { free(mjpegBuf); mjpegBuf=nullptr; return false; }
+  fileStream.f=mjpegFile;
+  mjpeg.setup(&fileStream,mjpegBuf,jpegDrawCallback,true,0,0,DISP_W,DISP_H);
+  strncpy(mjpegPath,filename,sizeof(mjpegPath)-1);
+  strncpy(mjpegPathSaved,filename,sizeof(mjpegPathSaved)-1);
+  mjpegFrame=0; mjpegPlaying=true; mjpegPaused=false; mjpegNotifUntilMs=0;
   lcd.fillScreen(COL_BLACK);
   return true;
 }
 
 void mjpegClose() {
-  if (mjpegFile) { fclose(mjpegFile); mjpegFile = nullptr; }
-  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf  = nullptr; }
-  fileStream.f = nullptr;
-  mjpegPlaying = false; mjpegPaused = false; mjpegFrame = 0; mjpegNotifUntilMs = 0;
+  if (mjpegFile) { fclose(mjpegFile); mjpegFile=nullptr; }
+  if (mjpegBuf)  { free(mjpegBuf);   mjpegBuf=nullptr; }
+  fileStream.f=nullptr;
+  mjpegPlaying=false; mjpegPaused=false; mjpegFrame=0; mjpegNotifUntilMs=0;
 }
 
 void mjpegShowNotif(const char* text) {
@@ -1824,18 +1785,17 @@ void mjpegShowNotif(const char* text) {
   lcd.fillRoundRect(px,py,pw,ph,6,COL_GRAY_D);
   lcd.drawRoundRect(px,py,pw,ph,6,COL_GRAY_5);
   lcd.setTextColor(COL_GRAY_E); lcd.drawString(text,px+10,py+4);
-  mjpegNotifUntilMs = millis() + 1200;
+  mjpegNotifUntilMs=millis()+1200;
 }
 
 void mjpegClearNotif() {
   lcd.fillRect((DISP_W-188)/2-4,(DISP_H-25)/2,196,25,COL_BLACK);
-  mjpegNotifUntilMs = 0;
+  mjpegNotifUntilMs=0;
 }
 
 void mjpegDrawHUD() {
   char buf[24];
-  snprintf(buf, sizeof(buf), "%.1f\xd7  %s",
-           (double)mjpegSpeeds[mjpegSpeedIdx], mjpegLoop ? "LOOP" : "-");
+  snprintf(buf,sizeof(buf),"%.1f\xd7  %s",(double)mjpegSpeeds[mjpegSpeedIdx],mjpegLoop?"LOOP":"-");
   lcd.setFont(&fonts::Font0);
   int tw=lcd.textWidth(buf),pw=tw+10,ph=13;
   lcd.fillRoundRect(4,4,pw,ph,4,COL_PILL_BG);
@@ -1845,42 +1805,40 @@ void mjpegDrawHUD() {
 void loopMjpegPlayer() {
   if (!mjpegPlaying) return;
   if (!mjpegPaused) {
-    int64_t frameStart = esp_timer_get_time();
-    bool ok = mjpeg.readMjpegBuf();
+    int64_t frameStart=esp_timer_get_time();
+    bool ok=mjpeg.readMjpegBuf();
     if (!ok) {
       if (mjpegLoop) {
         mjpegClose();
-        if (!mjpegOpen(mjpegPathSaved)) {
-          resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
-        }
+        if (!mjpegOpen(mjpegPathSaved)) { resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); }
         return;
       }
-      mjpegClose(); resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
+      mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return;
     }
     mjpeg.drawJpg(); mjpegFrame++; mjpegDrawHUD();
-    if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) mjpegClearNotif();
-    float speed = mjpegSpeeds[mjpegSpeedIdx];
-    int64_t targetUs = (int64_t)(1000000.0f / (MJPEG_FRAME_RATE * speed));
-    int64_t remain = targetUs - (esp_timer_get_time() - frameStart);
-    if (remain > 1000) {
-      int64_t waitEnd = esp_timer_get_time() + remain;
-      while (esp_timer_get_time() < waitEnd) { delayMicroseconds(500); esp_task_wdt_reset(); }
+    if (mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
+    float speed=mjpegSpeeds[mjpegSpeedIdx];
+    int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
+    int64_t remain=targetUs-(esp_timer_get_time()-frameStart);
+    if (remain>1000) {
+      int64_t waitEnd=esp_timer_get_time()+remain;
+      while (esp_timer_get_time()<waitEnd) { delayMicroseconds(500); esp_task_wdt_reset(); }
     }
   } else {
-    if (mjpegNotifUntilMs > 0 && millis() > mjpegNotifUntilMs) mjpegClearNotif();
+    if (mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
     delay(16);
   }
   esp_task_wdt_reset();
 }
 
 void openMjpegPlayer(const char* filename) {
-  mjpegLoop = false; mjpegSpeedIdx = 1;
+  mjpegLoop=false; mjpegSpeedIdx=1;
   if (!mjpegOpen(filename)) {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("gagal buka file", 20, DISP_H / 2);
-    delay(1500); resetAllButtons(); drawGallery(); appMode = MODE_GALLERY; return;
+    lcd.drawString("gagal buka file",20,DISP_H/2);
+    delay(1500); resetAllButtons(); drawGallery(); appMode=MODE_GALLERY; return;
   }
-  resetAllButtons(); appMode = MODE_MJPEG_PLAYER;
+  resetAllButtons(); appMode=MODE_MJPEG_PLAYER;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1888,17 +1846,17 @@ void openMjpegPlayer(const char* filename) {
 // ─────────────────────────────────────────────────────────────────────────────
 void drawRecIndicator() {
   if (!recActive) return;
-  unsigned long elapsed = (millis() - recStartMs) / 1000;
+  unsigned long elapsed=(millis()-recStartMs)/1000;
   char timeBuf[10];
-  snprintf(timeBuf, sizeof(timeBuf), "%02lu:%02lu", elapsed / 60, elapsed % 60);
-  bool blink = (millis() / 500) % 2;
-  lcd.fillRect(4, 4, 90, 22, COL_BLACK);
-  lcd.fillCircle(10, 11, 4, blink ? COL_WHITE : COL_GRAY_5);
+  snprintf(timeBuf,sizeof(timeBuf),"%02lu:%02lu",elapsed/60,elapsed%60);
+  bool blink=(millis()/500)%2;
+  lcd.fillRect(4,4,90,22,COL_BLACK);
+  lcd.fillCircle(10,11,4,blink?COL_WHITE:COL_GRAY_5);
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString(timeBuf, 18, 4);
-  char fBuf[10]; snprintf(fBuf, sizeof(fBuf), "%df", recFrameCount);
+  lcd.drawString(timeBuf,18,4);
+  char fBuf[10]; snprintf(fBuf,sizeof(fBuf),"%df",recFrameCount);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString(fBuf, 18, 14);
+  lcd.drawString(fBuf,18,14);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1906,42 +1864,40 @@ void drawRecIndicator() {
 // ─────────────────────────────────────────────────────────────────────────────
 void startRecording() {
   if (!sdReady) return;
-  if (faceDetectMode) { faceDetectMode = false; faceDetectCount = 0; }
+  if (faceDetectMode) { faceDetectMode=false; faceDetectCount=0; }
   recVideoCount++;
-  char path[48];
-  snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
-  recFile = fopen(path, "wb");
+  char path[48]; snprintf(path,sizeof(path),"/sdcard/video_%04d.mjpeg",recVideoCount);
+  recFile=fopen(path,"wb");
   if (!recFile) { recVideoCount--; return; }
-  recFrameCount = 0; recStartMs = millis(); recActive = true;
-  char buf[20]; snprintf(buf, sizeof(buf), "REC  #%04d", recVideoCount);
-  islandPush(NOTIF_REC, buf);
+  recFrameCount=0; recStartMs=millis(); recActive=true;
+  char buf[20]; snprintf(buf,sizeof(buf),"REC  #%04d",recVideoCount);
+  islandPush(NOTIF_REC,buf);
 }
 
 void stopRecording() {
-  if (!recActive || !recFile) return;
-  fclose(recFile); recFile = nullptr; recActive = false;
-  unsigned long dur = (millis() - recStartMs) / 1000;
-  char buf[28]; snprintf(buf, sizeof(buf), "%df  %02lu:%02lu", recFrameCount, dur / 60, dur % 60);
-  islandPush(NOTIF_OK, buf);
-  blinkLED(3, 100, 80);
-  fpsLastTime = millis(); fpsFrameCount = 0;
+  if (!recActive||!recFile) return;
+  fclose(recFile); recFile=nullptr; recActive=false;
+  unsigned long dur=(millis()-recStartMs)/1000;
+  char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
+  islandPush(NOTIF_OK,buf);
+  blinkLED(3,100,80);
+  fpsLastTime=millis(); fpsFrameCount=0;
 }
 
 void recordFrame() {
-  if (!recActive || !recFile) return;
-  camera_fb_t *fb = esp_camera_fb_get();
+  if (!recActive||!recFile) return;
+  camera_fb_t *fb=esp_camera_fb_get();
   if (!fb) { esp_task_wdt_reset(); return; }
-  uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_JPEG) { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
-  else { ok = frame2jpg(fb, 70, &jpg_buf, &jpg_len); }
-  if (ok && jpg_buf) {
-    fwrite(jpg_buf, 1, jpg_len, recFile); recFrameCount++;
-    if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+  uint8_t *jpg_buf=nullptr; size_t jpg_len=0; bool ok=false;
+  if (fb->format==PIXFORMAT_JPEG) { jpg_buf=fb->buf; jpg_len=fb->len; ok=true; }
+  else { ok=frame2jpg(fb,70,&jpg_buf,&jpg_len); }
+  if (ok&&jpg_buf) {
+    fwrite(jpg_buf,1,jpg_len,recFile); recFrameCount++;
+    if (fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
   }
-  if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-    drawRecIndicator();
-    islandTick();
+  if (recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
+    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+    drawRecIndicator(); islandTick();
   }
   esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
@@ -1949,278 +1905,15 @@ void recordFrame() {
 // ─────────────────────────────────────────────────────────────────────────────
 //  USB MSC
 // ─────────────────────────────────────────────────────────────────────────────
-static int32_t onRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize) {
   (void)offset;
-  if (!sdCard || !sdmmcDriverInit) return -1;
-  return (sdmmc_read_sectors(sdCard, buffer, lba, bufsize / 512) == ESP_OK) ? (int32_t)bufsize : -1;
+  if (!sdCard||!sdmmcDriverInit) return -1;
+  return (sdmmc_read_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
 }
-static int32_t onWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+static int32_t onWrite(uint32_t lba,uint32_t offset,uint8_t* buffer,uint32_t bufsize) {
   (void)offset;
-  if (!sdCard || !sdmmcDriverInit) return -1;
-  return (sdmmc_write_sectors(sdCard, buffer, lba, bufsize / 512) == ESP_OK) ? (int32_t)bufsize : -1;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  BOOT ANIMATION
-// ─────────────────────────────────────────────────────────────────────────────
-static const char GLITCH_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
-static const int  GLITCH_CHAR_COUNT = sizeof(GLITCH_CHARS) - 1;
-
-char glitchRandChar() { return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)]; }
-
-void glitchScrambleText(const char* target, int cx, int cy,
-                        uint16_t col, int steps, int stepDelayMs) {
-  int len = strlen(target);
-  char buf[16]; memset(buf, 0, sizeof(buf));
-  for (int step = 0; step <= len; step++) {
-    for (int i = 0; i < len; i++) buf[i] = (i < step) ? target[i] : glitchRandChar();
-    buf[len] = '\0';
-    lcd.fillRect(cx - 70, cy - 8, 140, 16, COL_BLACK);
-    lcd.setFont(&fonts::FreeSansBold9pt7b);
-    int tw = lcd.textWidth(buf);
-    lcd.setTextColor(col);
-    lcd.drawString(buf, cx - tw / 2, cy - 7);
-    for (int r = 0; r < stepDelayMs / 10; r++) { delay(10); esp_task_wdt_reset(); }
-  }
-}
-
-void glitchBarsFlash(int count, int delayMs) {
-  for (int i = 0; i < count; i++) {
-    int barY = random(DISP_H), barX = random(DISP_W - 60);
-    int barW = random(30, 120), barH = (random(10) > 7) ? 5 : 2;
-    uint16_t barCol = (random(3) == 0) ? COL_GRAY_5 : COL_GRAY_3;
-    lcd.fillRect(barX, barY, barW, barH, barCol);
-    delay(delayMs); esp_task_wdt_reset();
-    lcd.fillRect(barX, barY, barW, barH, COL_BLACK);
-  }
-}
-
-void glitchChromatic(const char* text, int cx, int cy, int offsetX,
-                     uint16_t colR, uint16_t colB) {
-  lcd.setFont(&fonts::FreeSansBold9pt7b);
-  int tw = lcd.textWidth(text);
-  lcd.setTextColor(colR); lcd.drawString(text, cx - tw / 2 - offsetX, cy - 7);
-  lcd.setTextColor(colB); lcd.drawString(text, cx - tw / 2 + offsetX, cy - 7);
-}
-
-void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label, 8, y);
-  int lx = 8 + lcd.textWidth(label) + 2;
-  for (int dx = lx; dx < 230; dx += 4) lcd.drawPixel(dx, y + 5, COL_GRAY_2);
-  lcd.setTextColor(valCol); lcd.drawString(value, 234, y);
-  esp_task_wdt_reset();
-}
-
-void bootLogSection(int y, const char* title) {
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString(title, 8, y);
-  lcd.drawFastHLine(8, y + 9, DISP_W - 16, COL_GRAY_2);
-}
-
-void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
-                     bool xclkOK, uint32_t xclkHz) {
-  lcd.fillScreen(COL_BLACK);
-  int cx = DISP_W / 2, cy = DISP_H / 2 - 10;
-  lcd.setFont(&fonts::FreeSansBold9pt7b);
-  char scramBuf[10];
-  for (int i = 0; i < 8; i++) scramBuf[i] = glitchRandChar();
-  scramBuf[8] = '\0';
-  int tw0 = lcd.textWidth(scramBuf);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString(scramBuf, cx - tw0 / 2, cy - 7);
-  delay(80); esp_task_wdt_reset();
-  glitchBarsFlash(6, 15);
-  glitchScrambleText("SANZXCAM", cx, cy, COL_GRAY_C, 8, 50);
-  glitchChromatic("SANZXCAM", cx, cy, 3, 0xF000, 0x001F);
-  delay(60); esp_task_wdt_reset();
-  lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
-  int tw1 = lcd.textWidth("SANZXCAM");
-  lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
-  delay(400); esp_task_wdt_reset();
-  glitchBarsFlash(4, 20);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_5);
-  const char* sub = "ESP32-S3  CAMERA SYSTEM";
-  lcd.drawString(sub, cx - lcd.textWidth(sub) / 2, cy + 10);
-  lcd.setTextColor(COL_GRAY_3);
-  const char* ver = "v5.9-fix2";
-  lcd.drawString(ver, cx - lcd.textWidth(ver) / 2, cy + 22);
-  lcd.drawFastHLine(cx - 80, cy + 32, 160, COL_GRAY_2);
-  delay(600); esp_task_wdt_reset();
-  glitchBarsFlash(3, 25);
-  glitchChromatic("SANZXCAM", cx, cy, 2, 0xA000, 0x000F);
-  delay(40); esp_task_wdt_reset();
-  lcd.fillRect(cx - 72, cy - 10, 144, 20, COL_BLACK);
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString("SANZXCAM", cx - tw1 / 2, cy - 7);
-  delay(800); esp_task_wdt_reset();
-  for (int stripe = 0; stripe < DISP_H; stripe += 8) {
-    lcd.fillRect(0, stripe, DISP_W, 8, COL_BLACK);
-    delay(10); esp_task_wdt_reset();
-  }
-
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRect(0, 0, DISP_W, 14, COL_GRAY_D);
-  lcd.drawFastHLine(0, 14, DISP_W, COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_7); lcd.drawString("SANZXCAM", 8, 3);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix2", DISP_W - 52, 3);
-  lcd.setTextColor(COL_GRAY_2); lcd.drawString("boot sequence", cx - 32, 3);
-  delay(80); esp_task_wdt_reset();
-
-  int y = 20;
-  bootLogSection(y, "CAMERA"); y += 13;
-  bootLogRow(y, "SENSOR PID",
-             pidOK ? (pid == PID_GC2145 ? "0x2145  GC2145" : "0x3660  OV3660") : "NOT FOUND",
-             pidOK ? COL_GRAY_E : COL_GRAY_5);
-  delay(100); y += 10; esp_task_wdt_reset();
-  char xclkBuf[20];
-  snprintf(xclkBuf, sizeof(xclkBuf), "%uMHz  %s", xclkHz / 1000000, xclkOK ? "OK" : "ERR");
-  bootLogRow(y, "XCLK", xclkBuf, xclkOK ? COL_GRAY_E : COL_GRAY_5);
-  delay(100); y += 10; esp_task_wdt_reset();
-  bootLogRow(y, "RESOLUTION", "320x240  QVGA", COL_GRAY_7);
-  delay(100); y += 10; esp_task_wdt_reset();
-  bootLogRow(y, "FORMAT",
-             (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP)
-             ? "RGB565  BMP" : "RGB565  JPG", COL_GRAY_7);
-  delay(100); y += 10; esp_task_wdt_reset();
-
-  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
-  bootLogSection(y, "STORAGE"); y += 13;
-  char sdBuf[20];
-  if (sdOK) snprintf(sdBuf, sizeof(sdBuf), "OK  %lluMB", sdMB);
-  else       snprintf(sdBuf, sizeof(sdBuf), "NOT FOUND");
-  bootLogRow(y, "SD CARD", sdBuf, sdOK ? COL_GRAY_E : COL_GRAY_5);
-  delay(100); y += 10; esp_task_wdt_reset();
-  if (sdOK) {
-    bootLogRow(y, "FILESYSTEM", "FAT32", COL_GRAY_7);
-    delay(100); y += 10; esp_task_wdt_reset();
-    char photoBuf[16]; snprintf(photoBuf, sizeof(photoBuf), "%04d files", photoCount);
-    bootLogRow(y, "PHOTOS", photoBuf, COL_GRAY_7);
-    delay(100); y += 10; esp_task_wdt_reset();
-    char settingsBuf[20];
-    FILE* stChk = fopen(SETTINGS_PATH, "r");
-    if (stChk) { fclose(stChk); snprintf(settingsBuf, sizeof(settingsBuf), "OK  loaded"); }
-    else        { snprintf(settingsBuf, sizeof(settingsBuf), "not found, default"); }
-    bootLogRow(y, "SETTINGS", settingsBuf, COL_GRAY_7);
-    delay(100); y += 10; esp_task_wdt_reset();
-  }
-
-  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
-  bootLogSection(y, "SYSTEM"); y += 13;
-  bootLogRow(y, "CPU FREQ", "240MHz  OK", COL_GRAY_E);
-  delay(100); y += 10; esp_task_wdt_reset();
-  bootLogRow(y, "PSRAM", psramFound() ? "8MB  OK" : "NOT FOUND",
-             psramFound() ? COL_GRAY_E : COL_GRAY_5);
-  delay(100); y += 10; esp_task_wdt_reset();
-  char heapBuf[16]; snprintf(heapBuf, sizeof(heapBuf), "%uKB", (unsigned)(ESP.getFreeHeap() / 1024));
-  bootLogRow(y, "HEAP FREE", heapBuf, COL_GRAY_7);
-  delay(100); y += 10; esp_task_wdt_reset();
-
-  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 2;
-  bootLogSection(y, "BUILD"); y += 13;
-  bootLogRow(y, "VERSION", "v5.9-fix2", COL_GRAY_7);
-  delay(100); y += 10; esp_task_wdt_reset();
-  bootLogRow(y, "STEGO-BMP", "embed in saveBMP OK", COL_GRAY_E);
-  delay(100); y += 10; esp_task_wdt_reset();
-  bootLogRow(y, "NEW FEAT", "SETTINGS+JUMP-INDEX", COL_GRAY_E);
-  delay(100); y += 10; esp_task_wdt_reset();
-
-  y += 4; lcd.drawFastHLine(0, y, DISP_W, COL_GRAY_2); y += 4;
-  int barX = 8, barW = DISP_W - 16, barH = 3;
-  lcd.fillRect(barX, y, barW, barH, COL_GRAY_2);
-  lcd.drawRect(barX, y, barW, barH, COL_GRAY_3);
-  for (int i = 0; i <= barW; i += 3) {
-    lcd.fillRect(barX, y + 1, i, barH - 2, COL_GRAY_7);
-    if (i % 15 == 0) { delay(8); esp_task_wdt_reset(); }
-  }
-  lcd.fillRect(barX, y + 1, barW, barH - 2, COL_GRAY_C);
-  y += barH + 4;
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  const char* readyMsg = "READY";
-  lcd.drawString(readyMsg, cx - lcd.textWidth(readyMsg) / 2, y);
-  delay(600); esp_task_wdt_reset();
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  USB mode screen
-// ─────────────────────────────────────────────────────────────────────────────
-void drawUSBIcon(int cx, int cy, uint16_t col) {
-  lcd.drawFastVLine(cx,cy-24,28,col);
-  lcd.drawCircle(cx,cy-27,4,col);
-  lcd.drawFastHLine(cx-18,cy-12,36,col);
-  lcd.drawFastVLine(cx-18,cy-12,12,col);
-  lcd.drawCircle(cx-18,cy+2,4,col);
-  lcd.drawFastVLine(cx+18,cy-12,10,col);
-  lcd.drawRect(cx+13,cy-2,10,7,col);
-}
-
-void drawUSBModeScreen() {
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRect(0,0,DISP_W,18,COL_GRAY_D);
-  lcd.drawFastHLine(0,18,DISP_W,COL_GRAY_3);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix2",DISP_W-52,4);
-  drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("to host via USB",(DISP_W-lcd.textWidth("to host via USB"))/2,136);
-  lcd.drawFastHLine(40,150,DISP_W-80,COL_GRAY_2);
-  auto infoRow=[&](int y, const char* key, const char* val) {
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5); lcd.drawString(key,44,y);
-    lcd.setTextColor(COL_GRAY_C); lcd.drawString(val,DISP_W-44-lcd.textWidth(val),y);
-  };
-  char buf[32];
-  infoRow(156,"SENSOR",sensorName);
-  if(sdSizeMB<1024) snprintf(buf,sizeof(buf),"%lluMB  FAT32",sdSizeMB);
-  else               snprintf(buf,sizeof(buf),"%lluGB  FAT32",sdSizeMB/1024);
-  infoRow(170,"STORAGE",buf);
-  snprintf(buf,sizeof(buf),"%04d files",photoCount);
-  infoRow(184,"PHOTOS",buf);
-  lcd.fillRect(0,DISP_H-18,DISP_W,18,COL_GRAY_D);
-  lcd.drawFastHLine(0,DISP_H-18,DISP_W,COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("eject from host first",(DISP_W-lcd.textWidth("eject from host first"))/2,DISP_H-15);
-  lcd.drawRoundRect((DISP_W/2)-68,DISP_H-32,136,13,2,COL_GRAY_3);
-  lcd.drawString("[ BOOT ]  exit usb mode",(DISP_W-lcd.textWidth("[ BOOT ]  exit usb mode"))/2,DISP_H-30);
-}
-
-void enterUSBMode() {
-  if (!sdReady) return;
-  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
-  islandForceHide();
-  unmountVFSOnly(); sdReady = false;
-  esp_task_wdt_reset(); msc.mediaPresent(true); esp_task_wdt_reset();
-  drawUSBModeScreen();
-  usbModeActive = true;
-  blinkLED(3, 200, 100); resetAllButtons();
-}
-
-void exitUSBMode() {
-  usbModeActive = false; msc.mediaPresent(false); esp_task_wdt_reset();
-  lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
-  sdReady = remountVFSOnly();
-  if (sdReady) {
-    scanPhotoCount();
-    loadSettings();
-    applyExpPreset(expPreset);
-    lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
-    char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
-    lcd.setTextColor(COL_GRAY_C); lcd.drawString(buf,(DISP_W-lcd.textWidth(buf))/2,DISP_H/2-6);
-  } else {
-    lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
-    lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("sd mount failed",(DISP_W-lcd.textWidth("sd mount failed"))/2,DISP_H/2-6);
-  }
-  esp_task_wdt_reset(); blinkLED(2,150,100); delay(1000);
-  lcd.fillScreen(COL_BLACK); resetAllButtons();
-  appMode = MODE_VIEWFINDER;
-  fpsLastTime = millis(); fpsFrameCount = 0; fpsValue = 0.0f;
+  if (!sdCard||!sdmmcDriverInit) return -1;
+  return (sdmmc_write_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2228,69 +1921,450 @@ void exitUSBMode() {
 // ─────────────────────────────────────────────────────────────────────────────
 void updateFPS() {
   fpsFrameCount++;
-  unsigned long elapsed = millis() - fpsLastTime;
-  if (elapsed >= 500) {
-    float newFps = fpsFrameCount * 1000.0f / elapsed;
-    fpsValue = fpsValue * 0.7f + newFps * 0.3f;
-    fpsFrameCount = 0; fpsLastTime = millis();
+  unsigned long elapsed=millis()-fpsLastTime;
+  if (elapsed>=500) {
+    float newFps=fpsFrameCount*1000.0f/elapsed;
+    fpsValue=fpsValue*0.7f+newFps*0.3f;
+    fpsFrameCount=0; fpsLastTime=millis();
   }
 }
 
 void runFaceDetect(camera_fb_t *fb) {
-  if (!fb || fb->format != PIXFORMAT_RGB565) return;
+  if (!fb||fb->format!=PIXFORMAT_RGB565) return;
   HumanFaceDetectMSR01 msr(0.1f,0.5f,10,0.2f);
   HumanFaceDetectMNP01 mnp(0.5f,0.3f,5);
-  auto &candidates = msr.infer((uint16_t*)fb->buf, {(int)fb->height,(int)fb->width,3});
-  auto &results    = mnp.infer((uint16_t*)fb->buf, {(int)fb->height,(int)fb->width,3}, candidates);
-  faceDetectCount = results.size();
-  for (auto &res : results) {
+  auto &candidates=msr.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3});
+  auto &results   =mnp.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3},candidates);
+  faceDetectCount=results.size();
+  for (auto &res:results) {
     int x1=constrain(res.box[0],0,DISP_W-1),y1=constrain(res.box[1],0,DISP_H-1);
     int x2=constrain(res.box[2],0,DISP_W-1),y2=constrain(res.box[3],0,DISP_H-1);
-    int bw=x2-x1,bh=y2-y1; if(bw<4||bh<4) continue;
+    int bw=x2-x1,bh=y2-y1; if (bw<4||bh<4) continue;
     int CL=min(12,min(bw,bh)/3);
     lcd.drawFastHLine(x1,y1,CL,COL_WHITE); lcd.drawFastVLine(x1,y1,CL,COL_WHITE);
     lcd.drawFastHLine(x2-CL,y1,CL,COL_WHITE); lcd.drawFastVLine(x2,y1,CL,COL_WHITE);
     lcd.drawFastHLine(x1,y2,CL,COL_WHITE); lcd.drawFastVLine(x1,y2-CL,CL,COL_WHITE);
     lcd.drawFastHLine(x2-CL,y2,CL,COL_WHITE); lcd.drawFastVLine(x2,y2-CL,CL,COL_WHITE);
-    if (res.keypoint.size() >= 10)
-      for (int k = 0; k < 10; k += 2)
+    if (res.keypoint.size()>=10)
+      for (int k=0;k<10;k+=2)
         lcd.fillCircle(constrain(res.keypoint[k],0,DISP_W-1),
                        constrain(res.keypoint[k+1],0,DISP_H-1),2,COL_GRAY_C);
   }
 }
 
 void toggleFaceDetect() {
-  faceDetectMode = !faceDetectMode; faceDetectCount = 0;
-  islandPush(NOTIF_FACE, faceDetectMode ? "FACE DETECT  ON" : "FACE DETECT  OFF");
+  faceDetectMode=!faceDetectMode; faceDetectCount=0;
+  islandPush(NOTIF_FACE,faceDetectMode?"FACE DETECT  ON":"FACE DETECT  OFF");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 void applyExpPreset(uint8_t preset) {
-  sensor_t *s = esp_camera_sensor_get();
+  sensor_t *s=esp_camera_sensor_get();
   if (!s) return;
-  expPreset = preset;
-  const ExpPresetCfg& c = expPresets[preset];
-  int aecVal  = (preset == 3) ? expManualVal  : c.aec_val;
-  int gainVal = (preset == 3) ? expManualGain : c.agc_gain;
-  s->set_exposure_ctrl(s, c.aec_on  ? 1 : 0);
-  s->set_aec2(s,          c.aec2_on ? 1 : 0);
-  if (!c.aec_on) s->set_aec_value(s, aecVal);
-  s->set_gain_ctrl(s, c.agc_on ? 1 : 0);
-  if (!c.agc_on) s->set_agc_gain(s, gainVal);
-  s->set_gainceiling(s, (gainceiling_t)c.gainceiling);
-  s->set_ae_level(s, c.ae_level);
-  if (detectedSensor == PID_GC2145) {
-    s->set_hmirror(s, HMIRROR_GC2145); s->set_vflip(s, VFLIP_GC2145);
-  } else if (detectedSensor == PID_OV3660) {
-    s->set_hmirror(s, HMIRROR_OV3660); s->set_vflip(s, VFLIP_OV3660);
+  expPreset=preset;
+  const ExpPresetCfg& c=expPresets[preset];
+  int aecVal =(preset==3)?expManualVal :c.aec_val;
+  int gainVal=(preset==3)?expManualGain:c.agc_gain;
+  s->set_exposure_ctrl(s,c.aec_on ?1:0);
+  s->set_aec2(s,         c.aec2_on?1:0);
+  if (!c.aec_on) s->set_aec_value(s,aecVal);
+  s->set_gain_ctrl(s,c.agc_on?1:0);
+  if (!c.agc_on) s->set_agc_gain(s,gainVal);
+  s->set_gainceiling(s,(gainceiling_t)c.gainceiling);
+  s->set_ae_level(s,c.ae_level);
+  if (detectedSensor==PID_GC2145) {
+    s->set_hmirror(s,HMIRROR_GC2145); s->set_vflip(s,VFLIP_GC2145);
+  } else if (detectedSensor==PID_OV3660) {
+    s->set_hmirror(s,HMIRROR_OV3660); s->set_vflip(s,VFLIP_OV3660);
   }
   delay(150); esp_task_wdt_reset();
-  for (int i = 0; i < 2; i++) {
-    camera_fb_t *fb = esp_camera_fb_get();
+  for (int i=0;i<2;i++) {
+    camera_fb_t *fb=esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
     esp_task_wdt_reset();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — BASE64 ENCODER  [AI]
+// ─────────────────────────────────────────────────────────────────────────────
+static void base64Encode(const uint8_t* in, size_t inLen, String& out) {
+  static const char b64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  out="";
+  out.reserve(((inLen+2)/3)*4+4);
+  uint32_t val=0; int bits=-6;
+  for (size_t i=0;i<inLen;i++) {
+    val=(val<<8)+in[i]; bits+=8;
+    while (bits>=0) { out+=b64[(val>>bits)&0x3F]; bits-=6; }
+  }
+  if (bits>-6) out+=b64[((val<<8)>>(bits+8))&0x3F];
+  while (out.length()%4) out+='=';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — WORD WRAP ke aiLines[]
+// ─────────────────────────────────────────────────────────────────────────────
+void aiWrapText(const char* text) {
+  aiTotalLines=0; aiScrollLine=0;
+  memset(aiLines,0,sizeof(aiLines));
+  const int maxW=DISP_W-12;
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+
+  char word[48]; int wi=0;
+  char lineBuf[AI_LINE_W]; lineBuf[0]='\0';
+
+  auto flushLine=[&]() {
+    if (aiTotalLines<AI_LINE_MAX && lineBuf[0]) {
+      strncpy(aiLines[aiTotalLines],lineBuf,AI_LINE_W-1);
+      aiLines[aiTotalLines][AI_LINE_W-1]='\0';
+      aiTotalLines++;
+      lineBuf[0]='\0';
+    }
+  };
+
+  const char* p=text;
+  while (*p) {
+    if (*p=='\n') {
+      if (wi>0) { word[wi]='\0'; wi=0;
+        char test[AI_LINE_W];
+        snprintf(test,sizeof(test),"%s%s%s",lineBuf,lineBuf[0]?" ":"",word);
+        if (lcd.textWidth(test)>maxW) { flushLine(); strncpy(lineBuf,word,AI_LINE_W-1); }
+        else strncpy(lineBuf,test,AI_LINE_W-1);
+      }
+      flushLine(); p++; continue;
+    }
+    if (*p==' '||wi>=47) {
+      word[wi]='\0'; wi=0;
+      if (word[0]) {
+        char test[AI_LINE_W];
+        snprintf(test,sizeof(test),"%s%s%s",lineBuf,lineBuf[0]?" ":"",word);
+        if (lcd.textWidth(test)>maxW) { flushLine(); strncpy(lineBuf,word,AI_LINE_W-1); }
+        else strncpy(lineBuf,test,AI_LINE_W-1);
+      }
+      if (*p==' ') p++;
+      continue;
+    }
+    word[wi++]=*p++;
+  }
+  if (wi>0) {
+    word[wi]='\0';
+    char test[AI_LINE_W];
+    snprintf(test,sizeof(test),"%s%s%s",lineBuf,lineBuf[0]?" ":"",word);
+    if (lcd.textWidth(test)>maxW) { flushLine(); strncpy(lineBuf,word,AI_LINE_W-1); }
+    else strncpy(lineBuf,test,AI_LINE_W-1);
+  }
+  flushLine();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — RENDER layar hasil
+// ─────────────────────────────────────────────────────────────────────────────
+void drawAIDescribeScreen() {
+  lcd.fillScreen(COL_BLACK);
+
+  // Header
+  lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
+  lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_AI_ACCENT);
+  const char* title="AI DESCRIBE";
+  lcd.drawString(title,(DISP_W-lcd.textWidth(title))/2,6);
+
+  // Nama file
+  lcd.setTextColor(COL_GRAY_5);
+  char fname[36]; snprintf(fname,sizeof(fname),"[%s]",galleryFiles[photoViewIndex]);
+  lcd.drawString(fname,(DISP_W-lcd.textWidth(fname))/2,22);
+
+  // Teks hasil (scroll)
+  const int lineH=13, textStartY=34;
+  const int visLines=(DISP_H-textStartY-14)/lineH;
+  lcd.fillRect(0,textStartY,DISP_W,DISP_H-textStartY-14,COL_BLACK);
+
+  for (int i=0;i<visLines;i++) {
+    int lineIdx=aiScrollLine+i;
+    if (lineIdx>=aiTotalLines) break;
+    lcd.setTextColor(COL_GRAY_C);
+    lcd.drawString(aiLines[lineIdx],4,textStartY+i*lineH);
+  }
+
+  // Scrollbar
+  if (aiTotalLines>visLines) {
+    int barH=DISP_H-textStartY-14;
+    int indH=max(8,barH*visLines/aiTotalLines);
+    int indY=textStartY+(barH-indH)*aiScrollLine/max(1,aiTotalLines-visLines);
+    lcd.fillRect(DISP_W-3,textStartY,3,barH,COL_GRAY_2);
+    lcd.fillRect(DISP_W-3,indY,3,indH,COL_GRAY_7);
+  }
+
+  // Footer
+  lcd.fillRect(0,DISP_H-12,DISP_W,12,COL_GRAY_D);
+  lcd.drawFastHLine(0,DISP_H-12,DISP_W,COL_GRAY_3);
+  lcd.setTextColor(COL_GRAY_5);
+  char footBuf[48];
+  snprintf(footBuf,sizeof(footBuf),"C=^ D=v   B=kembali   %d/%d baris",
+           aiScrollLine+1, aiTotalLines);
+  lcd.drawString(footBuf,(DISP_W-lcd.textWidth(footBuf))/2,DISP_H-10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — STATUS overlay (loading/error)
+// ─────────────────────────────────────────────────────────────────────────────
+void drawAIStatus(const char* line1, const char* line2="") {
+  int dw=260,dh=50,dx=(DISP_W-dw)/2,dy=(DISP_H-dh)/2;
+  lcd.fillRoundRect(dx,dy,dw,dh,8,COL_GRAY_D);
+  lcd.drawRoundRect(dx,dy,dw,dh,8,COL_GRAY_5);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_AI_ACCENT);
+  lcd.drawString(line1,dx+(dw-lcd.textWidth(line1))/2,dy+10);
+  if (line2[0]) {
+    lcd.setTextColor(COL_GRAY_7);
+    lcd.drawString(line2,dx+(dw-lcd.textWidth(line2))/2,dy+26);
+  }
+  esp_task_wdt_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — Baca file foto dari SD sebagai JPEG bytes
+//  BMP di-convert ke JPEG dulu agar lebih kecil dan hemat token
+// ─────────────────────────────────────────────────────────────────────────────
+static uint8_t* aiLoadPhotoAsJpeg(int idx, size_t* outLen) {
+  char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
+  *outLen=0;
+
+  if (gIsJpg(idx)) {
+    // Langsung baca JPEG
+    FILE* f=fopen(path,"rb");
+    if (!f) return nullptr;
+    fseek(f,0,SEEK_END); size_t sz=ftell(f); fseek(f,0,SEEK_SET);
+    if (sz==0||sz>300000) { fclose(f); return nullptr; }
+    uint8_t* buf=(uint8_t*)ps_malloc(sz);
+    if (!buf) buf=(uint8_t*)malloc(sz);
+    if (!buf) { fclose(f); return nullptr; }
+    fread(buf,1,sz,f); fclose(f);
+    *outLen=sz;
+    return buf;
+  }
+
+  if (gIsBmp(idx)) {
+    // Load BMP → pixel buf → convert ke JPEG
+    uint16_t bw=0,bh=0;
+    uint16_t* pixels=loadBMP(path,&bw,&bh);
+    if (!pixels||bw==0||bh==0) return nullptr;
+
+    // Buat camera_fb_t dummy agar bisa pakai frame2jpg
+    // Sebenarnya kita punya raw RGB565, pakai img_converters langsung
+    uint8_t* jpgOut=nullptr; size_t jpgLen=0;
+    // fmt2jpg untuk RGB565 → JPEG
+    bool ok=fmt2jpg((uint8_t*)pixels,(size_t)bw*bh*2,bw,bh,PIXFORMAT_RGB565,80,&jpgOut,&jpgLen);
+    free(pixels);
+    if (!ok||!jpgOut) return nullptr;
+    *outLen=jpgLen;
+    return jpgOut;
+  }
+
+  return nullptr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — Main function: kirim foto ke Gemini, ambil deskripsi
+// ─────────────────────────────────────────────────────────────────────────────
+bool doAIDescribe(int idx) {
+  // 1. Cek & load config
+  bool wifiOK   = (wifiSSID[0]!='\0' && strcmp(wifiSSID,"NamaWiFiKamu")!=0);
+  bool geminiOK = (geminiApiKey[0]!='\0' && strncmp(geminiApiKey,"AIzaXXXX",8)!=0);
+
+  if (!wifiOK)   wifiOK   = loadWifiConfig();
+  if (!geminiOK) geminiOK = loadGeminiConfig();
+
+  if (!wifiOK || !geminiOK) {
+    resetAllButtons();
+    drawAINoConfigScreen(!wifiOK, !geminiOK);
+    appMode=MODE_AI_NO_CONFIG;
+    return false;
+  }
+
+  lcd.fillScreen(COL_BLACK);
+  drawAIStatus("AI DESCRIBE","menghubungkan WiFi...");
+
+  // 2. Konek WiFi
+  if (WiFi.status()!=WL_CONNECTED) {
+    WiFi.begin(wifiSSID,wifiPass);
+    unsigned long t0=millis();
+    while (WiFi.status()!=WL_CONNECTED && millis()-t0<15000) {
+      delay(300); esp_task_wdt_reset();
+    }
+    if (WiFi.status()!=WL_CONNECTED) {
+      drawAIStatus("WiFi gagal","periksa wifi.ini");
+      delay(2500); return false;
+    }
+  }
+
+  drawAIStatus("AI DESCRIBE","membaca foto...");
+  esp_task_wdt_reset();
+
+  // 3. Baca foto sebagai JPEG
+  size_t jpgLen=0;
+  uint8_t* jpgBuf=aiLoadPhotoAsJpeg(idx,&jpgLen);
+  if (!jpgBuf||jpgLen==0) {
+    drawAIStatus("gagal baca foto",""); delay(2000); return false;
+  }
+
+  drawAIStatus("AI DESCRIBE","encode base64...");
+  esp_task_wdt_reset();
+
+  // 4. Base64
+  String b64;
+  base64Encode(jpgBuf,jpgLen,b64);
+  free(jpgBuf);
+
+  drawAIStatus("AI DESCRIBE","mengirim ke Gemini...");
+  esp_task_wdt_reset();
+
+  // 5. Build JSON — manual string build untuk hemat heap
+  //    Format: {"contents":[{"parts":[{"inline_data":{"mime_type":"image/jpeg","data":"BASE64"}},{"text":"..."}]}]}
+  String url = String(GEMINI_URL_BASE) + String(geminiApiKey);
+
+  // Buat body JSON
+  // Kita pakai DynamicJsonDocument secukupnya
+  // base64 bisa sangat besar, jadi kita pasang langsung ke string
+  String body;
+  body.reserve(b64.length()+256);
+  body  = "{\"contents\":[{\"parts\":[";
+  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
+  body += b64;
+  body += "\"}},";
+  body += "{\"text\":\"Deskripsikan isi gambar ini dalam Bahasa Indonesia. ";
+  body += "Jelaskan objek utama, warna dominan, suasana, dan konteks gambar. ";
+  body += "Maksimal 4 kalimat, gunakan bahasa sederhana.\"}";
+  body += "]}]}";
+  b64 = "";  // bebaskan memori
+
+  esp_task_wdt_reset();
+
+  // 6. HTTP POST
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.addHeader("Content-Type","application/json");
+  http.setTimeout(25000);
+
+  esp_task_wdt_reset();
+  int httpCode=http.POST(body);
+  body="";  // bebaskan
+  esp_task_wdt_reset();
+
+  if (httpCode!=200) {
+    String errBody=http.getString();
+    Serial.printf("[GEMINI] HTTP %d: %s\n",httpCode,errBody.c_str());
+    char errBuf[32]; snprintf(errBuf,sizeof(errBuf),"HTTP error %d",httpCode);
+    drawAIStatus(errBuf,"cek key di gemini.ini");
+    http.end(); delay(3000); return false;
+  }
+
+  drawAIStatus("AI DESCRIBE","parsing respons...");
+  esp_task_wdt_reset();
+
+  // 7. Parse JSON respons
+  // Format: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
+  String resp=http.getString();
+  http.end();
+  esp_task_wdt_reset();
+
+  // Ekstrak teks dengan DynamicJsonDocument
+  DynamicJsonDocument doc(8192);
+  DeserializationError err=deserializeJson(doc,resp);
+  if (err) {
+    Serial.printf("[GEMINI] JSON parse error: %s\n",err.c_str());
+    drawAIStatus("parse error","respons tidak valid");
+    delay(2500); return false;
+  }
+
+  const char* text=doc["candidates"][0]["content"]["parts"][0]["text"]|"";
+  if (!text||strlen(text)==0) {
+    drawAIStatus("respons kosong",""); delay(2000); return false;
+  }
+
+  strncpy(aiResult,text,AI_RESULT_MAX);
+  aiResult[AI_RESULT_MAX]='\0';
+  Serial.printf("[GEMINI] deskripsi: %s\n",aiResult);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — Entry point dari Photo View
+// ─────────────────────────────────────────────────────────────────────────────
+void openAIDescribe(int idx) {
+  aiDescribeBusy=true;
+  aiResult[0]='\0'; aiTotalLines=0; aiScrollLine=0;
+
+  bool ok=doAIDescribe(idx);
+  aiDescribeBusy=false;
+
+  if (ok) {
+    aiWrapText(aiResult);
+    drawAIDescribeScreen();
+    resetAllButtons();
+    appMode=MODE_AI_DESCRIBE;
+    islandPush(NOTIF_INFO,"AI describe selesai");
+  } else {
+    if (appMode==MODE_AI_NO_CONFIG) return;  // sudah handle di doAIDescribe
+    resetAllButtons();
+    appMode=MODE_PHOTO_VIEW;
+    photoViewRender();
+    photoViewDrawCaption(photoViewIndex);
+    islandPush(NOTIF_WARN,"AI describe gagal");
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI DESCRIBE — Mode handler
+// ─────────────────────────────────────────────────────────────────────────────
+void handleModeAIDescribe(ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) {
+  if (aiDescribeBusy) return;
+
+  bool redraw=false;
+  const int visLines=(DISP_H-34-14)/13;
+
+  if (evtC.valid && evtC.isShort) {
+    if (aiScrollLine>0) { aiScrollLine--; redraw=true; }
+  }
+  if (evtD.valid && evtD.isShort) {
+    if (aiScrollLine<aiTotalLines-visLines) { aiScrollLine++; redraw=true; }
+  }
+  // C/D long = lompat 5 baris
+  if (evtC.valid && evtC.isLong) {
+    aiScrollLine=max(0,aiScrollLine-5); redraw=true;
+  }
+  if (evtD.valid && evtD.isLong) {
+    aiScrollLine=min(max(0,aiTotalLines-visLines),aiScrollLine+5); redraw=true;
+  }
+
+  if (redraw) drawAIDescribeScreen();
+
+  if (evtB.valid && evtB.isShort) {
+    resetAllButtons();
+    appMode=MODE_PHOTO_VIEW;
+    photoViewRender();
+    photoViewDrawCaption(photoViewIndex);
+    photoViewCaptionUntilMs=millis()+2000;
+    photoViewCaptionVisible=true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  AI NO CONFIG — Mode handler
+// ─────────────────────────────────────────────────────────────────────────────
+void handleModeAINoConfig(ButtonEvent evtB) {
+  if (evtB.valid && evtB.isShort) {
+    resetAllButtons();
+    appMode=MODE_PHOTO_VIEW;
+    photoViewRender();
+    photoViewDrawCaption(photoViewIndex);
+    photoViewCaptionUntilMs=millis()+2000;
+    photoViewCaptionVisible=true;
   }
 }
 
@@ -2298,52 +2372,46 @@ void applyExpPreset(uint8_t preset) {
 //  VIEWFINDER
 // ─────────────────────────────────────────────────────────────────────────────
 void renderViewfinder() {
-  bool frozen = (millis() < islandFreezeUntilMs);
-  islandNoClear = true;
-
-  camera_fb_t *fb = nullptr;
+  bool frozen=(millis()<islandFreezeUntilMs);
+  islandNoClear=true;
+  camera_fb_t *fb=nullptr;
+  if (!frozen) { fb=esp_camera_fb_get(); if (!fb) return; }
   if (!frozen) {
-    fb = esp_camera_fb_get();
-    if (!fb) return;
-  }
-
-  if (!frozen) {
-    if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
-      lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-      uint16_t bktCol = recActive ? 0xF800 : (faceDetectMode ? COL_WHITE : COL_GRAY_E);
+    if (fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
+      lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+      uint16_t bktCol=recActive?0xF800:(faceDetectMode?COL_WHITE:COL_GRAY_E);
       drawCornerBrackets(bktCol);
       if (faceDetectMode) runFaceDetect(fb);
-      char fpsBuf[12]; snprintf(fpsBuf, sizeof(fpsBuf), "%.0f fps", fpsValue);
-      drawPill(32, 10, fpsBuf, COL_PILL_BG, COL_GRAY_A);
+      char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
+      drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
       char sensorPill[20];
-      snprintf(sensorPill, sizeof(sensorPill), "%s%s", sensorName, ledFlashEnabled ? " *" : "");
-      drawPill(DISP_W-42, 10, sensorPill, COL_PILL_BG, COL_GRAY_A);
+      snprintf(sensorPill,sizeof(sensorPill),"%s%s",sensorName,ledFlashEnabled?" *":"");
+      drawPill(DISP_W-42,10,sensorPill,COL_PILL_BG,COL_GRAY_A);
       if (faceDetectMode) {
         char faceBuf[12];
-        snprintf(faceBuf, sizeof(faceBuf),
-                 faceDetectCount > 0 ? "FACE  %d" : "FACE  --", faceDetectCount);
-        drawPill(DISP_W/2, 10, faceBuf, COL_PILL_BG, COL_GRAY_C);
-      } else if (expPreset > 0) {
+        snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
+        drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
+      } else if (expPreset>0) {
         char expBuf[12];
-        if (expPreset == 3) snprintf(expBuf, sizeof(expBuf), "M %d", expManualVal);
-        else                snprintf(expBuf, sizeof(expBuf), "%s", expPresetNames[expPreset]);
-        drawPill(DISP_W/2, 10, expBuf, COL_PILL_BG, COL_GRAY_E);
+        if (expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
+        else              snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
+        drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
       }
       const char* fmtTag;
-      if (detectedSensor == PID_GC2145)
-        fmtTag = (gc2145CaptureFormat == GFMT_BMP) ? "BMP" : "JPG";
-      else fmtTag = "JPG";
+      if (detectedSensor==PID_GC2145)
+        fmtTag=(gc2145CaptureFormat==GFMT_BMP)?"BMP":"JPG";
+      else fmtTag="JPG";
       char shotBuf[12];
-      snprintf(shotBuf, sizeof(shotBuf), "#%04d %s", photoCount + 1, fmtTag);
-      drawPill(38, DISP_H-10, shotBuf, COL_PILL_BG, COL_GRAY_8);
-      drawPill(DISP_W-36, DISP_H-10, sdReady ? "SD  OK" : "SD  --",
-               COL_PILL_BG, sdReady ? COL_GRAY_8 : COL_GRAY_5);
+      snprintf(shotBuf,sizeof(shotBuf),"#%04d %s",photoCount+1,fmtTag);
+      drawPill(38,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
+      drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
+               COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
       if (recActive) drawRecIndicator();
       updateFPS();
     } else {
       lcd.fillScreen(COL_BLACK);
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-      lcd.drawString("format not rgb565", 10, 110);
+      lcd.drawString("format not rgb565",10,110);
     }
     esp_camera_fb_return(fb);
   }
@@ -2355,81 +2423,66 @@ void renderViewfinder() {
 // ─────────────────────────────────────────────────────────────────────────────
 void captureAndPreview() {
   if (ledFlashEnabled) {
-    digitalWrite(LED_FLASH, HIGH); delay(150);
-    for (int i = 0; i < 2; i++) {
-      camera_fb_t *tfb = esp_camera_fb_get();
+    digitalWrite(LED_FLASH,HIGH); delay(150);
+    for (int i=0;i<2;i++) {
+      camera_fb_t *tfb=esp_camera_fb_get();
       if (tfb) esp_camera_fb_return(tfb);
       esp_task_wdt_reset();
     }
   }
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
-  if (!fb) { blinkLED(5, 50, 50); return; }
-
-  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
+  camera_fb_t *fb=esp_camera_fb_get();
+  if (ledFlashEnabled) digitalWrite(LED_FLASH,LOW);
+  if (!fb) { blinkLED(5,50,50); return; }
+  if (fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W) {
+    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawCornerBrackets(COL_GRAY_E);
   }
-
-  bool saved = false;
+  bool saved=false;
   if (sdReady) {
     photoCount++;
-    bool isGC2145rgb = (detectedSensor == PID_GC2145 &&
-                        fb->format == PIXFORMAT_RGB565 &&
-                        fb->width == DISP_W && fb->height == DISP_H);
-
-    if (isGC2145rgb && gc2145CaptureFormat == GFMT_BMP) {
-      char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
+    bool isGC2145rgb=(detectedSensor==PID_GC2145&&
+                      fb->format==PIXFORMAT_RGB565&&
+                      fb->width==DISP_W&&fb->height==DISP_H);
+    if (isGC2145rgb&&gc2145CaptureFormat==GFMT_BMP) {
+      char path[48]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.bmp",photoCount);
       char payload[STEGO_BMP_MAX_PAYLOAD];
-      stegoMakePayload(payload, sizeof(payload), photoCount);
-      int payLen = (int)strlen(payload);
-      saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, payLen);
-      Serial.printf("[CAPTURE-BMP] photo_%04d.bmp  %dx%d  stego=%s  %s\n",
-                    photoCount, fb->width, fb->height, payload, saved ? "OK" : "GAGAL");
+      stegoMakePayload(payload,sizeof(payload),photoCount);
+      saved=saveBMP(fb->buf,fb->width,fb->height,path,payload,(int)strlen(payload));
     } else {
-      uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
-      if (fb->format == PIXFORMAT_RGB565)       { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
-      else if (fb->format == PIXFORMAT_JPEG)    { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
-      if (ok && jpg_buf && jpg_len > 0) {
+      uint8_t *jpg_buf=nullptr; size_t jpg_len=0; bool ok=false;
+      if (fb->format==PIXFORMAT_RGB565)    { ok=frame2jpg(fb,85,&jpg_buf,&jpg_len); }
+      else if (fb->format==PIXFORMAT_JPEG) { jpg_buf=fb->buf; jpg_len=fb->len; ok=true; }
+      if (ok&&jpg_buf&&jpg_len>0) {
         char payload[STEGO_PAYLOAD_LEN];
-        stegoMakePayload(payload, sizeof(payload), photoCount);
-        int payLen = (int)strlen(payload);
-        size_t stegoLen = 0;
-        uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len, payload, payLen, &stegoLen);
-        if (!stegoBuf) { stegoBuf = jpg_buf; stegoLen = jpg_len; }
-        size_t finalLen = 0;
-        uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen, photoCount, sensorName, &finalLen);
-        if (!finalBuf) { finalBuf = stegoBuf; finalLen = stegoLen; }
-        char path[40]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-          size_t w = fwrite(finalBuf, 1, finalLen, f); fclose(f);
-          saved = (w == finalLen);
-          if (saved) Serial.printf("[CAPTURE-JPG] photo_%04d.jpg  %u bytes\n",
-                                   photoCount, (unsigned)finalLen);
-        }
-        if (finalBuf != stegoBuf) free(finalBuf);
-        if (stegoBuf != jpg_buf)  free(stegoBuf);
-        if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+        stegoMakePayload(payload,sizeof(payload),photoCount);
+        size_t stegoLen=0;
+        uint8_t* stegoBuf=stegoEmbedToJpeg(jpg_buf,jpg_len,payload,(int)strlen(payload),&stegoLen);
+        if (!stegoBuf) { stegoBuf=jpg_buf; stegoLen=jpg_len; }
+        size_t finalLen=0;
+        uint8_t* finalBuf=exifInjectToJpeg(stegoBuf,stegoLen,photoCount,sensorName,&finalLen);
+        if (!finalBuf) { finalBuf=stegoBuf; finalLen=stegoLen; }
+        char path[40]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.jpg",photoCount);
+        FILE* f=fopen(path,"wb");
+        if (f) { size_t w=fwrite(finalBuf,1,finalLen,f); fclose(f); saved=(w==finalLen); }
+        if (finalBuf!=stegoBuf) free(finalBuf);
+        if (stegoBuf!=jpg_buf)  free(stegoBuf);
+        if (fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
       }
     }
     if (!saved) photoCount--;
   }
-
   esp_camera_fb_return(fb);
-
   if (saved) {
     char notifText[28];
-    bool isBmpSave = (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP);
-    snprintf(notifText, sizeof(notifText), "SAVED %s #%04d",
-             isBmpSave ? "BMP" : "JPG", photoCount);
-    islandPush(NOTIF_OK, notifText);
-    blinkLED(2, 150, 80);
+    bool isBmpSave=(detectedSensor==PID_GC2145&&gc2145CaptureFormat==GFMT_BMP);
+    snprintf(notifText,sizeof(notifText),"SAVED %s #%04d",isBmpSave?"BMP":"JPG",photoCount);
+    islandPush(NOTIF_OK,notifText);
+    blinkLED(2,150,80);
   } else {
-    islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD");
-    blinkLED(5, 50, 50);
+    islandPush(NOTIF_WARN,sdReady?"WRITE ERR":"NO SD CARD");
+    blinkLED(5,50,50);
   }
-  fpsLastTime = millis(); fpsFrameCount = 0;
+  fpsLastTime=millis(); fpsFrameCount=0;
   resetAllButtons();
 }
 
@@ -2441,10 +2494,10 @@ void applySensorSettings(sensor_t *s, uint16_t pid) {
   s->set_special_effect(s,0); s->set_whitebal(s,1); s->set_awb_gain(s,1);
   s->set_wb_mode(s,0); s->set_exposure_ctrl(s,1); s->set_aec2(s,1);
   s->set_ae_level(s,0); s->set_gain_ctrl(s,1); s->set_agc_gain(s,0);
-  if (pid == PID_GC2145) {
+  if (pid==PID_GC2145) {
     s->set_aec_value(s,300); s->set_gainceiling(s,GAINCEILING_4X);
     s->set_hmirror(s,HMIRROR_GC2145); s->set_vflip(s,VFLIP_GC2145);
-  } else if (pid == PID_OV3660) {
+  } else if (pid==PID_OV3660) {
     s->set_aec_value(s,400); s->set_gainceiling(s,GAINCEILING_4X);
     s->set_hmirror(s,HMIRROR_OV3660); s->set_vflip(s,VFLIP_OV3660);
   } else {
@@ -2467,175 +2520,397 @@ bool initCamera() {
   if (psramFound()) { cfg.jpeg_quality=7; cfg.fb_count=2; cfg.fb_location=CAMERA_FB_IN_PSRAM; }
   else              { cfg.jpeg_quality=12; cfg.fb_count=1; cfg.fb_location=CAMERA_FB_IN_DRAM; }
   cfg.xclk_freq_hz=20000000;
-  if (esp_camera_init(&cfg) != ESP_OK) return false;
-  sensor_t *s = esp_camera_sensor_get(); if (!s) return false;
-  detectedSensor = s->id.PID;
-  if (detectedSensor == PID_OV3660) {
+  if (esp_camera_init(&cfg)!=ESP_OK) return false;
+  sensor_t *s=esp_camera_sensor_get(); if (!s) return false;
+  detectedSensor=s->id.PID;
+  if (detectedSensor==PID_OV3660) {
     esp_camera_deinit(); delay(100); cfg.xclk_freq_hz=24000000;
-    if (esp_camera_init(&cfg) != ESP_OK) {
+    if (esp_camera_init(&cfg)!=ESP_OK) {
       cfg.xclk_freq_hz=20000000;
-      if (esp_camera_init(&cfg) != ESP_OK) return false;
+      if (esp_camera_init(&cfg)!=ESP_OK) return false;
     }
-    s = esp_camera_sensor_get(); if (!s) return false;
+    s=esp_camera_sensor_get(); if (!s) return false;
   }
   switch (detectedSensor) {
     case PID_GC2145: strncpy(sensorName,"GC2145",sizeof(sensorName)); break;
     case PID_OV3660: strncpy(sensorName,"OV3660",sizeof(sensorName)); break;
     default: snprintf(sensorName,sizeof(sensorName),"0x%04X",detectedSensor); break;
   }
-  applySensorSettings(s, detectedSensor);
+  applySensorSettings(s,detectedSensor);
   return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  JUMP INPUT DIALOG  [JUMP]
+//  JUMP INPUT DIALOG
 // ─────────────────────────────────────────────────────────────────────────────
 void drawJumpDialog() {
-  const int dw = 240, dh = 100;
-  const int dx = (DISP_W - dw) / 2;
-  const int dy = (DISP_H - dh) / 2;
-
-  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(dx, dy, dw, dh, 10, COL_GRAY_5);
-  lcd.drawRoundRect(dx + 1, dy + 1, dw - 2, dh - 2, 9, COL_GRAY_3);
-
+  const int dw=240,dh=100,dx=(DISP_W-dw)/2,dy=(DISP_H-dh)/2;
+  lcd.fillRoundRect(dx,dy,dw,dh,10,COL_GRAY_D);
+  lcd.drawRoundRect(dx,dy,dw,dh,10,COL_GRAY_5);
+  lcd.drawRoundRect(dx+1,dy+1,dw-2,dh-2,9,COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title = "GO TO INDEX";
-  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 7);
-
-  lcd.drawFastHLine(dx + 10, dy + 19, dw - 20, COL_GRAY_3);
-
-  const int boxW = 26, boxH = 28, boxGap = 6;
-  const int totalBoxW = JUMP_DIGIT_COUNT * boxW + (JUMP_DIGIT_COUNT - 1) * boxGap;
-  int boxStartX = dx + (dw - totalBoxW) / 2;
-  const int boxY = dy + 24;
-
-  for (int i = 0; i < JUMP_DIGIT_COUNT; i++) {
-    int bx = boxStartX + i * (boxW + boxGap);
-    bool isCursor = (i == jumpCursorPos);
-
-    uint16_t boxBg  = isCursor ? COL_GRAY_5 : COL_GRAY_2;
-    uint16_t boxBdr = isCursor ? COL_WHITE  : COL_GRAY_3;
-    lcd.fillRoundRect(bx, boxY, boxW, boxH, 4, boxBg);
-    lcd.drawRoundRect(bx, boxY, boxW, boxH, 4, boxBdr);
-
-    char dBuf[2]; snprintf(dBuf, sizeof(dBuf), "%d", jumpDigits[i]);
+  const char* title="GO TO INDEX";
+  lcd.drawString(title,dx+(dw-lcd.textWidth(title))/2,dy+7);
+  lcd.drawFastHLine(dx+10,dy+19,dw-20,COL_GRAY_3);
+  const int boxW=26,boxH=28,boxGap=6;
+  const int totalBoxW=JUMP_DIGIT_COUNT*boxW+(JUMP_DIGIT_COUNT-1)*boxGap;
+  int boxStartX=dx+(dw-totalBoxW)/2;
+  const int boxY=dy+24;
+  for (int i=0;i<JUMP_DIGIT_COUNT;i++) {
+    int bx=boxStartX+i*(boxW+boxGap);
+    bool isCursor=(i==jumpCursorPos);
+    lcd.fillRoundRect(bx,boxY,boxW,boxH,4,isCursor?COL_GRAY_5:COL_GRAY_2);
+    lcd.drawRoundRect(bx,boxY,boxW,boxH,4,isCursor?COL_WHITE:COL_GRAY_3);
+    char dBuf[2]; snprintf(dBuf,sizeof(dBuf),"%d",jumpDigits[i]);
     lcd.setFont(&fonts::FreeSansBold9pt7b);
-    int tw = lcd.textWidth(dBuf);
-    lcd.setTextColor(isCursor ? COL_WHITE : COL_GRAY_A);
-    lcd.drawString(dBuf, bx + (boxW - tw) / 2, boxY + 6);
-
+    int tw=lcd.textWidth(dBuf);
+    lcd.setTextColor(isCursor?COL_WHITE:COL_GRAY_A);
+    lcd.drawString(dBuf,bx+(boxW-tw)/2,boxY+6);
     if (isCursor) {
-      int cx2 = bx + boxW / 2;
-      int cy2 = boxY + boxH + 3;
-      lcd.fillTriangle(cx2 - 4, cy2, cx2 + 4, cy2, cx2, cy2 + 5, COL_GRAY_A);
+      int cx2=bx+boxW/2,cy2=boxY+boxH+3;
+      lcd.fillTriangle(cx2-4,cy2,cx2+4,cy2,cx2,cy2+5,COL_GRAY_A);
     }
   }
-
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_5);
-  char totalBuf[12]; snprintf(totalBuf, sizeof(totalBuf), "/ %d", galleryCount);
-  int totalX = boxStartX + totalBoxW + 8;
-  lcd.drawString(totalBuf, totalX, boxY + 10);
-
-  lcd.drawFastHLine(dx + 10, dy + dh - 22, dw - 20, COL_GRAY_2);
+  char totalBuf[12]; snprintf(totalBuf,sizeof(totalBuf),"/ %d",galleryCount);
+  lcd.drawString(totalBuf,boxStartX+totalBoxW+8,boxY+10);
+  lcd.drawFastHLine(dx+10,dy+dh-22,dw-20,COL_GRAY_2);
   lcd.setTextColor(COL_GRAY_5);
-  const char* hint = "C=- D=+  B=kursor  BOOT=ok";
-  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + dh - 18);
-
-  unsigned long elapsed = millis() - jumpOpenMs;
-  int barW = dw - 20;
-  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
-  prog = constrain(prog, 0, barW);
-  lcd.fillRect(dx + 10, dy + dh - 6, barW, 3, COL_GRAY_2);
-  lcd.fillRect(dx + 10, dy + dh - 6, prog, 3, COL_GRAY_5);
+  const char* hint="C=- D=+  B=kursor  BOOT=ok";
+  lcd.drawString(hint,dx+(dw-lcd.textWidth(hint))/2,dy+dh-18);
+  unsigned long elapsed=millis()-jumpOpenMs;
+  int barW=dw-20;
+  int prog=barW-(int)((long)barW*elapsed/JUMP_TIMEOUT_MS);
+  prog=constrain(prog,0,barW);
+  lcd.fillRect(dx+10,dy+dh-6,barW,3,COL_GRAY_2);
+  lcd.fillRect(dx+10,dy+dh-6,prog,3,COL_GRAY_5);
 }
 
 void openJumpDialog() {
   jumpResetToCurrentIndex();
-  jumpOpenMs    = millis();
-  jumpActive    = true;
+  jumpOpenMs=millis();
+  jumpActive=true;
   drawJumpDialog();
   resetAllButtons();
-  appMode = MODE_JUMP_INPUT;
+  appMode=MODE_JUMP_INPUT;
 }
 
 void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
-                          ButtonEvent evtC,    ButtonEvent evtD) {
-  if (millis() - jumpOpenMs >= JUMP_TIMEOUT_MS) {
-    jumpActive = false;
-    resetAllButtons();
-    appMode = MODE_GALLERY;
-    drawGallery();
-    islandPush(NOTIF_INFO, "JUMP BATAL (timeout)");
+                          ButtonEvent evtC, ButtonEvent evtD) {
+  if (millis()-jumpOpenMs>=JUMP_TIMEOUT_MS) {
+    jumpActive=false;
+    resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+    islandPush(NOTIF_INFO,"JUMP BATAL (timeout)");
     return;
   }
-
-  bool redraw = false;
-
-  if (evtD.valid && evtD.isShort) {
-    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 1) % 10;
-    redraw = true;
-  }
-  if (evtC.valid && evtC.isShort) {
-    jumpDigits[jumpCursorPos] = (jumpDigits[jumpCursorPos] + 9) % 10;
-    redraw = true;
-  }
-  if (evtB.valid && evtB.isShort) {
-    jumpCursorPos = (jumpCursorPos + 1) % JUMP_DIGIT_COUNT;
-    redraw = true;
-  }
-  if (evtB.valid && evtB.isLong) {
-    jumpCursorPos = (jumpCursorPos + JUMP_DIGIT_COUNT - 1) % JUMP_DIGIT_COUNT;
-    redraw = true;
-  }
-  if (evtBoot.valid && evtBoot.isShort) {
-    int target = jumpGetValue();
-    jumpActive = false;
-    if (target < 1 || target > galleryCount) {
-      resetAllButtons();
-      appMode = MODE_GALLERY;
-      drawGallery();
-      char warnBuf[32];
-      snprintf(warnBuf, sizeof(warnBuf), "INDEX %d diluar range", target);
-      islandPush(NOTIF_WARN, warnBuf);
+  bool redraw=false;
+  if (evtD.valid&&evtD.isShort)  { jumpDigits[jumpCursorPos]=(jumpDigits[jumpCursorPos]+1)%10; redraw=true; }
+  if (evtC.valid&&evtC.isShort)  { jumpDigits[jumpCursorPos]=(jumpDigits[jumpCursorPos]+9)%10; redraw=true; }
+  if (evtB.valid&&evtB.isShort)  { jumpCursorPos=(jumpCursorPos+1)%JUMP_DIGIT_COUNT; redraw=true; }
+  if (evtB.valid&&evtB.isLong)   { jumpCursorPos=(jumpCursorPos+JUMP_DIGIT_COUNT-1)%JUMP_DIGIT_COUNT; redraw=true; }
+  if (evtBoot.valid&&evtBoot.isShort) {
+    int target=jumpGetValue(); jumpActive=false;
+    if (target<1||target>galleryCount) {
+      resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+      char warnBuf[32]; snprintf(warnBuf,sizeof(warnBuf),"INDEX %d diluar range",target);
+      islandPush(NOTIF_WARN,warnBuf);
     } else {
-      int newIdx = target - 1;
-      newIdx = constrain(newIdx, 0, galleryCount - 1);
-      gallerySelIdx  = newIdx;
-      galleryScroll  = (newIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
-      galleryHoldDir = 0;
-      resetAllButtons();
-      appMode = MODE_GALLERY;
-      drawGallery();
-      char infoBuf[24];
-      snprintf(infoBuf, sizeof(infoBuf), "JUMP #%d", target);
-      islandPush(NOTIF_INFO, infoBuf);
+      int newIdx=constrain(target-1,0,galleryCount-1);
+      gallerySelIdx=newIdx;
+      galleryScroll=(newIdx/GALLERY_ITEMS_PAGE)*GALLERY_ITEMS_PAGE;
+      galleryHoldDir=0;
+      resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+      char infoBuf[24]; snprintf(infoBuf,sizeof(infoBuf),"JUMP #%d",target);
+      islandPush(NOTIF_INFO,infoBuf);
     }
     return;
   }
-  if (evtBoot.valid && evtBoot.isLong) {
-    jumpActive = false;
-    resetAllButtons();
-    appMode = MODE_GALLERY;
-    drawGallery();
-    islandPush(NOTIF_INFO, "JUMP BATAL");
+  if (evtBoot.valid&&evtBoot.isLong) {
+    jumpActive=false;
+    resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+    islandPush(NOTIF_INFO,"JUMP BATAL");
     return;
   }
-
   if (redraw) drawJumpDialog();
-
-  unsigned long elapsed = millis() - jumpOpenMs;
-  int barW = 240 - 20;
-  int prog = barW - (int)((long)barW * elapsed / JUMP_TIMEOUT_MS);
-  prog = constrain(prog, 0, barW);
-  int dx = (DISP_W - 240) / 2;
-  int dy = (DISP_H - 100) / 2;
-  lcd.fillRect(dx + 10, dy + 100 - 6, barW, 3, COL_GRAY_2);
-  lcd.fillRect(dx + 10, dy + 100 - 6, prog, 3, COL_GRAY_5);
-
+  // Update progress bar
+  unsigned long elapsed=millis()-jumpOpenMs;
+  int barW=240-20;
+  int prog=barW-(int)((long)barW*elapsed/JUMP_TIMEOUT_MS);
+  prog=constrain(prog,0,barW);
+  int dx=(DISP_W-240)/2, dy=(DISP_H-100)/2;
+  lcd.fillRect(dx+10,dy+100-6,barW,3,COL_GRAY_2);
+  lcd.fillRect(dx+10,dy+100-6,prog,3,COL_GRAY_5);
   esp_task_wdt_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  BOOT ANIMATION
+// ─────────────────────────────────────────────────────────────────────────────
+static const char GLITCH_CHARS[]="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789#@$%&*!?";
+static const int  GLITCH_CHAR_COUNT=sizeof(GLITCH_CHARS)-1;
+char glitchRandChar() { return GLITCH_CHARS[random(GLITCH_CHAR_COUNT)]; }
+
+void glitchScrambleText(const char* target, int cx, int cy,
+                        uint16_t col, int steps, int stepDelayMs) {
+  int len=strlen(target);
+  char buf[16]; memset(buf,0,sizeof(buf));
+  for (int step=0;step<=len;step++) {
+    for (int i=0;i<len;i++) buf[i]=(i<step)?target[i]:glitchRandChar();
+    buf[len]='\0';
+    lcd.fillRect(cx-70,cy-8,140,16,COL_BLACK);
+    lcd.setFont(&fonts::FreeSansBold9pt7b);
+    int tw=lcd.textWidth(buf);
+    lcd.setTextColor(col);
+    lcd.drawString(buf,cx-tw/2,cy-7);
+    for (int r=0;r<stepDelayMs/10;r++) { delay(10); esp_task_wdt_reset(); }
+  }
+}
+
+void glitchBarsFlash(int count, int delayMs) {
+  for (int i=0;i<count;i++) {
+    int barY=random(DISP_H),barX=random(DISP_W-60);
+    int barW=random(30,120),barH=(random(10)>7)?5:2;
+    uint16_t barCol=(random(3)==0)?COL_GRAY_5:COL_GRAY_3;
+    lcd.fillRect(barX,barY,barW,barH,barCol);
+    delay(delayMs); esp_task_wdt_reset();
+    lcd.fillRect(barX,barY,barW,barH,COL_BLACK);
+  }
+}
+
+void glitchChromatic(const char* text, int cx, int cy, int offsetX,
+                     uint16_t colR, uint16_t colB) {
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  int tw=lcd.textWidth(text);
+  lcd.setTextColor(colR); lcd.drawString(text,cx-tw/2-offsetX,cy-7);
+  lcd.setTextColor(colB); lcd.drawString(text,cx-tw/2+offsetX,cy-7);
+}
+
+void bootLogRow(int y, const char* label, const char* value, uint16_t valCol) {
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString(label,8,y);
+  int lx=8+lcd.textWidth(label)+2;
+  for (int dx=lx;dx<230;dx+=4) lcd.drawPixel(dx,y+5,COL_GRAY_2);
+  lcd.setTextColor(valCol); lcd.drawString(value,234,y);
+  esp_task_wdt_reset();
+}
+
+void bootLogSection(int y, const char* title) {
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString(title,8,y);
+  lcd.drawFastHLine(8,y+9,DISP_W-16,COL_GRAY_2);
+}
+
+void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
+                     bool xclkOK, uint32_t xclkHz) {
+  lcd.fillScreen(COL_BLACK);
+  int cx=DISP_W/2,cy=DISP_H/2-10;
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  char scramBuf[10];
+  for (int i=0;i<8;i++) scramBuf[i]=glitchRandChar();
+  scramBuf[8]='\0';
+  int tw0=lcd.textWidth(scramBuf);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString(scramBuf,cx-tw0/2,cy-7);
+  delay(80); esp_task_wdt_reset();
+  glitchBarsFlash(6,15);
+  glitchScrambleText("SANZXCAM",cx,cy,COL_GRAY_C,8,50);
+  glitchChromatic("SANZXCAM",cx,cy,3,0xF000,0x001F);
+  delay(60); esp_task_wdt_reset();
+  lcd.fillRect(cx-72,cy-10,144,20,COL_BLACK);
+  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
+  int tw1=lcd.textWidth("SANZXCAM");
+  lcd.drawString("SANZXCAM",cx-tw1/2,cy-7);
+  delay(400); esp_task_wdt_reset();
+  glitchBarsFlash(4,20);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_5);
+  const char* sub="ESP32-S3  CAMERA SYSTEM";
+  lcd.drawString(sub,cx-lcd.textWidth(sub)/2,cy+10);
+  lcd.setTextColor(COL_GRAY_3);
+  const char* ver="v5.9-fix3";
+  lcd.drawString(ver,cx-lcd.textWidth(ver)/2,cy+22);
+  lcd.drawFastHLine(cx-80,cy+32,160,COL_GRAY_2);
+  delay(600); esp_task_wdt_reset();
+  glitchBarsFlash(3,25);
+  glitchChromatic("SANZXCAM",cx,cy,2,0xA000,0x000F);
+  delay(40); esp_task_wdt_reset();
+  lcd.fillRect(cx-72,cy-10,144,20,COL_BLACK);
+  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
+  lcd.drawString("SANZXCAM",cx-tw1/2,cy-7);
+  delay(800); esp_task_wdt_reset();
+  for (int stripe=0;stripe<DISP_H;stripe+=8) {
+    lcd.fillRect(0,stripe,DISP_W,8,COL_BLACK); delay(10); esp_task_wdt_reset();
+  }
+
+  lcd.fillScreen(COL_BLACK);
+  lcd.fillRect(0,0,DISP_W,14,COL_GRAY_D);
+  lcd.drawFastHLine(0,14,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_7); lcd.drawString("SANZXCAM",8,3);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix3",DISP_W-52,3);
+  lcd.setTextColor(COL_GRAY_2); lcd.drawString("boot sequence",cx-32,3);
+  delay(80); esp_task_wdt_reset();
+
+  int y=20;
+  bootLogSection(y,"CAMERA"); y+=13;
+  bootLogRow(y,"SENSOR PID",
+             pidOK?(pid==PID_GC2145?"0x2145  GC2145":"0x3660  OV3660"):"NOT FOUND",
+             pidOK?COL_GRAY_E:COL_GRAY_5);
+  delay(100); y+=10; esp_task_wdt_reset();
+  char xclkBuf[20];
+  snprintf(xclkBuf,sizeof(xclkBuf),"%uMHz  %s",xclkHz/1000000,xclkOK?"OK":"ERR");
+  bootLogRow(y,"XCLK",xclkBuf,xclkOK?COL_GRAY_E:COL_GRAY_5);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"RESOLUTION","320x240  QVGA",COL_GRAY_7);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"FORMAT",
+             (detectedSensor==PID_GC2145&&gc2145CaptureFormat==GFMT_BMP)
+             ?"RGB565  BMP":"RGB565  JPG",COL_GRAY_7);
+  delay(100); y+=10; esp_task_wdt_reset();
+
+  y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=2;
+  bootLogSection(y,"STORAGE"); y+=13;
+  char sdBuf[20];
+  if (sdOK) snprintf(sdBuf,sizeof(sdBuf),"OK  %lluMB",sdMB);
+  else       snprintf(sdBuf,sizeof(sdBuf),"NOT FOUND");
+  bootLogRow(y,"SD CARD",sdBuf,sdOK?COL_GRAY_E:COL_GRAY_5);
+  delay(100); y+=10; esp_task_wdt_reset();
+  if (sdOK) {
+    bootLogRow(y,"FILESYSTEM","FAT32",COL_GRAY_7);
+    delay(100); y+=10; esp_task_wdt_reset();
+    char photoBuf[16]; snprintf(photoBuf,sizeof(photoBuf),"%04d files",photoCount);
+    bootLogRow(y,"PHOTOS",photoBuf,COL_GRAY_7);
+    delay(100); y+=10; esp_task_wdt_reset();
+
+    // Cek wifi.ini & gemini.ini
+    FILE* wf=fopen(WIFI_INI_PATH,"r");
+    FILE* gf=fopen(GEMINI_INI_PATH,"r");
+    bool wifiFileOK=(wf!=nullptr); if (wf) fclose(wf);
+    bool geminiFileOK=(gf!=nullptr); if (gf) fclose(gf);
+    bootLogRow(y,"wifi.ini",wifiFileOK?"found":"not found (created)",
+               wifiFileOK?COL_GRAY_7:COL_GRAY_3);
+    delay(100); y+=10; esp_task_wdt_reset();
+    bootLogRow(y,"gemini.ini",geminiFileOK?"found":"not found (created)",
+               geminiFileOK?COL_GRAY_7:COL_GRAY_3);
+    delay(100); y+=10; esp_task_wdt_reset();
+  }
+
+  y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=2;
+  bootLogSection(y,"SYSTEM"); y+=13;
+  bootLogRow(y,"CPU FREQ","240MHz  OK",COL_GRAY_E);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"PSRAM",psramFound()?"8MB  OK":"NOT FOUND",
+             psramFound()?COL_GRAY_E:COL_GRAY_5);
+  delay(100); y+=10; esp_task_wdt_reset();
+  char heapBuf[16]; snprintf(heapBuf,sizeof(heapBuf),"%uKB",(unsigned)(ESP.getFreeHeap()/1024));
+  bootLogRow(y,"HEAP FREE",heapBuf,COL_GRAY_7);
+  delay(100); y+=10; esp_task_wdt_reset();
+
+  y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=2;
+  bootLogSection(y,"BUILD"); y+=13;
+  bootLogRow(y,"VERSION","v5.9-fix3",COL_GRAY_7);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"AI DESCRIBE","Gemini Vision  D-long",COL_AI_ACCENT);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"FACE DETECT","tetap ada  D-short VF",COL_GRAY_E);
+  delay(100); y+=10; esp_task_wdt_reset();
+
+  y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=4;
+  int barX=8,barW=DISP_W-16,barH=3;
+  lcd.fillRect(barX,y,barW,barH,COL_GRAY_2);
+  lcd.drawRect(barX,y,barW,barH,COL_GRAY_3);
+  for (int i=0;i<=barW;i+=3) {
+    lcd.fillRect(barX,y+1,i,barH-2,COL_GRAY_7);
+    if (i%15==0) { delay(8); esp_task_wdt_reset(); }
+  }
+  lcd.fillRect(barX,y+1,barW,barH-2,COL_GRAY_C);
+  y+=barH+4;
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
+  const char* readyMsg="READY";
+  lcd.drawString(readyMsg,cx-lcd.textWidth(readyMsg)/2,y);
+  delay(600); esp_task_wdt_reset();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  USB mode screen
+// ─────────────────────────────────────────────────────────────────────────────
+void drawUSBIcon(int cx,int cy,uint16_t col) {
+  lcd.drawFastVLine(cx,cy-24,28,col);
+  lcd.drawCircle(cx,cy-27,4,col);
+  lcd.drawFastHLine(cx-18,cy-12,36,col);
+  lcd.drawFastVLine(cx-18,cy-12,12,col);
+  lcd.drawCircle(cx-18,cy+2,4,col);
+  lcd.drawFastVLine(cx+18,cy-12,10,col);
+  lcd.drawRect(cx+13,cy-2,10,7,col);
+}
+
+void drawUSBModeScreen() {
+  lcd.fillScreen(COL_BLACK);
+  lcd.fillRect(0,0,DISP_W,18,COL_GRAY_D);
+  lcd.drawFastHLine(0,18,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix3",DISP_W-52,4);
+  drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
+  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
+  lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("to host via USB",(DISP_W-lcd.textWidth("to host via USB"))/2,136);
+  lcd.drawFastHLine(40,150,DISP_W-80,COL_GRAY_2);
+  auto infoRow=[&](int y,const char* key,const char* val) {
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5); lcd.drawString(key,44,y);
+    lcd.setTextColor(COL_GRAY_C); lcd.drawString(val,DISP_W-44-lcd.textWidth(val),y);
+  };
+  char buf[32];
+  infoRow(156,"SENSOR",sensorName);
+  if (sdSizeMB<1024) snprintf(buf,sizeof(buf),"%lluMB  FAT32",sdSizeMB);
+  else               snprintf(buf,sizeof(buf),"%lluGB  FAT32",sdSizeMB/1024);
+  infoRow(170,"STORAGE",buf);
+  snprintf(buf,sizeof(buf),"%04d files",photoCount);
+  infoRow(184,"PHOTOS",buf);
+  lcd.fillRect(0,DISP_H-18,DISP_W,18,COL_GRAY_D);
+  lcd.drawFastHLine(0,DISP_H-18,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("eject from host first",(DISP_W-lcd.textWidth("eject from host first"))/2,DISP_H-15);
+  lcd.drawRoundRect((DISP_W/2)-68,DISP_H-32,136,13,2,COL_GRAY_3);
+  lcd.drawString("[ BOOT ]  exit usb mode",(DISP_W-lcd.textWidth("[ BOOT ]  exit usb mode"))/2,DISP_H-30);
+}
+
+void enterUSBMode() {
+  if (!sdReady) return;
+  if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+  islandForceHide();
+  unmountVFSOnly(); sdReady=false;
+  WiFi.disconnect(true);  // matikan WiFi saat USB mode
+  esp_task_wdt_reset(); msc.mediaPresent(true); esp_task_wdt_reset();
+  drawUSBModeScreen();
+  usbModeActive=true;
+  blinkLED(3,200,100); resetAllButtons();
+}
+
+void exitUSBMode() {
+  usbModeActive=false; msc.mediaPresent(false); esp_task_wdt_reset();
+  lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
+  sdReady=remountVFSOnly();
+  if (sdReady) {
+    scanPhotoCount();
+    loadSettings();
+    applyExpPreset(expPreset);
+    lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
+    char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
+    lcd.setTextColor(COL_GRAY_C); lcd.drawString(buf,(DISP_W-lcd.textWidth(buf))/2,DISP_H/2-6);
+  } else {
+    lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("sd mount failed",(DISP_W-lcd.textWidth("sd mount failed"))/2,DISP_H/2-6);
+  }
+  esp_task_wdt_reset(); blinkLED(2,150,100); delay(1000);
+  lcd.fillScreen(COL_BLACK); resetAllButtons();
+  appMode=MODE_VIEWFINDER;
+  fpsLastTime=millis(); fpsFrameCount=0; fpsValue=0.0f;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2643,52 +2918,52 @@ void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.9-fix2 ===");
-  Serial.println("[SETTINGS] akan load dari /sdcard/settings.ini");
-  Serial.println("[JUMP] BOOT-long di gallery = jump-to-number");
+  Serial.println("\n=== Sanzxcam v5.9-fix3 ===");
+  Serial.println("[AI] Gemini Vision — D long-press di Photo View");
+  Serial.println("[WIFI] config dari /sdcard/wifi.ini");
+  Serial.println("[GEMINI] config dari /sdcard/gemini.ini");
 
-  galleryFiles    = (char(*)[32])     ps_malloc(GALLERY_MAX_FILES * 32);
-  galleryFileType = (GalleryFileType*)ps_malloc(GALLERY_MAX_FILES * sizeof(GalleryFileType));
-  if (!galleryFiles || !galleryFileType) {
-    Serial.println("PSRAM alloc failed!"); ESP.restart();
-  }
+  galleryFiles   =(char(*)[32])     ps_malloc(GALLERY_MAX_FILES*32);
+  galleryFileType=(GalleryFileType*)ps_malloc(GALLERY_MAX_FILES*sizeof(GalleryFileType));
+  if (!galleryFiles||!galleryFileType) { Serial.println("PSRAM alloc failed!"); ESP.restart(); }
 
-  pinMode(LED_PIN,   OUTPUT); digitalWrite(LED_PIN,   LOW);
-  pinMode(LED_FLASH, OUTPUT); digitalWrite(LED_FLASH, LOW);
-  pinMode(BTN_BOOT,  INPUT_PULLUP);
-  pinMode(BTN_B,     INPUT_PULLUP);
-  pinMode(BTN_C,     INPUT_PULLUP);
-  pinMode(BTN_D,     INPUT_PULLUP);
+  pinMode(LED_PIN,  OUTPUT); digitalWrite(LED_PIN,  LOW);
+  pinMode(LED_FLASH,OUTPUT); digitalWrite(LED_FLASH,LOW);
+  pinMode(BTN_BOOT, INPUT_PULLUP);
+  pinMode(BTN_B,    INPUT_PULLUP);
+  pinMode(BTN_C,    INPUT_PULLUP);
+  pinMode(BTN_D,    INPUT_PULLUP);
 
   setCpuFrequencyMhz(240);
   lcd.init(); lcd.setRotation(3); lcd.fillScreen(COL_BLACK);
 
-  static uint16_t touchCalData[8] = {3851,3630,673,3277,3965,160,772,136};
+  static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
 
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tjpgdecOutput);
 
-  sdReady = mountSDFull();
+  sdReady=mountSDFull();
   if (sdReady) {
     scanPhotoCount();
     scanVideoCount();
     loadSettings();
+    // Cek/buat file config AI
+    loadWifiConfig();
+    loadGeminiConfig();
   }
 
   msc.vendorID("ESP32S3"); msc.productID("SD Card"); msc.productRevision("1.0");
   msc.onRead(onRead); msc.onWrite(onWrite);
-  msc.begin(sdTotalSectors > 0 ? sdTotalSectors : 0, 512);
+  msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
   msc.mediaPresent(false); USB.begin();
 
-  bool camOK = initCamera();
-  bool pidOK = (detectedSensor == PID_GC2145 || detectedSensor == PID_OV3660);
-  uint32_t xclkHz = (detectedSensor == PID_OV3660) ? 24000000 : 20000000;
+  bool camOK=initCamera();
+  bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
+  uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
 
-  if (camOK && sdReady) {
-    applyExpPreset(expPreset);
-  }
+  if (camOK&&sdReady) applyExpPreset(expPreset);
 
-  runBootSequence(sdReady, sdSizeMB, pidOK, detectedSensor, camOK, xclkHz);
+  runBootSequence(sdReady,sdSizeMB,pidOK,detectedSensor,camOK,xclkHz);
 
   if (!camOK) {
     lcd.fillScreen(COL_BLACK); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
@@ -2708,259 +2983,261 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt) {
   if (!evt.valid) { renderViewfinder(); return; }
-  if (evt.pin == BTN_BOOT) {
+  if (evt.pin==BTN_BOOT) {
     if (evt.isLong) { if (sdReady) enterUSBMode(); }
     else            { captureAndPreview(); }
   }
-  else if (evt.pin == BTN_B) {
+  else if (evt.pin==BTN_B) {
     if (evt.isShort) { if (recActive) stopRecording(); else startRecording(); }
     else             { openLedMenu(); }
   }
-  else if (evt.pin == BTN_C) {
+  else if (evt.pin==BTN_C) {
     if (evt.isLong) {
-      if (detectedSensor == PID_GC2145) openFormatMenu();
-      else islandPush(NOTIF_INFO, "FORMAT: hanya GC2145");
+      if (detectedSensor==PID_GC2145) openFormatMenu();
+      else islandPush(NOTIF_INFO,"FORMAT: hanya GC2145");
     } else {
       if (sdReady) {
         scanGalleryFiles();
-        gallerySelIdx = 0; galleryScroll = 0; galleryHoldDir = 0;
-        islandForceHide(); islandNoClear = false;
-        resetAllButtons(); appMode = MODE_GALLERY; drawGallery();
+        gallerySelIdx=0; galleryScroll=0; galleryHoldDir=0;
+        islandForceHide(); islandNoClear=false;
+        resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
       }
     }
   }
-  else if (evt.pin == BTN_D) {
+  else if (evt.pin==BTN_D) {
     if (evt.isShort) { toggleFaceDetect(); }
     else             { openExpMenu(); }
   }
 }
 
 void handleModeGallery(ButtonEvent evt) {
-  bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
-  if (cHeld && galleryHoldDir != -1) {
-    galleryHoldDir = -1; galleryHoldStart = millis();
-    galleryLastStep = millis(); galleryStep(-1); return;
+  bool cHeld=btnC.isHeld(), dHeld=btnD.isHeld();
+  if (cHeld&&galleryHoldDir!=-1) {
+    galleryHoldDir=-1; galleryHoldStart=millis();
+    galleryLastStep=millis(); galleryStep(-1); return;
   }
-  if (dHeld && galleryHoldDir != 1) {
-    galleryHoldDir = 1; galleryHoldStart = millis();
-    galleryLastStep = millis(); galleryStep(1); return;
+  if (dHeld&&galleryHoldDir!=1) {
+    galleryHoldDir=1; galleryHoldStart=millis();
+    galleryLastStep=millis(); galleryStep(1); return;
   }
-  if (!cHeld && !dHeld) galleryHoldDir = 0;
-  if (galleryHoldDir != 0) {
-    uint32_t held = millis() - galleryHoldStart;
-    uint32_t interval = (held < 500) ? 200 : (held < 1500) ? 100 : 50;
-    if (millis() - galleryLastStep >= interval) {
-      galleryStep(galleryHoldDir); galleryLastStep = millis();
+  if (!cHeld&&!dHeld) galleryHoldDir=0;
+  if (galleryHoldDir!=0) {
+    uint32_t held=millis()-galleryHoldStart;
+    uint32_t interval=(held<500)?200:(held<1500)?100:50;
+    if (millis()-galleryLastStep>=interval) {
+      galleryStep(galleryHoldDir); galleryLastStep=millis();
     }
     return;
   }
   if (!evt.valid) return;
-
-  if (evt.pin == BTN_BOOT) {
+  if (evt.pin==BTN_BOOT) {
     if (evt.isLong) {
-      if (galleryCount > 0) openJumpDialog();
-      else islandPush(NOTIF_WARN, "GALLERY KOSONG");
+      if (galleryCount>0) openJumpDialog();
+      else islandPush(NOTIF_WARN,"GALLERY KOSONG");
     } else if (evt.isShort) {
-      if (galleryCount > 0 && gallerySelIdx >= 0 && gallerySelIdx < galleryCount) {
-        GalleryFileType ft = galleryFileType[gallerySelIdx];
-        if (ft == GFILE_VIDEO) openMjpegPlayer(galleryFiles[gallerySelIdx]);
-        else                   showPhotoView(gallerySelIdx);
+      if (galleryCount>0&&gallerySelIdx>=0&&gallerySelIdx<galleryCount) {
+        GalleryFileType ft=galleryFileType[gallerySelIdx];
+        if (ft==GFILE_VIDEO) openMjpegPlayer(galleryFiles[gallerySelIdx]);
+        else                 showPhotoView(gallerySelIdx);
       }
     }
   }
-  else if (evt.pin == BTN_B && evt.isShort) {
-    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
-    galleryHoldDir = 0; islandForceHide(); resetAllButtons();
-    islandNoClear = true;
-    appMode = MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
-    fpsLastTime = millis(); fpsFrameCount = 0;
+  else if (evt.pin==BTN_B&&evt.isShort) {
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+    galleryHoldDir=0; islandForceHide(); resetAllButtons();
+    islandNoClear=true;
+    appMode=MODE_VIEWFINDER; lcd.fillScreen(COL_BLACK);
+    fpsLastTime=millis(); fpsFrameCount=0;
   }
 }
 
 void handleModePhotoView(ButtonEvent evt) {
-  static unsigned long lastPanTime = 0;
-  bool cHeld = btnC.isHeld(), dHeld = btnD.isHeld();
-  if (photoZoomLevel > 0 && (cHeld || dHeld) && millis() - lastPanTime > 120) {
-    float zf = photoZoomFactors[photoZoomLevel];
-    int maxOffX = max(0, (int)photoBufW - (int)(DISP_W / zf));
-    int maxOffY = max(0, (int)photoBufH - (int)(DISP_H / zf));
-    if (cHeld) photoZoomOffX = constrain(photoZoomOffX - PAN_STEP, 0, maxOffX);
-    if (dHeld) photoZoomOffX = constrain(photoZoomOffX + PAN_STEP, 0, maxOffX);
-    photoViewRender(); lastPanTime = millis(); return;
+  static unsigned long lastPanTime=0;
+  bool cHeld=btnC.isHeld(), dHeld=btnD.isHeld();
+  if (photoZoomLevel>0&&(cHeld||dHeld)&&millis()-lastPanTime>120) {
+    float zf=photoZoomFactors[photoZoomLevel];
+    int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
+    int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
+    if (cHeld) photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX);
+    if (dHeld) photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);
+    photoViewRender(); lastPanTime=millis(); return;
   }
   if (!evt.valid) return;
-  static unsigned long lastActionTime = 0;
-  if (millis() - lastActionTime < 150) return;
-  lastActionTime = millis();
+  static unsigned long lastActionTime=0;
+  if (millis()-lastActionTime<150) return;
+  lastActionTime=millis();
 
-  if (evt.pin == BTN_BOOT && evt.isShort) {
-    photoViewCaptionVisible = false; photoViewCaptionUntilMs = 0;
-    photoZoomLevel = 0; photoZoomOffX = 0; photoZoomOffY = 0;
-    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf = nullptr; }
-    resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
+  if (evt.pin==BTN_BOOT&&evt.isShort) {
+    photoViewCaptionVisible=false; photoViewCaptionUntilMs=0;
+    photoZoomLevel=0; photoZoomOffX=0; photoZoomOffY=0;
+    if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
+    resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return;
   }
-  if (evt.pin == BTN_B) {
+  if (evt.pin==BTN_B) {
     if (evt.isLong) { photoViewClearCaption(); openDeleteDialog(); }
     else {
-      photoZoomLevel = (photoZoomLevel + 1) % ZOOM_LEVELS;
-      photoZoomOffX = 0; photoZoomOffY = 0;
-      if (photoZoomLevel > 0) {
-        float zf = photoZoomFactors[photoZoomLevel];
-        int vpW = (int)(DISP_W / zf), vpH = (int)(DISP_H / zf);
-        photoZoomOffX = max(0, (int)photoBufW / 2 - vpW / 2);
-        photoZoomOffY = max(0, (int)photoBufH / 2 - vpH / 2);
+      photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
+      photoZoomOffX=0; photoZoomOffY=0;
+      if (photoZoomLevel>0) {
+        float zf=photoZoomFactors[photoZoomLevel];
+        int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
+        photoZoomOffX=max(0,(int)photoBufW/2-vpW/2);
+        photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
       }
       photoViewRender();
-      if (photoZoomLevel == 0) {
+      if (photoZoomLevel==0) {
         photoViewDrawCaption(photoViewIndex);
-        photoViewCaptionUntilMs = millis() + 2000; photoViewCaptionVisible = true;
+        photoViewCaptionUntilMs=millis()+2000; photoViewCaptionVisible=true;
       }
     }
     return;
   }
-  if (photoZoomLevel == 0) {
-    if (evt.pin == BTN_C && evt.isShort) photoViewPrev();
-    if (evt.pin == BTN_D && evt.isShort) photoViewNext();
+
+  // ← D long-press = AI Describe
+  if (evt.pin==BTN_D&&evt.isLong) {
+    if (!sdReady) { islandPush(NOTIF_WARN,"SD tidak tersedia"); return; }
+    photoViewClearCaption();
+    openAIDescribe(photoViewIndex);
+    return;
+  }
+
+  if (photoZoomLevel==0) {
+    if (evt.pin==BTN_C&&evt.isShort) photoViewPrev();
+    if (evt.pin==BTN_D&&evt.isShort) photoViewNext();
   } else {
-    float zf = photoZoomFactors[photoZoomLevel];
-    int maxOffX = max(0, (int)photoBufW - (int)(DISP_W / zf));
-    int maxOffY = max(0, (int)photoBufH - (int)(DISP_H / zf));
-    bool moved = false;
-    if (evt.pin == BTN_C) {
-      if (evt.isShort) { photoZoomOffX = constrain(photoZoomOffX - PAN_STEP, 0, maxOffX); moved = true; }
-      else             { photoZoomOffY = constrain(photoZoomOffY - PAN_STEP, 0, maxOffY); moved = true; }
+    float zf=photoZoomFactors[photoZoomLevel];
+    int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
+    int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
+    bool moved=false;
+    if (evt.pin==BTN_C) {
+      if (evt.isShort) { photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX); moved=true; }
+      else             { photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY); moved=true; }
     }
-    if (evt.pin == BTN_D) {
-      if (evt.isShort) { photoZoomOffX = constrain(photoZoomOffX + PAN_STEP, 0, maxOffX); moved = true; }
-      else             { photoZoomOffY = constrain(photoZoomOffY + PAN_STEP, 0, maxOffY); moved = true; }
+    if (evt.pin==BTN_D) {
+      if (evt.isShort) { photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX); moved=true; }
+      else             { photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY); moved=true; }
     }
     if (moved) photoViewRender();
   }
 }
 
 void handleModeMjpegPlayer(ButtonEvent evtBoot, ButtonEvent evtB,
-                            ButtonEvent evtC,    ButtonEvent evtD) {
-  static unsigned long lastToggleTime = 0;
-  if (evtBoot.valid) {
-    mjpegClose(); resetAllButtons(); appMode = MODE_GALLERY; drawGallery(); return;
+                            ButtonEvent evtC, ButtonEvent evtD) {
+  static unsigned long lastToggleTime=0;
+  if (evtBoot.valid) { mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); return; }
+  if (evtB.valid&&(millis()-lastToggleTime)>=200) {
+    mjpegPaused=!mjpegPaused;
+    mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY"); lastToggleTime=millis();
   }
-  if (evtB.valid && (millis() - lastToggleTime) >= 200) {
-    mjpegPaused = !mjpegPaused;
-    mjpegShowNotif(mjpegPaused ? "PAUSE" : "PLAY"); lastToggleTime = millis();
+  if (evtC.valid&&(millis()-lastToggleTime)>=200) {
+    mjpegLoop=!mjpegLoop;
+    mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF"); lastToggleTime=millis();
   }
-  if (evtC.valid && (millis() - lastToggleTime) >= 200) {
-    mjpegLoop = !mjpegLoop;
-    mjpegShowNotif(mjpegLoop ? "LOOP ON" : "LOOP OFF"); lastToggleTime = millis();
-  }
-  if (evtD.valid && (millis() - lastToggleTime) >= 200) {
-    mjpegSpeedIdx = (mjpegSpeedIdx + 1) % 3;
-    char spBuf[12]; snprintf(spBuf, sizeof(spBuf), "%.1f\xd7", (double)mjpegSpeeds[mjpegSpeedIdx]);
-    mjpegShowNotif(spBuf); lastToggleTime = millis();
+  if (evtD.valid&&(millis()-lastToggleTime)>=200) {
+    mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
+    char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
+    mjpegShowNotif(spBuf); lastToggleTime=millis();
   }
   loopMjpegPlayer();
 }
 
 void handleModeMenuLed(ButtonEvent evt) {
   if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT) {
-    ledFlashEnabled = (menuLedSel == 0);
-    islandPush(NOTIF_FLASH, ledFlashEnabled ? "FLASH ON" : "FLASH OFF");
+  if (evt.pin==BTN_BOOT) {
+    ledFlashEnabled=(menuLedSel==0);
+    islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
     saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_B) {
+  else if (evt.pin==BTN_B) {
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_C || evt.pin == BTN_D) {
-    menuLedSel = (menuLedSel == 0) ? 1 : 0; drawLedMenu(menuLedSel);
-  }
+  else if (evt.pin==BTN_C||evt.pin==BTN_D) { menuLedSel=(menuLedSel==0)?1:0; drawLedMenu(menuLedSel); }
 }
 
 void handleModeMenuFormat(ButtonEvent evt) {
   if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT) {
-    gc2145CaptureFormat = (menuFormatSel == 0) ? GFMT_BMP : GFMT_JPG;
+  if (evt.pin==BTN_BOOT) {
+    gc2145CaptureFormat=(menuFormatSel==0)?GFMT_BMP:GFMT_JPG;
     char fbBuf[28];
-    snprintf(fbBuf, sizeof(fbBuf), "FORMAT: %s",
-             gc2145CaptureFormat == GFMT_BMP ? "BMP+stego" : "JPG+EXIF+stego");
-    islandPush(NOTIF_INFO, fbBuf);
+    snprintf(fbBuf,sizeof(fbBuf),"FORMAT: %s",
+             gc2145CaptureFormat==GFMT_BMP?"BMP+stego":"JPG+EXIF+stego");
+    islandPush(NOTIF_INFO,fbBuf);
     saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_B) {
+  else if (evt.pin==BTN_B) {
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_C || evt.pin == BTN_D) {
-    menuFormatSel = (menuFormatSel == 0) ? 1 : 0; drawFormatMenu(menuFormatSel);
-  }
+  else if (evt.pin==BTN_C||evt.pin==BTN_D) { menuFormatSel=(menuFormatSel==0)?1:0; drawFormatMenu(menuFormatSel); }
 }
 
 void handleModeMenuExp(ButtonEvent evt) {
   if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT) {
+  if (evt.pin==BTN_BOOT) {
     applyExpPreset((uint8_t)menuExpSel);
-    if (menuExpSel == 3) {
-      lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode = MODE_MENU_EXP_ADJ; return;
+    if (menuExpSel==3) {
+      lcd.fillScreen(COL_BLACK); resetAllButtons(); appMode=MODE_MENU_EXP_ADJ; return;
     }
-    char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[menuExpSel]);
-    islandPush(NOTIF_INFO, fbBuf);
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
+    islandPush(NOTIF_INFO,fbBuf);
     saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_B) {
+  else if (evt.pin==BTN_B) {
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER;
+    islandNoClear=true; appMode=MODE_VIEWFINDER;
   }
-  else if (evt.pin == BTN_C) { menuExpSel = (menuExpSel + 3) % 4; drawExpMenu(menuExpSel); }
-  else if (evt.pin == BTN_D) { menuExpSel = (menuExpSel + 1) % 4; drawExpMenu(menuExpSel); }
+  else if (evt.pin==BTN_C) { menuExpSel=(menuExpSel+3)%4; drawExpMenu(menuExpSel); }
+  else if (evt.pin==BTN_D) { menuExpSel=(menuExpSel+1)%4; drawExpMenu(menuExpSel); }
 }
 
 void handleModeMenuExpAdj(ButtonEvent evt) {
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb=esp_camera_fb_get();
   if (fb) {
-    if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H) {
-      int visH = DISP_H - 38;
-      for (int row = 0; row < visH; row++)
-        lcd.pushImage(0, row, DISP_W, 1, (uint16_t*)fb->buf + row * DISP_W);
+    if (fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H) {
+      int visH=DISP_H-38;
+      for (int row=0;row<visH;row++)
+        lcd.pushImage(0,row,DISP_W,1,(uint16_t*)fb->buf+row*DISP_W);
     }
     esp_camera_fb_return(fb);
   }
   drawExpAdjOverlay(); esp_task_wdt_reset();
   if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT) {
-    char fbBuf[24]; snprintf(fbBuf, sizeof(fbBuf), "MODE: %s", expPresetNames[3]);
-    islandPush(NOTIF_INFO, fbBuf);
+  if (evt.pin==BTN_BOOT) {
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[3]);
+    islandPush(NOTIF_INFO,fbBuf);
     saveSettings();
     lcd.fillScreen(COL_BLACK); resetAllButtons();
-    islandNoClear = true; appMode = MODE_VIEWFINDER; return;
+    islandNoClear=true; appMode=MODE_VIEWFINDER; return;
   }
-  bool changed = false;
-  int step = (expManualVal < 100) ? 10 : (expManualVal < 400) ? 25 : 50;
-  if (evt.pin == BTN_C) { expManualVal  = constrain(expManualVal  - step, 0, 1200); changed = true; }
-  if (evt.pin == BTN_D) { expManualVal  = constrain(expManualVal  + step, 0, 1200); changed = true; }
-  if (evt.pin == BTN_B) { expManualGain = (expManualGain + 1) % 31;                 changed = true; }
+  bool changed=false;
+  int step=(expManualVal<100)?10:(expManualVal<400)?25:50;
+  if (evt.pin==BTN_C) { expManualVal =constrain(expManualVal -step,0,1200); changed=true; }
+  if (evt.pin==BTN_D) { expManualVal =constrain(expManualVal +step,0,1200); changed=true; }
+  if (evt.pin==BTN_B) { expManualGain=(expManualGain+1)%31;                  changed=true; }
   if (changed) applyExpPreset(3);
 }
 
 void handleModeDialogDelete(ButtonEvent evt) {
-  unsigned long elapsed = millis() - deleteDialogOpenMs;
-  if (elapsed < DELETE_TIMEOUT_MS) {
-    int dw = 200, dx = (DISP_W - dw) / 2, dy = (DISP_H - 80) / 2;
-    int barW = 180;
-    int prog = barW - (int)((long)barW * elapsed / DELETE_TIMEOUT_MS);
-    prog = constrain(prog, 0, barW);
-    lcd.fillRect(dx + 10, dy + 70, barW, 3, COL_GRAY_3);
-    lcd.fillRect(dx + 10, dy + 70, prog, 3, COL_GRAY_7);
+  unsigned long elapsed=millis()-deleteDialogOpenMs;
+  if (elapsed<DELETE_TIMEOUT_MS) {
+    int dw=200,dx=(DISP_W-dw)/2,dy=(DISP_H-80)/2;
+    int barW=180;
+    int prog=barW-(int)((long)barW*elapsed/DELETE_TIMEOUT_MS);
+    prog=constrain(prog,0,barW);
+    lcd.fillRect(dx+10,dy+70,barW,3,COL_GRAY_3);
+    lcd.fillRect(dx+10,dy+70,prog,3,COL_GRAY_7);
   } else {
     resetAllButtons(); showPhotoView(photoViewIndex); return;
   }
   if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT) photoViewDeleteCurrent();
+  if (evt.pin==BTN_BOOT) photoViewDeleteCurrent();
   else { resetAllButtons(); showPhotoView(photoViewIndex); }
 }
 
@@ -2977,33 +3254,38 @@ void loop() {
   btnC.pollEvent(evtC);
   btnD.pollEvent(evtD);
 
-  ButtonEvent singleEvt = {};
-  if      (evtBoot.valid) singleEvt = evtBoot;
-  else if (evtB.valid)    singleEvt = evtB;
-  else if (evtC.valid)    singleEvt = evtC;
-  else if (evtD.valid)    singleEvt = evtD;
+  ButtonEvent singleEvt={};
+  if      (evtBoot.valid) singleEvt=evtBoot;
+  else if (evtB.valid)    singleEvt=evtB;
+  else if (evtC.valid)    singleEvt=evtC;
+  else if (evtD.valid)    singleEvt=evtD;
 
-  if (appMode == MODE_PHOTO_VIEW && photoViewCaptionVisible && millis() > photoViewCaptionUntilMs)
+  if (appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
   if (usbModeActive) { if (evtBoot.valid) exitUSBMode(); return; }
   if (recActive)     { if (evtB.valid) stopRecording(); else recordFrame(); return; }
 
   switch (appMode) {
-    case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                  break;
-    case MODE_GALLERY:       handleModeGallery(singleEvt);                     break;
-    case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                   break;
-    case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD);   break;
-    case MODE_MENU_LED:      handleModeMenuLed(singleEvt);                     break;
-    case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                     break;
-    case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                  break;
-    case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);                break;
-    case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                  break;
-    case MODE_JUMP_INPUT:    handleModeJumpInput(evtBoot,evtB,evtC,evtD);      break;
+    case MODE_VIEWFINDER:    handleModeViewfinder(singleEvt);                break;
+    case MODE_GALLERY:       handleModeGallery(singleEvt);                   break;
+    case MODE_PHOTO_VIEW:    handleModePhotoView(singleEvt);                 break;
+    case MODE_MJPEG_PLAYER:  handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
+    case MODE_MENU_LED:      handleModeMenuLed(singleEvt);                   break;
+    case MODE_MENU_EXP:      handleModeMenuExp(singleEvt);                   break;
+    case MODE_MENU_EXP_ADJ:  handleModeMenuExpAdj(singleEvt);                break;
+    case MODE_DIALOG_DELETE: handleModeDialogDelete(singleEvt);              break;
+    case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                break;
+    case MODE_JUMP_INPUT:    handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
+    case MODE_AI_DESCRIBE:   handleModeAIDescribe(evtB,evtC,evtD);           break;
+    case MODE_AI_NO_CONFIG:  handleModeAINoConfig(evtB);                     break;
   }
 
-  if (appMode != MODE_VIEWFINDER && appMode != MODE_JUMP_INPUT) {
-    islandNoClear = false;
+  if (appMode!=MODE_VIEWFINDER &&
+      appMode!=MODE_JUMP_INPUT &&
+      appMode!=MODE_AI_DESCRIBE &&
+      appMode!=MODE_AI_NO_CONFIG) {
+    islandNoClear=false;
     islandTick();
   }
 }
