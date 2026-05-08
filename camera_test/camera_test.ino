@@ -1,41 +1,41 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.9-fix3
+ * Version: v5.9-fix4
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.9-fix3 (di atas v5.9-fix2):
+ *  CHANGELOG v5.9-fix4 (di atas v5.9-fix3):
  *
- *  [AI-DESCRIBE] Fitur deskripsi foto via Google Gemini Vision API
- *    - Trigger: D long-press di MODE_PHOTO_VIEW
- *    - Model  : gemini-2.5-flash (gratis 250 req/hari)
- *    - Config : /sdcard/gemini.ini  → key=AIzaXXXX
- *    - Config : /sdcard/wifi.ini    → ssid=... / pass=...
- *    - Jika file belum ada → dibuat otomatis template + instruksi LCD
- *    - Hasil deskripsi ditampilkan dengan word-wrap di LCD
- *    - C=scroll up, D=scroll down, B=kembali ke photo view
- *    - Foto BMP di-convert ke JPEG dulu sebelum dikirim (hemat token)
- *    - Base64 encode dilakukan in-place dari PSRAM
+ *  [MULTI-KEY] Support hingga 5 Gemini API key sekaligus
+ *    - Format gemini.ini: key1=AIza...  key2=AIza...  dst
+ *    - Auto-fallback ke key berikutnya jika HTTP 403 / 429
+ *    - key aktif di-cache, tidak reset tiap request
+ *    - Serial log tiap key attempt
  *
- *  [WIFI-SD] WiFi config dari SD card
- *    - File /sdcard/wifi.ini dibuat otomatis jika belum ada
- *    - loadWifiConfig() dipanggil saat AI Describe pertama kali
- *    - Koneksi WiFi di-cache, tidak reconnect jika sudah tersambung
+ *  [KEY-MANAGER] Menu manajemen API key dari dalam kamera
+ *    - Trigger: di MODE_AI_NO_CONFIG → tombol D long-press
+ *    - Bisa tambah / hapus key langsung dari kamera
+ *    - Tulis ulang gemini.ini di SD card
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.9-fix2:
- *  [SETTINGS] Simpan/load preferensi ke /sdcard/settings.ini
- *  [JUMP]     Jump-to-number di Gallery (BOOT long-press)
- *  [STEGO]    Steganografi JPEG & BMP
- *  [EXIF]     Inject EXIF ke JPEG
- *  [FACE]     Human face detection (tetap ada)
- *  [FORMAT]   Pilih format GC2145: JPG atau BMP
+ *  TETAP dari v5.9-fix3:
+ *  [AI-DESCRIBE] Deskripsi foto via Google Gemini Vision API
+ *  [WIFI-SD]     WiFi config dari SD card
+ *  [SETTINGS]    Simpan/load preferensi ke /sdcard/settings.ini
+ *  [JUMP]        Jump-to-number di Gallery (BOOT long-press)
+ *  [STEGO]       Steganografi JPEG & BMP
+ *  [EXIF]        Inject EXIF ke JPEG
+ *  [FACE]        Human face detection
+ *  [FORMAT]      Pilih format GC2145: JPG atau BMP
  * ═══════════════════════════════════════════════════════════════
  *
  * UI THEME : Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY  : ILI9341 2.4" 320x240 landscape
  *
- * LIBRARY TAMBAHAN (install via Arduino Library Manager):
+ * LIBRARY (install via Arduino Library Manager):
  *   - ArduinoJson by Benoit Blanchon  (v6.x)
+ *   - LovyanGFX
+ *   - TJpg_Decoder
+ *   - JPEGDEC
  */
 
 #include "esp_camera.h"
@@ -195,6 +195,7 @@ static LGFX lcd;
 #define COL_VID_ACCENT  0x6000
 #define COL_JPG_ACCENT  0x3186
 #define COL_AI_ACCENT   0x07E0   // hijau untuk AI
+#define COL_AI_WARN     0xFD20   // oranye untuk warning
 
 #define PID_GC2145 0x2145
 #define PID_OV3660 0x3660
@@ -230,8 +231,9 @@ enum AppMode {
   MODE_DIALOG_DELETE,
   MODE_MENU_FORMAT,
   MODE_JUMP_INPUT,
-  MODE_AI_DESCRIBE,     // ← baru v5.9-fix3
-  MODE_AI_NO_CONFIG,    // ← baru v5.9-fix3: tampil instruksi setup
+  MODE_AI_DESCRIBE,
+  MODE_AI_NO_CONFIG,
+  MODE_KEY_MANAGER,     // ← baru v5.9-fix4: kelola API key dari kamera
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
@@ -245,7 +247,7 @@ enum GC2145Format : uint8_t {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WiFi & Gemini AI config  [WIFI-SD] [AI]
+//  WiFi & Gemini AI config  [WIFI-SD] [AI] [MULTI-KEY]
 // ─────────────────────────────────────────────────────────────────────────────
 #define WIFI_INI_PATH    "/sdcard/wifi.ini"
 #define GEMINI_INI_PATH  "/sdcard/gemini.ini"
@@ -254,14 +256,32 @@ enum GC2145Format : uint8_t {
 #define AI_LINE_MAX       28
 #define AI_LINE_W         56
 
-static char wifiSSID[64]               = "";
-static char wifiPass[64]               = "";
-static char geminiApiKey[80]           = "";
-static char aiResult[AI_RESULT_MAX+1]  = "";
-static bool aiDescribeBusy             = false;
-static char aiLines[AI_LINE_MAX][AI_LINE_W] = {};
-static int  aiTotalLines               = 0;
-static int  aiScrollLine               = 0;
+// Multi API Key
+#define GEMINI_KEY_MAX    5
+
+static char wifiSSID[64]                      = "";
+static char wifiPass[64]                      = "";
+static char geminiApiKeys[GEMINI_KEY_MAX][80] = {};
+static int  geminiKeyCount                    = 0;
+static int  geminiKeyActive                   = 0;   // index key aktif terakhir sukses
+static char aiResult[AI_RESULT_MAX+1]         = "";
+static bool aiDescribeBusy                    = false;
+static char aiLines[AI_LINE_MAX][AI_LINE_W]   = {};
+static int  aiTotalLines                      = 0;
+static int  aiScrollLine                      = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KEY MANAGER STATE  [KEY-MANAGER]
+// ─────────────────────────────────────────────────────────────────────────────
+// Kamera tidak punya keyboard, jadi key manager hanya bisa:
+//  - Melihat daftar key yang ada (masked: AIza...XXXX)
+//  - Menghapus key tertentu
+//  - Menyimpan kembali ke SD card
+// Untuk MENAMBAH key baru → tetap harus edit gemini.ini via PC
+// (ditampilkan instruksinya di layar)
+
+static int  kmSelIdx     = 0;   // index key yang dipilih di key manager
+static bool kmDirty      = false; // ada perubahan yang belum disimpan
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
@@ -550,7 +570,7 @@ void saveSettings() {
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) return;
-  fprintf(f, "# Sanzxcam v5.9-fix3 settings\n");
+  fprintf(f, "# Sanzxcam v5.9-fix4 settings\n");
   fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
   fprintf(f, "exp_preset=%d\n", (int)expPreset);
   fprintf(f, "exp_val=%d\n",    expManualVal);
@@ -576,7 +596,7 @@ void loadSettings() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WIFI & GEMINI CONFIG LOADER  [WIFI-SD]
+//  WIFI & GEMINI CONFIG LOADER  [WIFI-SD] [MULTI-KEY]
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void createFileTemplate(const char* path, const char* content) {
@@ -587,7 +607,6 @@ static void createFileTemplate(const char* path, const char* content) {
   Serial.printf("[CFG] template dibuat: %s\n", path);
 }
 
-// Kembalikan true jika berhasil load & bukan template default
 bool loadWifiConfig() {
   FILE* f = fopen(WIFI_INI_PATH, "r");
   if (!f) {
@@ -611,34 +630,105 @@ bool loadWifiConfig() {
   return gotSSID && gotPass;
 }
 
-// Kembalikan true jika berhasil load & bukan template default
+// ─────────────────────────────────────────────────────────────────────────────
+//  loadGeminiConfig — baca key1..key5 dari gemini.ini
+// ─────────────────────────────────────────────────────────────────────────────
 bool loadGeminiConfig() {
   FILE* f = fopen(GEMINI_INI_PATH, "r");
   if (!f) {
     createFileTemplate(GEMINI_INI_PATH,
-      "# Gemini API Key untuk Sanzxcam AI Describe\n"
+      "# Gemini API Keys untuk Sanzxcam AI Describe\n"
+      "# Bisa isi hingga 5 key, auto-fallback jika 403/429\n"
       "# Dapatkan key GRATIS di: aistudio.google.com\n"
       "# Login Google -> Get API Key -> Create API Key\n"
-      "# Salin key (format: AIza...) ke baris di bawah\n"
-      "key=AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n");
+      "# Format:\n"
+      "key1=AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n"
+      "key2=\n"
+      "key3=\n"
+      "key4=\n"
+      "key5=\n");
     return false;
   }
-  char line[128]; bool gotKey=false;
+
+  geminiKeyCount  = 0;
+  geminiKeyActive = 0;
+  memset(geminiApiKeys, 0, sizeof(geminiApiKeys));
+
+  char line[128];
   while (fgets(line, sizeof(line), f)) {
     if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
-    char val[80]="";
-    if (sscanf(line,"key=%79[^\r\n]",val)==1) {
-      strncpy(geminiApiKey,val,79);
-      gotKey=true;
+    if (geminiKeyCount >= GEMINI_KEY_MAX) break;
+
+    char val[80] = "";
+    for (int ki = 1; ki <= GEMINI_KEY_MAX; ki++) {
+      char pattern[16];
+      snprintf(pattern, sizeof(pattern), "key%d=%%79[^\r\n]", ki);
+      if (sscanf(line, pattern, val) == 1) {
+        // Trim whitespace
+        int vlen = strlen(val);
+        while (vlen > 0 && (val[vlen-1]==' '||val[vlen-1]=='\t')) { val[--vlen]='\0'; }
+        // Validasi: minimal panjang 20, bukan template
+        if (vlen >= 20 && strncmp(val,"AIzaXXXX",8)!=0) {
+          strncpy(geminiApiKeys[geminiKeyCount], val, 79);
+          geminiApiKeys[geminiKeyCount][79] = '\0';
+          geminiKeyCount++;
+          Serial.printf("[GEMINI] key%d loaded: %.12s...\n", geminiKeyCount, val);
+        }
+        break;
+      }
     }
   }
   fclose(f);
-  if (strncmp(geminiApiKey,"AIzaXXXX",8)==0) return false;
-  Serial.printf("[GEMINI] key loaded (len=%d)\n", strlen(geminiApiKey));
-  return gotKey;
+  if (geminiKeyCount == 0) return false;
+  Serial.printf("[GEMINI] total %d key valid\n", geminiKeyCount);
+  return true;
 }
 
-// Tampilkan layar instruksi setup jika config belum ada/diisi
+// ─────────────────────────────────────────────────────────────────────────────
+//  saveGeminiConfig — tulis kembali gemini.ini dari array geminiApiKeys
+// ─────────────────────────────────────────────────────────────────────────────
+bool saveGeminiConfig() {
+  if (!sdReady) return false;
+  FILE* f = fopen(GEMINI_INI_PATH, "w");
+  if (!f) return false;
+  fprintf(f, "# Gemini API Keys untuk Sanzxcam AI Describe\n");
+  fprintf(f, "# Bisa isi hingga 5 key, auto-fallback jika 403/429\n");
+  fprintf(f, "# Dapatkan key GRATIS di: aistudio.google.com\n");
+  fprintf(f, "# Login Google -> Get API Key -> Create API Key\n");
+  fprintf(f, "# Format:\n");
+  for (int i = 0; i < GEMINI_KEY_MAX; i++) {
+    if (i < geminiKeyCount && strlen(geminiApiKeys[i]) > 0) {
+      fprintf(f, "key%d=%s\n", i+1, geminiApiKeys[i]);
+    } else {
+      fprintf(f, "key%d=\n", i+1);
+    }
+  }
+  fclose(f);
+  Serial.printf("[GEMINI] gemini.ini disimpan (%d key)\n", geminiKeyCount);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Helper: mask API key untuk tampilan (AIza...XXXX)
+// ─────────────────────────────────────────────────────────────────────────────
+static void maskApiKey(const char* key, char* out, int outLen) {
+  int len = strlen(key);
+  if (len == 0) {
+    strncpy(out, "(kosong)", outLen-1);
+    return;
+  }
+  if (len <= 12) {
+    // Key terlalu pendek, tampilkan sebagian
+    snprintf(out, outLen, "%.8s...", key);
+    return;
+  }
+  // Tampilkan 8 karakter pertama + ... + 4 karakter terakhir
+  snprintf(out, outLen, "%.8s...%s", key, key + len - 4);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Tampilkan layar instruksi setup jika config belum ada/diisi
+// ─────────────────────────────────────────────────────────────────────────────
 void drawAINoConfigScreen(bool missingWifi, bool missingGemini) {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
@@ -664,17 +754,214 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini) {
     lcd.setTextColor(COL_AI_ACCENT);
     lcd.drawString("/sdcard/gemini.ini",4,y); y+=11;
     lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("  key=AIzaXXXXXXXXXXXX",4,y); y+=11;
+    lcd.drawString("  key1=AIzaXXXXXXXXXXXX",4,y); y+=11;
+    lcd.drawString("  key2=AIzaXXXX  (opsional)",4,y); y+=11;
     lcd.setTextColor(COL_GRAY_3);
     lcd.drawString("  (dari aistudio.google.com)",4,y); y+=13;
   }
 
   lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=4;
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("Setelah diisi, pasang SD & restart.",4,y);
+  lcd.drawString("Setelah diisi, pasang SD & restart.",4,y); y+=12;
+
+  // Hint key manager
+  if (missingGemini && sdReady) {
+    lcd.setTextColor(COL_AI_ACCENT);
+    lcd.drawString("D-long = kelola key di kamera",4,y);
+  }
 
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("B=kembali",DISP_W-52,DISP_H-10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KEY MANAGER — Draw screen
+// ─────────────────────────────────────────────────────────────────────────────
+void drawKeyManagerScreen() {
+  lcd.fillScreen(COL_BLACK);
+
+  // Header
+  lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
+  lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_AI_ACCENT);
+  const char* title = "GEMINI KEY MANAGER";
+  lcd.drawString(title,(DISP_W-lcd.textWidth(title))/2,6);
+
+  if (kmDirty) {
+    lcd.setTextColor(COL_AI_WARN);
+    lcd.drawString("*UNSAVED*", DISP_W-58, 6);
+  }
+
+  int y = 24;
+
+  if (geminiKeyCount == 0) {
+    lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("Tidak ada key.", 8, y+10); y+=24;
+    lcd.setTextColor(COL_GRAY_3);
+    lcd.drawString("Edit gemini.ini di PC", 8, y); y+=12;
+    lcd.drawString("lalu restart kamera.", 8, y);
+  } else {
+    for (int i = 0; i < geminiKeyCount; i++) {
+      bool isSelected = (i == kmSelIdx);
+      bool isActive   = (i == geminiKeyActive);
+
+      uint16_t rowBg = isSelected ? COL_GRAY_5 : (i%2==0 ? COL_GRAY_D : COL_BLACK);
+      lcd.fillRect(0, y, DISP_W, 22, rowBg);
+
+      // Nomor key
+      char numBuf[4]; snprintf(numBuf, sizeof(numBuf), "k%d", i+1);
+      lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_5);
+      lcd.drawString(numBuf, 4, y+7);
+
+      // Key (masked)
+      char masked[32];
+      maskApiKey(geminiApiKeys[i], masked, sizeof(masked));
+      lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_C);
+      lcd.drawString(masked, 28, y+7);
+
+      // Badge: aktif
+      if (isActive) {
+        lcd.setTextColor(COL_AI_ACCENT);
+        lcd.drawString("*", DISP_W-16, y+7);
+      }
+
+      // Separator
+      lcd.drawFastHLine(0, y+22, DISP_W, COL_GRAY_2);
+      y += 23;
+    }
+  }
+
+  // Slot kosong tersisa
+  y = 24 + geminiKeyCount * 23;
+  if (geminiKeyCount < GEMINI_KEY_MAX) {
+    lcd.setTextColor(COL_GRAY_3);
+    char slotBuf[32];
+    snprintf(slotBuf, sizeof(slotBuf), "+ %d slot kosong (edit via PC)",
+             GEMINI_KEY_MAX - geminiKeyCount);
+    lcd.drawString(slotBuf, 4, y+4);
+    y += 20;
+  }
+
+  // Divider
+  lcd.drawFastHLine(0, DISP_H-40, DISP_W, COL_GRAY_2);
+
+  // Legenda
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("C/D=pilih", 4, DISP_H-35);
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString("B=set aktif", 80, DISP_H-35);
+  lcd.setTextColor(0xF800);  // merah
+  lcd.drawString("BOOT-long=hapus", 180, DISP_H-35);
+
+  lcd.drawFastHLine(0, DISP_H-22, DISP_W, COL_GRAY_2);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("BOOT=simpan&kembali", 4, DISP_H-18);
+  lcd.setTextColor(COL_GRAY_3);
+  lcd.drawString("D-long=batal", 190, DISP_H-18);
+
+  // Info: * = key aktif
+  lcd.setTextColor(COL_GRAY_2);
+  lcd.drawString("* = key aktif terakhir", 4, DISP_H-8);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KEY MANAGER — Hapus key pada index tertentu, geser sisanya
+// ─────────────────────────────────────────────────────────────────────────────
+void kmDeleteKey(int idx) {
+  if (idx < 0 || idx >= geminiKeyCount) return;
+  for (int i = idx; i < geminiKeyCount-1; i++) {
+    strncpy(geminiApiKeys[i], geminiApiKeys[i+1], 79);
+  }
+  memset(geminiApiKeys[geminiKeyCount-1], 0, 80);
+  geminiKeyCount--;
+  if (geminiKeyActive >= geminiKeyCount) geminiKeyActive = max(0, geminiKeyCount-1);
+  if (kmSelIdx >= geminiKeyCount) kmSelIdx = max(0, geminiKeyCount-1);
+  kmDirty = true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  KEY MANAGER — Mode handler
+// ─────────────────────────────────────────────────────────────────────────────
+void openKeyManager() {
+  kmSelIdx = 0;
+  kmDirty  = false;
+  drawKeyManagerScreen();
+  resetAllButtons();
+  appMode = MODE_KEY_MANAGER;
+}
+
+void handleModeKeyManager(ButtonEvent evtBoot, ButtonEvent evtB,
+                           ButtonEvent evtC, ButtonEvent evtD) {
+  bool redraw = false;
+
+  // C = ke atas
+  if (evtC.valid && evtC.isShort) {
+    if (geminiKeyCount > 0) {
+      kmSelIdx = (kmSelIdx - 1 + geminiKeyCount) % geminiKeyCount;
+      redraw = true;
+    }
+  }
+  // D short = ke bawah
+  if (evtD.valid && evtD.isShort) {
+    if (geminiKeyCount > 0) {
+      kmSelIdx = (kmSelIdx + 1) % geminiKeyCount;
+      redraw = true;
+    }
+  }
+  // B short = set key ini sebagai aktif
+  if (evtB.valid && evtB.isShort) {
+    if (geminiKeyCount > 0) {
+      geminiKeyActive = kmSelIdx;
+      char buf[28]; snprintf(buf, sizeof(buf), "Key %d diset aktif", kmSelIdx+1);
+      islandPush(NOTIF_INFO, buf);
+      redraw = true;
+    }
+  }
+  // BOOT long = hapus key yang dipilih
+  if (evtBoot.valid && evtBoot.isLong) {
+    if (geminiKeyCount > 0) {
+      char delBuf[28]; snprintf(delBuf, sizeof(delBuf), "Key %d dihapus", kmSelIdx+1);
+      kmDeleteKey(kmSelIdx);
+      islandPush(NOTIF_WARN, delBuf);
+      redraw = true;
+    }
+  }
+  // BOOT short = simpan & kembali
+  if (evtBoot.valid && evtBoot.isShort) {
+    if (kmDirty) {
+      bool ok = saveGeminiConfig();
+      islandPush(ok ? NOTIF_OK : NOTIF_WARN,
+                 ok ? "Key disimpan ke SD" : "Gagal simpan key");
+    }
+    kmDirty = false;
+    resetAllButtons();
+    // Kembali ke photo view jika dari sana
+    appMode = MODE_PHOTO_VIEW;
+    photoViewRender();
+    photoViewDrawCaption(photoViewIndex);
+    photoViewCaptionUntilMs = millis() + 2000;
+    photoViewCaptionVisible = true;
+    return;
+  }
+  // D long = batal tanpa simpan
+  if (evtD.valid && evtD.isLong) {
+    if (kmDirty) {
+      // Reload dari SD untuk rollback
+      loadGeminiConfig();
+      islandPush(NOTIF_INFO, "Perubahan dibatalkan");
+    }
+    kmDirty = false;
+    resetAllButtons();
+    appMode = MODE_PHOTO_VIEW;
+    photoViewRender();
+    photoViewDrawCaption(photoViewIndex);
+    photoViewCaptionUntilMs = millis() + 2000;
+    photoViewCaptionVisible = true;
+    return;
+  }
+
+  if (redraw) drawKeyManagerScreen();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -822,7 +1109,7 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn, size_t jpgLen,
   snprintf(strDesc,     sizeof(strDesc),     "photo_%04d", photoNum);
   snprintf(strMake,     sizeof(strMake),     "SANZXCAM");
   snprintf(strModel,    sizeof(strModel),    "%s", sensorStr ? sensorStr : "UNKNOWN");
-  snprintf(strSoftware, sizeof(strSoftware), "v5.9-fix3");
+  snprintf(strSoftware, sizeof(strSoftware), "v5.9-fix4");
   exifMakeTimestamp(strDt, sizeof(strDt));
   int lenDesc=strlen(strDesc)+1, lenMake=strlen(strMake)+1;
   int lenModel=strlen(strModel)+1, lenSoftware=strlen(strSoftware)+1, lenDt=20;
@@ -1453,7 +1740,6 @@ void photoViewRender() {
   lcd.drawString("BOOT=back",DISP_W-58,2);
   if (photoZoomLevel==0) {
     lcd.drawString("C=prev",2,DISP_H-10);
-    // Tampilkan hint D long = AI
     lcd.setTextColor(COL_AI_ACCENT);
     lcd.drawString("Dlong=AI",DISP_W-52,DISP_H-10);
   } else {
@@ -1988,7 +2274,7 @@ void applyExpPreset(uint8_t preset) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI DESCRIBE — BASE64 ENCODER  [AI]
+//  AI DESCRIBE — BASE64 ENCODER
 // ─────────────────────────────────────────────────────────────────────────────
 static void base64Encode(const uint8_t* in, size_t inLen, String& out) {
   static const char b64[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -2004,7 +2290,7 @@ static void base64Encode(const uint8_t* in, size_t inLen, String& out) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI DESCRIBE — WORD WRAP ke aiLines[]
+//  AI DESCRIBE — WORD WRAP
 // ─────────────────────────────────────────────────────────────────────────────
 void aiWrapText(const char* text) {
   aiTotalLines=0; aiScrollLine=0;
@@ -2063,8 +2349,6 @@ void aiWrapText(const char* text) {
 // ─────────────────────────────────────────────────────────────────────────────
 void drawAIDescribeScreen() {
   lcd.fillScreen(COL_BLACK);
-
-  // Header
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
   lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
@@ -2072,12 +2356,15 @@ void drawAIDescribeScreen() {
   const char* title="AI DESCRIBE";
   lcd.drawString(title,(DISP_W-lcd.textWidth(title))/2,6);
 
-  // Nama file
+  // Badge key aktif
+  char keyBadge[8]; snprintf(keyBadge,sizeof(keyBadge),"k%d/%d",geminiKeyActive+1,geminiKeyCount);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString(keyBadge, DISP_W-30, 6);
+
   lcd.setTextColor(COL_GRAY_5);
   char fname[36]; snprintf(fname,sizeof(fname),"[%s]",galleryFiles[photoViewIndex]);
   lcd.drawString(fname,(DISP_W-lcd.textWidth(fname))/2,22);
 
-  // Teks hasil (scroll)
   const int lineH=13, textStartY=34;
   const int visLines=(DISP_H-textStartY-14)/lineH;
   lcd.fillRect(0,textStartY,DISP_W,DISP_H-textStartY-14,COL_BLACK);
@@ -2089,7 +2376,6 @@ void drawAIDescribeScreen() {
     lcd.drawString(aiLines[lineIdx],4,textStartY+i*lineH);
   }
 
-  // Scrollbar
   if (aiTotalLines>visLines) {
     int barH=DISP_H-textStartY-14;
     int indH=max(8,barH*visLines/aiTotalLines);
@@ -2098,7 +2384,6 @@ void drawAIDescribeScreen() {
     lcd.fillRect(DISP_W-3,indY,3,indH,COL_GRAY_7);
   }
 
-  // Footer
   lcd.fillRect(0,DISP_H-12,DISP_W,12,COL_GRAY_D);
   lcd.drawFastHLine(0,DISP_H-12,DISP_W,COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_5);
@@ -2109,7 +2394,7 @@ void drawAIDescribeScreen() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI DESCRIBE — STATUS overlay (loading/error)
+//  AI DESCRIBE — STATUS overlay
 // ─────────────────────────────────────────────────────────────────────────────
 void drawAIStatus(const char* line1, const char* line2="") {
   int dw=260,dh=50,dx=(DISP_W-dw)/2,dy=(DISP_H-dh)/2;
@@ -2126,15 +2411,13 @@ void drawAIStatus(const char* line1, const char* line2="") {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI DESCRIBE — Baca file foto dari SD sebagai JPEG bytes
-//  BMP di-convert ke JPEG dulu agar lebih kecil dan hemat token
+//  AI DESCRIBE — Baca foto dari SD sebagai JPEG
 // ─────────────────────────────────────────────────────────────────────────────
 static uint8_t* aiLoadPhotoAsJpeg(int idx, size_t* outLen) {
   char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
   *outLen=0;
 
   if (gIsJpg(idx)) {
-    // Langsung baca JPEG
     FILE* f=fopen(path,"rb");
     if (!f) return nullptr;
     fseek(f,0,SEEK_END); size_t sz=ftell(f); fseek(f,0,SEEK_SET);
@@ -2148,15 +2431,10 @@ static uint8_t* aiLoadPhotoAsJpeg(int idx, size_t* outLen) {
   }
 
   if (gIsBmp(idx)) {
-    // Load BMP → pixel buf → convert ke JPEG
     uint16_t bw=0,bh=0;
     uint16_t* pixels=loadBMP(path,&bw,&bh);
     if (!pixels||bw==0||bh==0) return nullptr;
-
-    // Buat camera_fb_t dummy agar bisa pakai frame2jpg
-    // Sebenarnya kita punya raw RGB565, pakai img_converters langsung
     uint8_t* jpgOut=nullptr; size_t jpgLen=0;
-    // fmt2jpg untuk RGB565 → JPEG
     bool ok=fmt2jpg((uint8_t*)pixels,(size_t)bw*bh*2,bw,bh,PIXFORMAT_RGB565,80,&jpgOut,&jpgLen);
     free(pixels);
     if (!ok||!jpgOut) return nullptr;
@@ -2168,12 +2446,12 @@ static uint8_t* aiLoadPhotoAsJpeg(int idx, size_t* outLen) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI DESCRIBE — Main function: kirim foto ke Gemini, ambil deskripsi
+//  AI DESCRIBE — Main function dengan MULTI-KEY FALLBACK
 // ─────────────────────────────────────────────────────────────────────────────
 bool doAIDescribe(int idx) {
   // 1. Cek & load config
   bool wifiOK   = (wifiSSID[0]!='\0' && strcmp(wifiSSID,"NamaWiFiKamu")!=0);
-  bool geminiOK = (geminiApiKey[0]!='\0' && strncmp(geminiApiKey,"AIzaXXXX",8)!=0);
+  bool geminiOK = (geminiKeyCount > 0);
 
   if (!wifiOK)   wifiOK   = loadWifiConfig();
   if (!geminiOK) geminiOK = loadGeminiConfig();
@@ -2219,16 +2497,7 @@ bool doAIDescribe(int idx) {
   base64Encode(jpgBuf,jpgLen,b64);
   free(jpgBuf);
 
-  drawAIStatus("AI DESCRIBE","mengirim ke Gemini...");
-  esp_task_wdt_reset();
-
-  // 5. Build JSON — manual string build untuk hemat heap
-  //    Format: {"contents":[{"parts":[{"inline_data":{"mime_type":"image/jpeg","data":"BASE64"}},{"text":"..."}]}]}
-  String url = String(GEMINI_URL_BASE) + String(geminiApiKey);
-
-  // Buat body JSON
-  // Kita pakai DynamicJsonDocument secukupnya
-  // base64 bisa sangat besar, jadi kita pasang langsung ke string
+  // 5. Build JSON body (sekali, dipakai ulang semua key)
   String body;
   body.reserve(b64.length()+256);
   body  = "{\"contents\":[{\"parts\":[";
@@ -2239,41 +2508,92 @@ bool doAIDescribe(int idx) {
   body += "Jelaskan objek utama, warna dominan, suasana, dan konteks gambar. ";
   body += "Maksimal 4 kalimat, gunakan bahasa sederhana.\"}";
   body += "]}]}";
-  b64 = "";  // bebaskan memori
-
+  b64 = "";
   esp_task_wdt_reset();
 
-  // 6. HTTP POST
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.begin(client, url);
-  http.addHeader("Content-Type","application/json");
-  http.setTimeout(25000);
+  // 6. HTTP POST — loop semua key, fallback jika 403/429
+  int httpCode = 0;
+  String resp  = "";
 
-  esp_task_wdt_reset();
-  int httpCode=http.POST(body);
-  body="";  // bebaskan
-  esp_task_wdt_reset();
+  for (int ki = 0; ki < geminiKeyCount; ki++) {
+    // Mulai dari key aktif terakhir, lalu maju
+    int keyIdx = (geminiKeyActive + ki) % geminiKeyCount;
 
-  if (httpCode!=200) {
-    String errBody=http.getString();
-    Serial.printf("[GEMINI] HTTP %d: %s\n",httpCode,errBody.c_str());
-    char errBuf[32]; snprintf(errBuf,sizeof(errBuf),"HTTP error %d",httpCode);
-    drawAIStatus(errBuf,"cek key di gemini.ini");
-    http.end(); delay(3000); return false;
+    // Status message — tampilkan nomor key jika lebih dari 1
+    char statusMsg[48];
+    if (geminiKeyCount > 1)
+      snprintf(statusMsg, sizeof(statusMsg), "kirim... (key %d/%d)", keyIdx+1, geminiKeyCount);
+    else
+      strncpy(statusMsg, "mengirim ke Gemini...", sizeof(statusMsg)-1);
+    drawAIStatus("AI DESCRIBE", statusMsg);
+    esp_task_wdt_reset();
+
+    String url = String(GEMINI_URL_BASE) + String(geminiApiKeys[keyIdx]);
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.begin(client, url);
+    http.addHeader("Content-Type","application/json");
+    http.setTimeout(25000);
+
+    esp_task_wdt_reset();
+    httpCode = http.POST(body);
+    esp_task_wdt_reset();
+
+    if (httpCode == 200) {
+      resp = http.getString();
+      http.end();
+      // Simpan key sukses sebagai default berikutnya
+      geminiKeyActive = keyIdx;
+      Serial.printf("[GEMINI] key%d berhasil (HTTP 200)\n", keyIdx+1);
+      break;
+    }
+
+    // 403 = quota/invalid, 429 = rate limit → fallback ke key berikutnya
+    if (httpCode == 403 || httpCode == 429) {
+      String errBody = http.getString();
+      http.end();
+      Serial.printf("[GEMINI] key%d HTTP %d → fallback\n", keyIdx+1, httpCode);
+
+      if (ki < geminiKeyCount - 1) {
+        int nextKey = ((geminiKeyActive + ki + 1) % geminiKeyCount) + 1;
+        char fbMsg[48];
+        snprintf(fbMsg, sizeof(fbMsg), "key%d %s → coba key%d...",
+                 keyIdx+1,
+                 httpCode==403 ? "quota/invalid" : "rate limit",
+                 nextKey);
+        drawAIStatus("FALLBACK", fbMsg);
+        delay(800);
+        esp_task_wdt_reset();
+      }
+      continue;
+    }
+
+    // Error lain (5xx, network, dll) → berhenti
+    Serial.printf("[GEMINI] key%d HTTP %d\n", keyIdx+1, httpCode);
+    http.end();
+    char errBuf[32]; snprintf(errBuf, sizeof(errBuf), "HTTP error %d", httpCode);
+    drawAIStatus(errBuf, "cek koneksi internet");
+    body = "";
+    delay(3000); return false;
+  }
+
+  body = "";
+
+  // Semua key sudah dicoba tapi semua 403/429
+  if (httpCode != 200) {
+    Serial.printf("[GEMINI] semua %d key gagal\n", geminiKeyCount);
+    char failMsg[40];
+    snprintf(failMsg, sizeof(failMsg), "semua %d key gagal (quota?)", geminiKeyCount);
+    drawAIStatus("GAGAL", failMsg);
+    delay(3000); return false;
   }
 
   drawAIStatus("AI DESCRIBE","parsing respons...");
   esp_task_wdt_reset();
 
   // 7. Parse JSON respons
-  // Format: {"candidates":[{"content":{"parts":[{"text":"..."}]}}]}
-  String resp=http.getString();
-  http.end();
-  esp_task_wdt_reset();
-
-  // Ekstrak teks dengan DynamicJsonDocument
   DynamicJsonDocument doc(8192);
   DeserializationError err=deserializeJson(doc,resp);
   if (err) {
@@ -2308,9 +2628,12 @@ void openAIDescribe(int idx) {
     drawAIDescribeScreen();
     resetAllButtons();
     appMode=MODE_AI_DESCRIBE;
-    islandPush(NOTIF_INFO,"AI describe selesai");
+    // Notif tampilkan key yang dipakai
+    char notifBuf[28];
+    snprintf(notifBuf,sizeof(notifBuf),"AI selesai (key%d)",geminiKeyActive+1);
+    islandPush(NOTIF_INFO,notifBuf);
   } else {
-    if (appMode==MODE_AI_NO_CONFIG) return;  // sudah handle di doAIDescribe
+    if (appMode==MODE_AI_NO_CONFIG) return;
     resetAllButtons();
     appMode=MODE_PHOTO_VIEW;
     photoViewRender();
@@ -2334,7 +2657,6 @@ void handleModeAIDescribe(ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) 
   if (evtD.valid && evtD.isShort) {
     if (aiScrollLine<aiTotalLines-visLines) { aiScrollLine++; redraw=true; }
   }
-  // C/D long = lompat 5 baris
   if (evtC.valid && evtC.isLong) {
     aiScrollLine=max(0,aiScrollLine-5); redraw=true;
   }
@@ -2356,8 +2678,9 @@ void handleModeAIDescribe(ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) 
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI NO CONFIG — Mode handler
+//  D long-press → buka Key Manager
 // ─────────────────────────────────────────────────────────────────────────────
-void handleModeAINoConfig(ButtonEvent evtB) {
+void handleModeAINoConfig(ButtonEvent evtB, ButtonEvent evtD) {
   if (evtB.valid && evtB.isShort) {
     resetAllButtons();
     appMode=MODE_PHOTO_VIEW;
@@ -2365,6 +2688,11 @@ void handleModeAINoConfig(ButtonEvent evtB) {
     photoViewDrawCaption(photoViewIndex);
     photoViewCaptionUntilMs=millis()+2000;
     photoViewCaptionVisible=true;
+  }
+  // D long = buka key manager (reload dulu dari SD)
+  if (evtD.valid && evtD.isLong && sdReady) {
+    loadGeminiConfig();  // reload terbaru
+    openKeyManager();
   }
 }
 
@@ -2634,7 +2962,6 @@ void handleModeJumpInput(ButtonEvent evtBoot, ButtonEvent evtB,
     return;
   }
   if (redraw) drawJumpDialog();
-  // Update progress bar
   unsigned long elapsed=millis()-jumpOpenMs;
   int barW=240-20;
   int prog=barW-(int)((long)barW*elapsed/JUMP_TIMEOUT_MS);
@@ -2727,7 +3054,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   const char* sub="ESP32-S3  CAMERA SYSTEM";
   lcd.drawString(sub,cx-lcd.textWidth(sub)/2,cy+10);
   lcd.setTextColor(COL_GRAY_3);
-  const char* ver="v5.9-fix3";
+  const char* ver="v5.9-fix4";
   lcd.drawString(ver,cx-lcd.textWidth(ver)/2,cy+22);
   lcd.drawFastHLine(cx-80,cy+32,160,COL_GRAY_2);
   delay(600); esp_task_wdt_reset();
@@ -2747,7 +3074,7 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
   lcd.drawFastHLine(0,14,DISP_W,COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_7); lcd.drawString("SANZXCAM",8,3);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix3",DISP_W-52,3);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix4",DISP_W-52,3);
   lcd.setTextColor(COL_GRAY_2); lcd.drawString("boot sequence",cx-32,3);
   delay(80); esp_task_wdt_reset();
 
@@ -2782,7 +3109,6 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
     bootLogRow(y,"PHOTOS",photoBuf,COL_GRAY_7);
     delay(100); y+=10; esp_task_wdt_reset();
 
-    // Cek wifi.ini & gemini.ini
     FILE* wf=fopen(WIFI_INI_PATH,"r");
     FILE* gf=fopen(GEMINI_INI_PATH,"r");
     bool wifiFileOK=(wf!=nullptr); if (wf) fclose(wf);
@@ -2790,8 +3116,15 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
     bootLogRow(y,"wifi.ini",wifiFileOK?"found":"not found (created)",
                wifiFileOK?COL_GRAY_7:COL_GRAY_3);
     delay(100); y+=10; esp_task_wdt_reset();
-    bootLogRow(y,"gemini.ini",geminiFileOK?"found":"not found (created)",
-               geminiFileOK?COL_GRAY_7:COL_GRAY_3);
+
+    // Tampilkan jumlah key yang loaded
+    char keyBuf[24];
+    if (geminiKeyCount > 0)
+      snprintf(keyBuf, sizeof(keyBuf), "found  %d key valid", geminiKeyCount);
+    else
+      strncpy(keyBuf, geminiFileOK?"found (no valid key)":"not found (created)", sizeof(keyBuf)-1);
+    bootLogRow(y,"gemini.ini", keyBuf,
+               geminiKeyCount>0?COL_AI_ACCENT:(geminiFileOK?COL_AI_WARN:COL_GRAY_3));
     delay(100); y+=10; esp_task_wdt_reset();
   }
 
@@ -2808,11 +3141,13 @@ void runBootSequence(bool sdOK, uint64_t sdMB, bool pidOK, uint16_t pid,
 
   y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=2;
   bootLogSection(y,"BUILD"); y+=13;
-  bootLogRow(y,"VERSION","v5.9-fix3",COL_GRAY_7);
+  bootLogRow(y,"VERSION","v5.9-fix4",COL_GRAY_7);
   delay(100); y+=10; esp_task_wdt_reset();
   bootLogRow(y,"AI DESCRIBE","Gemini Vision  D-long",COL_AI_ACCENT);
   delay(100); y+=10; esp_task_wdt_reset();
-  bootLogRow(y,"FACE DETECT","tetap ada  D-short VF",COL_GRAY_E);
+  bootLogRow(y,"MULTI-KEY","auto-fallback 403/429",COL_AI_ACCENT);
+  delay(100); y+=10; esp_task_wdt_reset();
+  bootLogRow(y,"KEY-MGR","D-long di no-config screen",COL_GRAY_E);
   delay(100); y+=10; esp_task_wdt_reset();
 
   y+=4; lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2); y+=4;
@@ -2852,7 +3187,7 @@ void drawUSBModeScreen() {
   lcd.setTextColor(COL_GRAY_3); lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix3",DISP_W-52,4);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString("v5.9-fix4",DISP_W-52,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -2883,7 +3218,7 @@ void enterUSBMode() {
   if (photoPixelBuf) { free(photoPixelBuf); photoPixelBuf=nullptr; }
   islandForceHide();
   unmountVFSOnly(); sdReady=false;
-  WiFi.disconnect(true);  // matikan WiFi saat USB mode
+  WiFi.disconnect(true);
   esp_task_wdt_reset(); msc.mediaPresent(true); esp_task_wdt_reset();
   drawUSBModeScreen();
   usbModeActive=true;
@@ -2898,6 +3233,7 @@ void exitUSBMode() {
   if (sdReady) {
     scanPhotoCount();
     loadSettings();
+    loadGeminiConfig();  // reload key setelah USB (mungkin user edit gemini.ini)
     applyExpPreset(expPreset);
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf[32]; snprintf(buf,sizeof(buf),"sd ok  next #%04d",photoCount+1);
@@ -2918,10 +3254,9 @@ void exitUSBMode() {
 // ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.9-fix3 ===");
-  Serial.println("[AI] Gemini Vision — D long-press di Photo View");
-  Serial.println("[WIFI] config dari /sdcard/wifi.ini");
-  Serial.println("[GEMINI] config dari /sdcard/gemini.ini");
+  Serial.println("\n=== Sanzxcam v5.9-fix4 ===");
+  Serial.println("[MULTI-KEY] auto-fallback 403/429 → key berikutnya");
+  Serial.println("[KEY-MGR] D-long di no-config screen");
 
   galleryFiles   =(char(*)[32])     ps_malloc(GALLERY_MAX_FILES*32);
   galleryFileType=(GalleryFileType*)ps_malloc(GALLERY_MAX_FILES*sizeof(GalleryFileType));
@@ -2947,7 +3282,6 @@ void setup() {
     scanPhotoCount();
     scanVideoCount();
     loadSettings();
-    // Cek/buat file config AI
     loadWifiConfig();
     loadGeminiConfig();
   }
@@ -3093,7 +3427,7 @@ void handleModePhotoView(ButtonEvent evt) {
     return;
   }
 
-  // ← D long-press = AI Describe
+  // D long-press = AI Describe
   if (evt.pin==BTN_D&&evt.isLong) {
     if (!sdReady) { islandPush(NOTIF_WARN,"SD tidak tersedia"); return; }
     photoViewClearCaption();
@@ -3278,13 +3612,15 @@ void loop() {
     case MODE_MENU_FORMAT:   handleModeMenuFormat(singleEvt);                break;
     case MODE_JUMP_INPUT:    handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
     case MODE_AI_DESCRIBE:   handleModeAIDescribe(evtB,evtC,evtD);           break;
-    case MODE_AI_NO_CONFIG:  handleModeAINoConfig(evtB);                     break;
+    case MODE_AI_NO_CONFIG:  handleModeAINoConfig(evtB,evtD);                break;
+    case MODE_KEY_MANAGER:   handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
   if (appMode!=MODE_VIEWFINDER &&
       appMode!=MODE_JUMP_INPUT &&
       appMode!=MODE_AI_DESCRIBE &&
-      appMode!=MODE_AI_NO_CONFIG) {
+      appMode!=MODE_AI_NO_CONFIG &&
+      appMode!=MODE_KEY_MANAGER) {
     islandNoClear=false;
     islandTick();
   }
