@@ -271,6 +271,16 @@ static int  aiTotalLines                      = 0;
 static int  aiScrollLine                      = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  PHOTO VIEW VARIABLES — dideklarasikan di sini (sebelum KEY MANAGER)
+//  agar bisa diakses oleh handleModeKeyManager
+// ─────────────────────────────────────────────────────────────────────────────
+char  photoViewPath[48]               = {};
+int   photoViewIndex                  = 0;
+
+unsigned long photoViewCaptionUntilMs = 0;
+bool          photoViewCaptionVisible = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE  [KEY-MANAGER]
 // ─────────────────────────────────────────────────────────────────────────────
 // Kamera tidak punya keyboard, jadi key manager hanya bisa:
@@ -718,11 +728,9 @@ static void maskApiKey(const char* key, char* out, int outLen) {
     return;
   }
   if (len <= 12) {
-    // Key terlalu pendek, tampilkan sebagian
     snprintf(out, outLen, "%.8s...", key);
     return;
   }
-  // Tampilkan 8 karakter pertama + ... + 4 karakter terakhir
   snprintf(out, outLen, "%.8s...%s", key, key + len - 4);
 }
 
@@ -879,6 +887,13 @@ void kmDeleteKey(int idx) {
   if (kmSelIdx >= geminiKeyCount) kmSelIdx = max(0, geminiKeyCount-1);
   kmDirty = true;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Forward declarations untuk fungsi photo view
+//  (didefinisikan setelah Gallery section)
+// ─────────────────────────────────────────────────────────────────────────────
+void photoViewRender();
+void photoViewDrawCaption(int idx);
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER — Mode handler
@@ -1267,8 +1282,8 @@ GalleryFileType*   galleryFileType   = nullptr;
 int   galleryCount  = 0;
 int   galleryScroll = 0;
 int   gallerySelIdx = 0;
-char  photoViewPath[48];
-int   photoViewIndex = 0;
+// NOTE: photoViewPath, photoViewIndex, photoViewCaptionUntilMs, photoViewCaptionVisible
+//       sudah dideklarasikan di atas (sebelum KEY MANAGER section)
 
 inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
 inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
@@ -1278,9 +1293,6 @@ inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
 unsigned long galleryHoldStart = 0;
 unsigned long galleryLastStep  = 0;
 int           galleryHoldDir   = 0;
-
-unsigned long photoViewCaptionUntilMs = 0;
-bool          photoViewCaptionVisible = false;
 
 #define ZOOM_LEVELS 3
 float    photoZoomFactors[ZOOM_LEVELS] = { 1.0f, 2.0f, 4.0f };
