@@ -41,7 +41,7 @@
  *    B short     = start/stop REC
  *    B long      = LED flash menu
  *    C short     = buka Gallery
- *    C long      = AI Feature Menu (capture dari viewfinder)  ← BARU
+ *    C long      = AI Feature Menu (capture dari viewfinder)
  *    D short     = toggle Face Detect
  *    D long      = Exposure menu (+ format di dalamnya)
  *
@@ -51,7 +51,7 @@
  *    B short     = kembali ke viewfinder
  *    C hold      = scroll up
  *    D short/hold= scroll down
- *    D long      = AI Feature Menu (foto yang dipilih)        ← BARU
+ *    D long      = AI Feature Menu (foto yang dipilih)
  *
  *  PHOTO VIEW:
  *    BOOT short  = kembali ke gallery
@@ -59,7 +59,7 @@
  *    B long      = delete dialog
  *    C short     = foto sebelumnya (zoom=0) / pan kiri (zoom>0)
  *    D short     = foto berikutnya (zoom=0) / pan kanan (zoom>0)
- *    D long      = AI Feature Menu                            ← BARU (ganti AI Describe langsung)
+ *    D long      = AI Feature Menu
  *
  * UI THEME : Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY  : ILI9341 2.4" 320x240 landscape
@@ -260,10 +260,10 @@ enum AppMode {
   MODE_MENU_LED,
   MODE_MENU_EXP,
   MODE_MENU_EXP_ADJ,
-  MODE_MENU_FORMAT,       // masih ada, dipanggil dari Exp Menu
+  MODE_MENU_FORMAT,
   MODE_DIALOG_DELETE,
   MODE_JUMP_INPUT,
-  MODE_AI_FEATURE_MENU,   // ← BARU: sub-menu pilih fitur AI
+  MODE_AI_FEATURE_MENU,
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
   MODE_KEY_MANAGER,
@@ -286,13 +286,12 @@ enum AIFeature : uint8_t {
 };
 
 struct AIFeatureDef {
-  const char* label;      // nama pendek untuk menu
-  const char* icon;       // simbol 1-2 karakter
+  const char* label;
+  const char* icon;
   uint16_t    iconColor;
-  const char* prompt;     // prompt Bahasa Indonesia yang dikirim ke Gemini
+  const char* prompt;
 };
 
-// Prompt dirancang spesifik per fitur, semua dalam Bahasa Indonesia
 static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
   {
     "Describe",
@@ -305,80 +304,68 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
   {
     "Scavenger Hunt",
     "S",
-    0xFFE0,  // kuning
+    0xFFE0,
     "Kamu adalah game master Scavenger Hunt. "
     "Analisis gambar ini dan tentukan apakah gambar tersebut memenuhi tantangan yang diberikan. "
-    "Pertama, sebutkan tantangan yang kamu ciptakan berdasarkan objek di gambar (contoh: 'Cari benda berwarna merah berbentuk bulat'). "
-    "Lalu jawab apakah gambar memenuhi tantangan tersebut, berikan poin 0-10, dan tantangan baru untuk sesi berikutnya. "
+    "Pertama, sebutkan tantangan yang kamu ciptakan berdasarkan objek di gambar. "
+    "Lalu jawab apakah gambar memenuhi tantangan tersebut, berikan poin 0-10, dan tantangan baru. "
     "Format: TANTANGAN: [kalimat] | HASIL: [lulus/gagal] | POIN: [angka] | TANTANGAN BARU: [kalimat]. "
     "Gunakan Bahasa Indonesia."
   },
   {
     "Mood Reader",
     "M",
-    0xF81F,  // magenta
+    0xF81F,
     "Kamu adalah psikolog ekspresi wajah. "
     "Analisis wajah atau suasana keseluruhan dalam gambar ini. "
-    "Jika ada wajah manusia: identifikasi emosi utama (senang/sedih/marah/takut/terkejut/jijik/netral), "
-    "perkiraan intensitas emosi 0-100%, dan penjelasan singkat berdasarkan ekspresi, postur, dan konteks. "
-    "Jika tidak ada wajah: analisis mood keseluruhan gambar (warna, komposisi, suasana). "
+    "Jika ada wajah manusia: identifikasi emosi utama, perkiraan intensitas 0-100%, dan penjelasan singkat. "
+    "Jika tidak ada wajah: analisis mood keseluruhan gambar. "
     "Gunakan Bahasa Indonesia. Maksimal 5 kalimat."
   },
   {
     "ANPR",
     "P",
-    0xFC00,  // oranye
+    0xFC00,
     "Kamu adalah sistem ANPR (Automatic Number Plate Recognition). "
     "Cari dan baca semua teks pelat nomor kendaraan dalam gambar ini. "
-    "Untuk setiap pelat yang ditemukan, sebutkan: teks pelat lengkap, posisi di gambar (kiri/tengah/kanan/atas/bawah), "
-    "dan perkiraan tingkat keterbacaan (jelas/agak buram/sulit dibaca). "
+    "Untuk setiap pelat: teks pelat lengkap, posisi di gambar, perkiraan keterbacaan. "
     "Jika tidak ada pelat: nyatakan 'TIDAK ADA PELAT'. "
-    "Format per pelat: PELAT: [teks] | POSISI: [lokasi] | KUALITAS: [tingkat]. "
+    "Format: PELAT: [teks] | POSISI: [lokasi] | KUALITAS: [tingkat]. "
     "Gunakan Bahasa Indonesia."
   },
   {
     "Sky Watch",
     "W",
-    0x841F,  // biru langit
+    0x841F,
     "Kamu adalah ahli meteorologi dan astronomi. "
     "Analisis langit, awan, atau fenomena atmosfer dalam gambar ini. "
-    "Identifikasi: jenis awan (cumulus/stratus/cirrus/cumulonimbus/dll jika ada), "
-    "kondisi cuaca saat ini berdasarkan gambar, perkiraan waktu (pagi/siang/sore/malam), "
-    "dan fenomena langit menarik yang terlihat (pelangi/halo matahari/bintang/bulan/dll). "
+    "Identifikasi: jenis awan, kondisi cuaca, perkiraan waktu, dan fenomena langit menarik. "
     "Jika langit tidak terlihat: analisis kondisi pencahayaan yang ada. "
     "Gunakan Bahasa Indonesia. Maksimal 5 kalimat."
   },
   {
     "Pest Count",
     "#",
-    0xF800,  // merah
+    0xF800,
     "Kamu adalah entomolog dan ahli hama pertanian. "
     "Analisis gambar ini dan hitung semua serangga, hama, atau organisme kecil yang terlihat. "
-    "Untuk setiap jenis yang ditemukan: identifikasi nama (semut/lalat/ulat/kutu/dll), "
-    "hitung jumlah individu yang terlihat jelas, dan perkiraan jumlah total jika ada yang samar. "
-    "Format per spesies: SPESIES: [nama] | TERLIHAT: [angka] | ESTIMASI TOTAL: [angka]. "
-    "Di bagian akhir, beri penilaian tingkat infestasi (rendah/sedang/tinggi/sangat tinggi) "
-    "dan rekomendasi penanganan singkat. Gunakan Bahasa Indonesia."
+    "Untuk setiap jenis: identifikasi nama, hitung jumlah, dan estimasi total. "
+    "Format: SPESIES: [nama] | TERLIHAT: [angka] | ESTIMASI TOTAL: [angka]. "
+    "Beri penilaian tingkat infestasi dan rekomendasi penanganan. Gunakan Bahasa Indonesia."
   },
   {
     "Produce ID",
     "F",
-    0x07E0,  // hijau
+    0x07E0,
     "Kamu adalah ahli botani dan hortikultura. "
     "Identifikasi semua buah, sayuran, tanaman, atau produk pertanian dalam gambar ini. "
-    "Untuk setiap item yang ditemukan: nama umum (Bahasa Indonesia), nama ilmiah jika tahu, "
-    "perkiraan jumlah/kuantitas, kondisi (segar/matang/terlalu matang/rusak), "
-    "dan nilai gizi atau kegunaan singkat. "
-    "Format per item: ITEM: [nama] | JUMLAH: [angka/estimasi] | KONDISI: [status] | INFO: [kalimat singkat]. "
-    "Di bagian akhir, estimasi total nilai gizi atau kegunaan koleksi ini. "
-    "Gunakan Bahasa Indonesia."
+    "Untuk setiap item: nama umum, nama ilmiah, perkiraan jumlah, kondisi, dan nilai gizi singkat. "
+    "Format: ITEM: [nama] | JUMLAH: [angka] | KONDISI: [status] | INFO: [kalimat singkat]. "
+    "Di bagian akhir, estimasi total nilai gizi koleksi ini. Gunakan Bahasa Indonesia."
   },
 };
 
-// Feature yang sedang aktif dipilih di menu
 static AIFeature aiSelectedFeature = AI_FEAT_DESCRIBE;
-
-// Apakah AI dipanggil dari viewfinder (perlu capture dulu) atau dari gallery/photo view
 static bool aiFromViewfinder = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -829,12 +816,43 @@ static void maskApiKey(const char* key, char* out, int outLen) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  GALLERY — type & globals (declared EARLY so AI menu can reference them)
+// ─────────────────────────────────────────────────────────────────────────────
+enum GalleryFileType : uint8_t {
+  GFILE_JPG   = 0,
+  GFILE_BMP   = 1,
+  GFILE_VIDEO = 2,
+};
+
+#define GALLERY_MAX_FILES  1000
+#define GALLERY_ITEMS_PAGE    8
+#define GALLERY_ITEM_H       26
+
+char             (*galleryFiles)[32] = nullptr;
+GalleryFileType*   galleryFileType   = nullptr;
+int   galleryCount  = 0;
+int   galleryScroll = 0;
+int   gallerySelIdx = 0;
+
+inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
+inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
+inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
+inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
+
+// Forward declarations for functions used in AI feature menu
+void scanGalleryFiles();
+void scanPhotoCount();
+void photoViewRender();
+void photoViewDrawCaption(int idx);
+void openAIDescribeWithFeature(int idx, AIFeature feature);
+void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE MENU — DRAW
 // ─────────────────────────────────────────────────────────────────────────────
 void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.fillScreen(COL_BLACK);
 
-  // Header
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
@@ -842,7 +860,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   const char* title = "AI FEATURE";
   lcd.drawString(title, (DISP_W - lcd.textWidth(title)) / 2, 6);
 
-  // Source badge
   lcd.setTextColor(COL_GRAY_5);
   if (fromViewfinder) {
     lcd.drawString("VIEWFINDER", 4, 6);
@@ -852,7 +869,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     lcd.drawString("GALLERY", 4, 6);
   }
 
-  // Daftar fitur
   const int itemH = 28;
   const int startY = 22;
 
@@ -861,59 +877,31 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     bool isSelected = (i == sel);
     int iy = startY + i * itemH;
 
-    // Background
     uint16_t rowBg = isSelected ? COL_GRAY_5 : (i % 2 == 0 ? COL_GRAY_D : COL_BLACK);
     lcd.fillRect(0, iy, DISP_W, itemH - 1, rowBg);
     lcd.drawFastHLine(0, iy + itemH - 1, DISP_W, COL_GRAY_2);
 
-    // Nomor
     char numBuf[4]; snprintf(numBuf, sizeof(numBuf), "%d", i + 1);
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_5);
     lcd.drawString(numBuf, 5, iy + 10);
 
-    // Icon badge
     int iconX = 18, iconY = iy + 6;
     lcd.fillRect(iconX, iconY, 14, 14, isSelected ? feat.iconColor : COL_GRAY_3);
     lcd.setTextColor(isSelected ? COL_BLACK : COL_GRAY_7);
     int iconTw = lcd.textWidth(feat.icon);
     lcd.drawString(feat.icon, iconX + (14 - iconTw) / 2, iconY + 3);
 
-    // Label
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_C);
     lcd.drawString(feat.label, 38, iy + 10);
 
-    // Prompt preview (baris pertama saja, truncated)
-    if (isSelected) {
-      // Tampilkan 2 baris preview prompt
-      lcd.setTextColor(COL_GRAY_5);
-      char preview[40];
-      strncpy(preview, feat.prompt, 39);
-      preview[39] = '\0';
-      // Cari batas kata yang muat di layar
-      int maxW = DISP_W - 10;
-      while (strlen(preview) > 4 && lcd.textWidth(preview) > maxW) {
-        int l = strlen(preview);
-        preview[l-1] = '\0';
-        if (strlen(preview) > 3) {
-          preview[strlen(preview)-1] = '.';
-          preview[strlen(preview)-2] = '.';
-          preview[strlen(preview)-3] = '.';
-        }
-      }
-      // Preview di bawah item — digambar di area footer
-    }
-
-    // Arrow indicator
     if (isSelected) {
       lcd.setTextColor(COL_AI_ACCENT);
       lcd.drawString(">", DISP_W - 12, iy + 10);
     }
   }
 
-  // Footer dengan preview prompt dan legend
   int footerY = startY + AI_FEAT_COUNT * itemH;
 
-  // Preview prompt singkat dari fitur terpilih
   if (footerY + 14 < DISP_H - 22) {
     lcd.drawFastHLine(0, footerY, DISP_W, COL_GRAY_2);
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
@@ -933,7 +921,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     lcd.drawString(preview, 4, footerY + 4);
   }
 
-  // Legend tombol
   lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
   lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
@@ -947,30 +934,19 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Forward declarations
-// ─────────────────────────────────────────────────────────────────────────────
-void photoViewRender();
-void photoViewDrawCaption(int idx);
-void openAIDescribeWithFeature(int idx, AIFeature feature);
-void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE MENU — OPEN & HANDLE
 // ─────────────────────────────────────────────────────────────────────────────
 void openAIFeatureMenu(bool fromViewfinder) {
   aiFromViewfinder = fromViewfinder;
-  aiSelectedFeature = AI_FEAT_DESCRIBE;  // default
+  aiSelectedFeature = AI_FEAT_DESCRIBE;
   drawAIFeatureMenu((int)aiSelectedFeature, fromViewfinder);
   resetAllButtons();
   appMode = MODE_AI_FEATURE_MENU;
 }
 
-// Capture dari viewfinder, simpan sementara ke SD sebagai /sdcard/ai_temp.jpg
-// Return true jika berhasil, path di outPath
 bool captureForAI(char* outPath, int outPathLen) {
   snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
 
-  // Flash jika aktif
   if (ledFlashEnabled) {
     digitalWrite(LED_FLASH, HIGH); delay(150);
     for (int i = 0; i < 2; i++) {
@@ -1027,7 +1003,6 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
     return;
   }
 
-  // Batal
   if (evtB.valid && evtB.isShort) {
     resetAllButtons();
     if (aiFromViewfinder) {
@@ -1044,10 +1019,8 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
     return;
   }
 
-  // Jalankan fitur
   if (evtBoot.valid && evtBoot.isShort) {
     if (aiFromViewfinder) {
-      // Capture dari viewfinder dulu
       if (!sdReady) {
         islandPush(NOTIF_WARN, "SD tidak tersedia");
         resetAllButtons();
@@ -1057,7 +1030,6 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
         return;
       }
 
-      // Tampilkan status capturing
       lcd.fillScreen(COL_BLACK);
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
       const char* capMsg = "capturing...";
@@ -1074,14 +1046,9 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
         return;
       }
 
-      // Scan gallery supaya file temp bisa diakses via index
-      // Kita langsung proses tanpa gallery index — pakai path langsung
-      // Buat entry dummy di galleryFiles untuk reuse openAIDescribeWithFeature
-      // Sebenarnya kita perlu index gallery. Rescan dulu.
-      scanGalleryFiles();  // forward decl di bawah
+      scanGalleryFiles();
       scanPhotoCount();
 
-      // Cari index ai_temp.jpg di gallery
       int tempIdx = -1;
       for (int i = 0; i < galleryCount; i++) {
         if (strcmp(galleryFiles[i], "ai_temp.jpg") == 0) {
@@ -1089,8 +1056,6 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
         }
       }
       if (tempIdx < 0) {
-        // Fallback: gunakan index 0 tapi dengan path override
-        // Kita pakai openAIDescribeWithFeature dengan injeksi path manual
         islandPush(NOTIF_WARN, "File temp tidak ditemukan");
         resetAllButtons();
         appMode = MODE_VIEWFINDER;
@@ -1103,7 +1068,6 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
       openAIDescribeWithFeature(tempIdx, aiSelectedFeature);
 
     } else {
-      // Dari gallery/photo view — langsung proses foto yang dipilih
       openAIDescribeWithFeature(photoViewIndex, aiSelectedFeature);
     }
     return;
@@ -1488,29 +1452,8 @@ uint16_t* loadBMP(const char* path,uint16_t* outW,uint16_t* outH){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Gallery
+//  Gallery remaining vars
 // ─────────────────────────────────────────────────────────────────────────────
-enum GalleryFileType : uint8_t {
-  GFILE_JPG   = 0,
-  GFILE_BMP   = 1,
-  GFILE_VIDEO = 2,
-};
-
-#define GALLERY_MAX_FILES  1000
-#define GALLERY_ITEMS_PAGE    8
-#define GALLERY_ITEM_H       26
-
-char             (*galleryFiles)[32] = nullptr;
-GalleryFileType*   galleryFileType   = nullptr;
-int   galleryCount  = 0;
-int   galleryScroll = 0;
-int   gallerySelIdx = 0;
-
-inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
-inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
-inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
-inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
-
 unsigned long galleryHoldStart = 0;
 unsigned long galleryLastStep  = 0;
 int           galleryHoldDir   = 0;
@@ -1720,7 +1663,7 @@ void unmountVFSOnly(){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  scanPhotoCount / scanVideoCount
+//  scanPhotoCount / scanVideoCount / scanGalleryFiles
 // ─────────────────────────────────────────────────────────────────────────────
 void scanPhotoCount(){
   photoCount=0;
@@ -1752,9 +1695,6 @@ void scanVideoCount(){
   closedir(dir);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Gallery functions
-// ─────────────────────────────────────────────────────────────────────────────
 void scanGalleryFiles(){
   galleryCount=0;galleryScroll=0;
   DIR* dir=opendir("/sdcard"); if(!dir) return;
@@ -1787,6 +1727,9 @@ void scanGalleryFiles(){
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Gallery draw functions
+// ─────────────────────────────────────────────────────────────────────────────
 void drawGallery(){
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
@@ -1930,7 +1873,7 @@ void photoViewRender(){
   if(photoZoomLevel==0){
     lcd.drawString("C=prev",2,DISP_H-10);
     lcd.setTextColor(COL_AI_ACCENT);
-    lcd.drawString("Dlong=AI",DISP_W-52,DISP_H-10);  // D-long = AI Feature Menu
+    lcd.drawString("Dlong=AI",DISP_W-52,DISP_H-10);
   } else {
     lcd.drawString("C/D=pan",2,DISP_H-10);
     lcd.drawString("Blong=del",DISP_W-58,DISP_H-10);
@@ -2113,7 +2056,7 @@ void openLedMenu(){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu Format (dipanggil dari Exp Menu)
+//  Menu Format
 // ─────────────────────────────────────────────────────────────────────────────
 void drawFormatMenu(int sel){
   int mw=220,mh=120,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
@@ -2156,7 +2099,7 @@ void openFormatMenu(){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Menu Exposure  (+ tombol B di dalam exp menu = buka format)
+//  Menu Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 void drawExpMenu(int sel){
   int mw=220,mh=155,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
@@ -2179,16 +2122,14 @@ void drawExpMenu(int sel){
     lcd.setTextColor((i==sel)?COL_WHITE:COL_GRAY_7);
     lcd.drawString(labels[i],mx+14,iy+5);
   }
-  // Divider + hint format
   lcd.drawFastHLine(mx+10,my+116,mw-20,COL_GRAY_2);
   lcd.setTextColor(COL_GRAY_3);
   lcd.drawString("C/D=pilih  BOOT=ok  B=batal",mx+8,my+120);
-  // Format shortcut
   if(detectedSensor==PID_GC2145){
     lcd.drawFastHLine(mx+10,my+132,mw-20,COL_GRAY_2);
     lcd.setTextColor(COL_GRAY_5);
     char fmtBuf[28];
-    snprintf(fmtBuf,sizeof(fmtBuf),"Format: %s  [C-long=ganti]",
+    snprintf(fmtBuf,sizeof(fmtBuf),"Format: %s  [D-long=ganti]",
              gc2145CaptureFormat==GFMT_BMP?"BMP":"JPG");
     lcd.drawString(fmtBuf,mx+8,my+136);
   }
@@ -2516,7 +2457,6 @@ void aiWrapText(const char* text){
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — RENDER layar hasil
-//  Header sekarang menampilkan nama fitur yang dijalankan
 // ─────────────────────────────────────────────────────────────────────────────
 void drawAIDescribeScreen(){
   lcd.fillScreen(COL_BLACK);
@@ -2525,16 +2465,13 @@ void drawAIDescribeScreen(){
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
   lcd.setTextColor(COL_AI_ACCENT);
 
-  // Judul = nama fitur yang sedang aktif
   const char* title = AI_FEATURES[(int)aiSelectedFeature].label;
   lcd.drawString(title,(DISP_W-lcd.textWidth(title))/2,6);
 
-  // Badge key aktif
   char keyBadge[8]; snprintf(keyBadge,sizeof(keyBadge),"k%d/%d",geminiKeyActive+1,geminiKeyCount);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString(keyBadge,DISP_W-30,6);
 
-  // Badge icon fitur
   lcd.setTextColor(AI_FEATURES[(int)aiSelectedFeature].iconColor);
   lcd.drawString(AI_FEATURES[(int)aiSelectedFeature].icon,4,6);
 
@@ -2631,7 +2568,7 @@ void drawAINoConfigScreen(bool missingWifi,bool missingGemini){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI — Baca foto dari SD sebagai JPEG (untuk dikirim ke Gemini)
+//  AI — Baca foto dari SD sebagai JPEG
 // ─────────────────────────────────────────────────────────────────────────────
 static uint8_t* aiLoadPhotoAsJpeg(int idx,size_t* outLen){
   char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
@@ -2660,10 +2597,8 @@ static uint8_t* aiLoadPhotoAsJpeg(int idx,size_t* outLen){
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Core HTTP call dengan multi-key fallback
-//  Menerima prompt kustom (dari AIFeatureDef)
 // ─────────────────────────────────────────────────────────────────────────────
 bool doAICall(int idx, const char* customPrompt) {
-  // 1. Cek config
   bool wifiOK   = (wifiSSID[0]!='\0'&&strcmp(wifiSSID,"NamaWiFiKamu")!=0);
   bool geminiOK = (geminiKeyCount>0);
   if(!wifiOK)   wifiOK   = loadWifiConfig();
@@ -2678,7 +2613,6 @@ bool doAICall(int idx, const char* customPrompt) {
   lcd.fillScreen(COL_BLACK);
   drawAIStatus("CONNECTING","menghubungkan WiFi...");
 
-  // 2. WiFi
   if(WiFi.status()!=WL_CONNECTED){
     WiFi.begin(wifiSSID,wifiPass);
     unsigned long t0=millis();
@@ -2696,7 +2630,6 @@ bool doAICall(int idx, const char* customPrompt) {
   drawAIStatus(statusHdr,"membaca foto...");
   esp_task_wdt_reset();
 
-  // 3. Baca foto
   size_t jpgLen=0;
   uint8_t* jpgBuf=aiLoadPhotoAsJpeg(idx,&jpgLen);
   if(!jpgBuf||jpgLen==0){drawAIStatus("gagal baca foto","");delay(2000);return false;}
@@ -2704,12 +2637,10 @@ bool doAICall(int idx, const char* customPrompt) {
   drawAIStatus(statusHdr,"encode base64...");
   esp_task_wdt_reset();
 
-  // 4. Base64
   String b64;
   base64Encode(jpgBuf,jpgLen,b64);
   free(jpgBuf);
 
-  // 5. Build JSON body dengan prompt kustom
   String body;
   body.reserve(b64.length()+512);
   body  = "{\"contents\":[{\"parts\":[";
@@ -2717,7 +2648,6 @@ bool doAICall(int idx, const char* customPrompt) {
   body += b64;
   body += "\"}},";
   body += "{\"text\":\"";
-  // Escape prompt: ganti " dengan \" dan newline dengan \n
   for(const char* p=customPrompt;*p;p++){
     if(*p=='"') body+="\\\"";
     else if(*p=='\n') body+="\\n";
@@ -2728,7 +2658,6 @@ bool doAICall(int idx, const char* customPrompt) {
   b64="";
   esp_task_wdt_reset();
 
-  // 6. HTTP POST dengan multi-key fallback
   int httpCode=0;
   String resp="";
 
@@ -2784,7 +2713,6 @@ bool doAICall(int idx, const char* customPrompt) {
   drawAIStatus(statusHdr,"parsing respons...");
   esp_task_wdt_reset();
 
-  // 7. Parse JSON
   DynamicJsonDocument doc(8192);
   DeserializationError err=deserializeJson(doc,resp);
   if(err){
@@ -2803,7 +2731,7 @@ bool doAICall(int idx, const char* customPrompt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI — Entry point utama: jalankan fitur tertentu pada foto idx
+//  AI — Entry point utama
 // ─────────────────────────────────────────────────────────────────────────────
 void openAIDescribeWithFeature(int idx, AIFeature feature) {
   aiSelectedFeature = feature;
@@ -2835,7 +2763,7 @@ void openAIDescribeWithFeature(int idx, AIFeature feature) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI — Mode handler untuk MODE_AI_DESCRIBE (layar hasil)
+//  AI — Mode handler untuk MODE_AI_DESCRIBE
 // ─────────────────────────────────────────────────────────────────────────────
 void handleModeAIDescribe(ButtonEvent evtB,ButtonEvent evtC,ButtonEvent evtD){
   if(aiDescribeBusy) return;
@@ -2910,7 +2838,6 @@ void renderViewfinder(){
       drawPill(38,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
       drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
                COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
-      // Hint AI di viewfinder
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
       lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
       if(recActive) drawRecIndicator();
@@ -3463,7 +3390,6 @@ void handleModeViewfinder(ButtonEvent evt){
   }
   else if(evt.pin==BTN_C){
     if(evt.isShort){
-      // C short = buka gallery
       if(sdReady){
         scanGalleryFiles();
         gallerySelIdx=0;galleryScroll=0;galleryHoldDir=0;
@@ -3472,15 +3398,14 @@ void handleModeViewfinder(ButtonEvent evt){
       }
     }
     else{
-      // C long = AI Feature Menu (capture dari viewfinder)
       if(!sdReady){islandPush(NOTIF_WARN,"SD tidak tersedia");return;}
       islandForceHide();
-      openAIFeatureMenu(true);  // true = dari viewfinder
+      openAIFeatureMenu(true);
     }
   }
   else if(evt.pin==BTN_D){
     if(evt.isShort){toggleFaceDetect();}
-    else           {openExpMenu();}  // D long = Exp Menu (Format ada di dalam)
+    else           {openExpMenu();}
   }
 }
 
@@ -3521,15 +3446,13 @@ void handleModeGallery(ButtonEvent evt){
     appMode=MODE_VIEWFINDER;lcd.fillScreen(COL_BLACK);
     fpsLastTime=millis();fpsFrameCount=0;
   }
-  // D long dari gallery = AI Feature Menu (foto yang dipilih)
   else if(evt.pin==BTN_D&&evt.isLong){
     if(galleryCount==0){islandPush(NOTIF_WARN,"Gallery kosong");return;}
     GalleryFileType ft=galleryFileType[gallerySelIdx];
     if(ft==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
-    // Load foto dulu ke photo view index
     photoViewIndex=gallerySelIdx;
     strncpy(photoViewPath,galleryFiles[gallerySelIdx],sizeof(photoViewPath)-1);
-    openAIFeatureMenu(false);  // false = dari gallery/photo
+    openAIFeatureMenu(false);
   }
 }
 
@@ -3575,11 +3498,10 @@ void handleModePhotoView(ButtonEvent evt){
     return;
   }
 
-  // D long-press dari photo view = AI Feature Menu
   if(evt.pin==BTN_D&&evt.isLong){
     if(!sdReady){islandPush(NOTIF_WARN,"SD tidak tersedia");return;}
     photoViewClearCaption();
-    openAIFeatureMenu(false);  // false = dari photo view
+    openAIFeatureMenu(false);
     return;
   }
 
@@ -3640,13 +3562,11 @@ void handleModeMenuFormat(ButtonEvent evt){
     char fbBuf[28];
     snprintf(fbBuf,sizeof(fbBuf),"FORMAT: %s",gc2145CaptureFormat==GFMT_BMP?"BMP+stego":"JPG+EXIF+stego");
     islandPush(NOTIF_INFO,fbBuf);saveSettings();
-    // Kembali ke Exp Menu
     lcd.fillScreen(COL_BLACK);resetAllButtons();
     drawExpMenu(menuExpSel);
     appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_B){
-    // Batal = kembali ke Exp Menu
     drawExpMenu(menuExpSel);resetAllButtons();appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_C||evt.pin==BTN_D){menuFormatSel=(menuFormatSel==0)?1:0;drawFormatMenu(menuFormatSel);}
@@ -3669,7 +3589,6 @@ void handleModeMenuExp(ButtonEvent evt){
   else if(evt.pin==BTN_D){
     if(evt.isShort){menuExpSel=(menuExpSel+1)%4;drawExpMenu(menuExpSel);}
     else if(evt.isLong&&detectedSensor==PID_GC2145){
-      // D long di Exp Menu = buka Format Menu
       openFormatMenu();
     }
   }
