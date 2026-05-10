@@ -1,28 +1,27 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.9-fix6-scavmem
+ * Version: v5.9-fix5
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.9-fix6-scavmem (di atas v5.9-fix5):
+ *  CHANGELOG v5.9-fix5 (di atas v5.9-fix4):
  *
- *  [SCAVENGER-MEMORY] Sistem ingatan Scavenger Hunt persisten di SD card
- *    - File: /sdcard/scavenger.ini
- *    - Menyimpan: skor total, jumlah round, tantangan aktif sekarang,
- *                 riwayat 20 tantangan terakhir (agar AI tidak mengulang)
- *    - AI diberikan konteks riwayat tantangan saat membuat tantangan baru
- *    - Tantangan aktif dilanjutkan antar sesi (tidak hilang saat restart)
- *    - Tombol khusus: di layar AI result, B-long = reset skor Scavenger
+ *  [AI-MENU] Sub-menu pilih fitur AI (6 fitur)
+ *    - Trigger dari VIEWFINDER: longpress C
+ *    - Trigger dari GALLERY: longpress D (pada foto yang dipilih)
+ *    - Trigger dari PHOTO VIEW: longpress D (gantikan langsung AI Describe)
+ *    - 6 fitur: Describe, Scavenger Hunt, Mood Reader, ANPR,
+ *               Pengamat Langit, Penghitung Hama, Identifikasi Buah/Tanaman
  *
- *  [SCAVENGER-UI] Layar status Scavenger Hunt
- *    - Terlihat di header result AI Scavenger
- *    - Tampil: skor total, round ke berapa, tantangan aktif
- *    - Riwayat terakhir tampil di footer
- *
- * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.9-fix5:
- *  [AI-MENU] Sub-menu pilih fitur AI (7 fitur)
  *  [AI-CAPTURE] Capture langsung dari viewfinder untuk AI
+ *    - Dari viewfinder longpress C → pilih fitur → capture otomatis
+ *    - Tidak perlu buka gallery dulu
+ *
  *  [SETTINGS-REORG] Format menu masuk ke dalam Exposure menu
+ *    - Longpress C viewfinder: dulu Format Menu → sekarang AI Feature Menu
+ *    - Format pilihan ada di tab terakhir Exp Menu (shortpress BOOT di Exp)
+ *
+ * ═══════════════════════════════════════════════════════════════
+ *  TETAP dari v5.9-fix4:
  *  [MULTI-KEY] Support hingga 5 Gemini API key sekaligus
  *  [KEY-MANAGER] Menu manajemen API key dari dalam kamera
  *  [AI-DESCRIBE] Deskripsi foto via Google Gemini Vision API
@@ -34,7 +33,7 @@
  *  [FACE]        Human face detection
  * ═══════════════════════════════════════════════════════════════
  *
- * TOMBOL LAYOUT (v5.9-fix6-scavmem):
+ * TOMBOL LAYOUT (final v5.9-fix5):
  *
  *  VIEWFINDER:
  *    BOOT short  = capture foto
@@ -62,14 +61,14 @@
  *    D short     = foto berikutnya (zoom=0) / pan kanan (zoom>0)
  *    D long      = AI Feature Menu
  *
- *  AI DESCRIBE (Scavenger Hunt):
- *    B short     = kembali
- *    B long      = RESET skor Scavenger Hunt (minta konfirmasi)
- *    C short/long= scroll up
- *    D short/long= scroll down
- *
  * UI THEME : Monochrome — full black/gray/white, terminal aesthetic
  * DISPLAY  : ILI9341 2.4" 320x240 landscape
+ *
+ * LIBRARY:
+ *   - ArduinoJson by Benoit Blanchon  (v6.x)
+ *   - LovyanGFX
+ *   - TJpg_Decoder
+ *   - JPEGDEC
  */
 
 #include "esp_camera.h"
@@ -118,27 +117,6 @@ struct NotifStyle {
   uint16_t    iconFg;
   const char* sym;
 };
-
-#define SCAV_CHALLENGE_LEN  120     // max panjang 1 tantangan
-#define SCAV_ACTIVE_LEN     160     // max panjang tantangan aktif
-
-struct ScavParseResult {
-  char tantangan[SCAV_CHALLENGE_LEN];
-  char hasil[16];       // "lulus" atau "gagal"
-  int  poin;
-  char tantanganBaru[SCAV_ACTIVE_LEN];
-  char kategori[24];
-  bool valid;
-};
-
-struct ButtonEvent {
-  uint8_t  pin;
-  uint32_t dur;
-  bool     isLong;
-  bool     isShort;
-  bool     valid;
-};
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
@@ -250,7 +228,6 @@ static LGFX lcd;
 #define COL_JPG_ACCENT  0x3186
 #define COL_AI_ACCENT   0x07E0
 #define COL_AI_WARN     0xFD20
-#define COL_SCAV_GOLD   0xFEA0  // warna emas untuk skor Scavenger
 
 #define PID_GC2145 0x2145
 #define PID_OV3660 0x3660
@@ -290,386 +267,9 @@ enum AppMode {
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
   MODE_KEY_MANAGER,
-  MODE_SCAV_RESET_CONFIRM,  // ← BARU: konfirmasi reset scavenger
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  ═══════════════════════════════════════════════════════════════
-//  SCAVENGER HUNT MEMORY SYSTEM
-//  ═══════════════════════════════════════════════════════════════
-// ─────────────────────────────────────────────────────────────────────────────
-#define SCAV_INI_PATH       "/sdcard/scavenger.ini"
-#define SCAV_HISTORY_MAX    20      // simpan 20 tantangan terakhir
-
-// Struct untuk satu entry riwayat
-struct ScavHistoryEntry {
-  char  challenge[SCAV_CHALLENGE_LEN]; // deskripsi tantangan
-  int   points;                         // poin yang diperoleh (0 jika gagal)
-  bool  passed;                         // lulus atau gagal
-  char  category[24];                   // kategori/kata kunci tantangan
-};
-
-// State Scavenger Hunt
-struct ScavengerState {
-  int   totalScore;                              // total skor kumulatif
-  int   totalRounds;                             // total round yang sudah dimainkan
-  int   totalPassed;                             // total yang lulus
-  char  activeChallenge[SCAV_ACTIVE_LEN];        // tantangan yang sedang aktif
-  bool  hasPending;                              // ada tantangan yang belum dikerjakan
-  char  pendingFrom[20];                         // nama file foto saat tantangan dibuat
-  ScavHistoryEntry history[SCAV_HISTORY_MAX];    // riwayat tantangan
-  int   historyCount;                            // jumlah entry riwayat tersimpan
-};
-
-static ScavengerState scavState;
-static bool scavStateLoaded = false;
-
-// ─── Inisialisasi state kosong ───
-void scavInitEmpty() {
-  memset(&scavState, 0, sizeof(scavState));
-  scavState.totalScore    = 0;
-  scavState.totalRounds   = 0;
-  scavState.totalPassed   = 0;
-  scavState.hasPending    = false;
-  scavState.historyCount  = 0;
-  scavState.activeChallenge[0] = '\0';
-  scavState.pendingFrom[0]     = '\0';
-}
-
-// ─── Simpan state ke SD card ───
-bool scavSave() {
-  FILE* f = fopen(SCAV_INI_PATH, "w");
-  if (!f) return false;
-
-  fprintf(f, "# Scavenger Hunt Memory - Sanzxcam v5.9-fix6\n");
-  fprintf(f, "total_score=%d\n",   scavState.totalScore);
-  fprintf(f, "total_rounds=%d\n",  scavState.totalRounds);
-  fprintf(f, "total_passed=%d\n",  scavState.totalPassed);
-  fprintf(f, "history_count=%d\n", scavState.historyCount);
-  fprintf(f, "has_pending=%d\n",   (int)scavState.hasPending);
-
-  // Encode challenge: ganti newline dengan \n literal
-  // kita simpan sebagai satu baris dengan | sebagai separator line
-  if (scavState.hasPending) {
-    // escape active challenge: ganti \n jadi [NL]
-    char escaped[SCAV_ACTIVE_LEN * 2];
-    int ei = 0;
-    for (int i = 0; scavState.activeChallenge[i] && ei < (int)sizeof(escaped)-4; i++) {
-      if (scavState.activeChallenge[i] == '\n') {
-        escaped[ei++] = '['; escaped[ei++] = 'N'; escaped[ei++] = 'L'; escaped[ei++] = ']';
-      } else if (scavState.activeChallenge[i] == '\r') {
-        // skip
-      } else {
-        escaped[ei++] = scavState.activeChallenge[i];
-      }
-    }
-    escaped[ei] = '\0';
-    fprintf(f, "active_challenge=%s\n", escaped);
-    fprintf(f, "pending_from=%s\n", scavState.pendingFrom);
-  }
-
-  // Simpan riwayat
-  for (int i = 0; i < scavState.historyCount; i++) {
-    // escape challenge text
-    char escaped[SCAV_CHALLENGE_LEN * 2];
-    int ei = 0;
-    for (int j = 0; scavState.history[i].challenge[j] && ei < (int)sizeof(escaped)-4; j++) {
-      char c = scavState.history[i].challenge[j];
-      if (c == '\n') { escaped[ei++]='['; escaped[ei++]='N'; escaped[ei++]='L'; escaped[ei++]=']'; }
-      else if (c == '\r') { /* skip */ }
-      else escaped[ei++] = c;
-    }
-    escaped[ei] = '\0';
-    fprintf(f, "h%d_challenge=%s\n", i, escaped);
-    fprintf(f, "h%d_points=%d\n",    i, scavState.history[i].points);
-    fprintf(f, "h%d_passed=%d\n",    i, (int)scavState.history[i].passed);
-    fprintf(f, "h%d_category=%s\n",  i, scavState.history[i].category);
-  }
-
-  fclose(f);
-  Serial.printf("[SCAV] state saved: score=%d rounds=%d hist=%d\n",
-                scavState.totalScore, scavState.totalRounds, scavState.historyCount);
-  return true;
-}
-
-// ─── Unescape [NL] → \n ───
-static void scavUnescape(const char* src, char* dst, int dstLen) {
-  int di = 0;
-  for (int i = 0; src[i] && di < dstLen - 1; ) {
-    if (src[i]=='[' && src[i+1]=='N' && src[i+2]=='L' && src[i+3]==']') {
-      dst[di++] = '\n'; i += 4;
-    } else {
-      dst[di++] = src[i++];
-    }
-  }
-  dst[di] = '\0';
-}
-
-// ─── Load state dari SD card ───
-bool scavLoad() {
-  scavInitEmpty();
-  FILE* f = fopen(SCAV_INI_PATH, "r");
-  if (!f) {
-    Serial.println("[SCAV] tidak ada scavenger.ini, mulai fresh");
-    scavStateLoaded = true;
-    return false;
-  }
-
-  char line[512];
-  // parse history sementara
-  struct {
-    char challenge[SCAV_CHALLENGE_LEN * 2];
-    int  points;
-    bool passed;
-    char category[24];
-    bool valid;
-  } tempHist[SCAV_HISTORY_MAX];
-  memset(tempHist, 0, sizeof(tempHist));
-  int maxHistIdx = -1;
-
-  char escActive[SCAV_ACTIVE_LEN * 2] = "";
-
-  while (fgets(line, sizeof(line), f)) {
-    // trim newline
-    int len = strlen(line);
-    while (len > 0 && (line[len-1]=='\n'||line[len-1]=='\r')) line[--len]='\0';
-    if (line[0]=='#'||line[0]=='\0') continue;
-
-    int v = 0;
-    char sval[512] = "";
-
-    if      (sscanf(line, "total_score=%d",   &v)==1) scavState.totalScore   = v;
-    else if (sscanf(line, "total_rounds=%d",  &v)==1) scavState.totalRounds  = v;
-    else if (sscanf(line, "total_passed=%d",  &v)==1) scavState.totalPassed  = v;
-    else if (sscanf(line, "history_count=%d", &v)==1) scavState.historyCount = constrain(v,0,SCAV_HISTORY_MAX);
-    else if (sscanf(line, "has_pending=%d",   &v)==1) scavState.hasPending   = (bool)v;
-    else if (sscanf(line, "active_challenge=%511[^\n]", sval)==1) {
-      strncpy(escActive, sval, sizeof(escActive)-1);
-    }
-    else if (sscanf(line, "pending_from=%19[^\n]", sval)==1) {
-      strncpy(scavState.pendingFrom, sval, sizeof(scavState.pendingFrom)-1);
-    }
-    else {
-      // parse history entries: h0_challenge=... dll
-      int idx = -1;
-      char key[32] = "";
-      // Cek format h<idx>_<key>=<val>
-      if (sscanf(line, "h%d_%31[^=]=%511[^\n]", &idx, key, sval)==3) {
-        if (idx>=0 && idx<SCAV_HISTORY_MAX) {
-          if (idx > maxHistIdx) maxHistIdx = idx;
-          tempHist[idx].valid = true;
-          if      (strcmp(key,"challenge")==0) strncpy(tempHist[idx].challenge, sval, sizeof(tempHist[idx].challenge)-1);
-          else if (strcmp(key,"points")==0)    tempHist[idx].points = atoi(sval);
-          else if (strcmp(key,"passed")==0)    tempHist[idx].passed = (bool)atoi(sval);
-          else if (strcmp(key,"category")==0)  strncpy(tempHist[idx].category, sval, sizeof(tempHist[idx].category)-1);
-        }
-      }
-    }
-  }
-  fclose(f);
-
-  // Unescape active challenge
-  if (scavState.hasPending && escActive[0]) {
-    scavUnescape(escActive, scavState.activeChallenge, SCAV_ACTIVE_LEN);
-  }
-
-  // Copy history dari temp
-  int histCount = constrain(scavState.historyCount, 0, SCAV_HISTORY_MAX);
-  for (int i = 0; i < histCount; i++) {
-    if (!tempHist[i].valid) continue;
-    scavUnescape(tempHist[i].challenge, scavState.history[i].challenge, SCAV_CHALLENGE_LEN);
-    scavState.history[i].points  = tempHist[i].points;
-    scavState.history[i].passed  = tempHist[i].passed;
-    strncpy(scavState.history[i].category, tempHist[i].category, 23);
-  }
-
-  scavStateLoaded = true;
-  Serial.printf("[SCAV] loaded: score=%d rounds=%d hist=%d pending=%d\n",
-                scavState.totalScore, scavState.totalRounds,
-                scavState.historyCount, (int)scavState.hasPending);
-  return true;
-}
-
-// ─── Reset total scavenger ───
-void scavReset() {
-  scavInitEmpty();
-  scavSave();
-  Serial.println("[SCAV] state di-reset");
-}
-
-// ─── Tambah entry riwayat ───
-void scavAddHistory(const char* challenge, int points, bool passed, const char* category) {
-  // Geser riwayat ke bawah jika sudah penuh
-  if (scavState.historyCount >= SCAV_HISTORY_MAX) {
-    // Geser semua ke belakang 1 slot (hapus yang tertua = index terakhir)
-    for (int i = SCAV_HISTORY_MAX - 1; i > 0; i--) {
-      scavState.history[i] = scavState.history[i-1];
-    }
-    scavState.historyCount = SCAV_HISTORY_MAX - 1;
-  }
-  // Sisipkan di awal (index 0 = paling baru)
-  strncpy(scavState.history[0].challenge, challenge, SCAV_CHALLENGE_LEN-1);
-  scavState.history[0].challenge[SCAV_CHALLENGE_LEN-1] = '\0';
-  scavState.history[0].points  = points;
-  scavState.history[0].passed  = passed;
-  strncpy(scavState.history[0].category, category, 23);
-  scavState.history[0].category[23] = '\0';
-  scavState.historyCount++;
-}
-
-// ─── Buat konteks riwayat untuk prompt AI ───
-// Mengembalikan string yang berisi daftar tantangan sebelumnya
-void scavBuildHistoryContext(char* outBuf, int outLen) {
-  outBuf[0] = '\0';
-  if (scavState.historyCount == 0 && !scavState.hasPending) {
-    strncat(outBuf, "Ini adalah tantangan pertama kali. Belum ada riwayat.", outLen-1);
-    return;
-  }
-
-  char tmp[512];
-  snprintf(tmp, sizeof(tmp),
-           "DATA PEMAIN:\n"
-           "- Total skor: %d poin\n"
-           "- Total round dimainkan: %d\n"
-           "- Berhasil lulus: %d dari %d tantangan\n",
-           scavState.totalScore, scavState.totalRounds,
-           scavState.totalPassed, scavState.totalRounds);
-  strncat(outBuf, tmp, outLen-strlen(outBuf)-1);
-
-  if (scavState.hasPending && scavState.activeChallenge[0]) {
-    snprintf(tmp, sizeof(tmp),
-             "\nTANTANGAN AKTIF (BELUM DISELESAIKAN):\n\"%s\"\n"
-             "(dari foto: %s)\n"
-             "PENTING: Karena ada tantangan aktif, evaluasi apakah foto ini "
-             "memenuhi tantangan aktif tersebut!\n",
-             scavState.activeChallenge,
-             scavState.pendingFrom[0] ? scavState.pendingFrom : "sebelumnya");
-    strncat(outBuf, tmp, outLen-strlen(outBuf)-1);
-  }
-
-  if (scavState.historyCount > 0) {
-    strncat(outBuf, "\nRIWAYAT TANTANGAN SEBELUMNYA (JANGAN ULANGI TEMA INI):\n", outLen-strlen(outBuf)-1);
-    int showMax = min(scavState.historyCount, 15);
-    for (int i = 0; i < showMax; i++) {
-      snprintf(tmp, sizeof(tmp), "  %d. [%s] %s - %s (%d poin)\n",
-               i+1,
-               scavState.history[i].category[0] ? scavState.history[i].category : "?",
-               scavState.history[i].challenge,
-               scavState.history[i].passed ? "LULUS" : "GAGAL",
-               scavState.history[i].points);
-      strncat(outBuf, tmp, outLen-strlen(outBuf)-1);
-    }
-  }
-}
-
-// ─── Parse hasil AI Scavenger Hunt ───
-// Format yang diminta AI: TANTANGAN: ... | HASIL: ... | POIN: ... | TANTANGAN BARU: ... | KATEGORI: ...
-
-ScavParseResult scavParseAIResponse(const char* response) {
-  ScavParseResult res;
-  memset(&res, 0, sizeof(res));
-  res.valid = false;
-
-  // Cari masing-masing field
-  const char* pT = strstr(response, "TANTANGAN:");
-  const char* pH = strstr(response, "HASIL:");
-  const char* pP = strstr(response, "POIN:");
-  const char* pTB= strstr(response, "TANTANGAN BARU:");
-  const char* pK = strstr(response, "KATEGORI:");
-
-  auto extractField = [](const char* start, char* out, int outLen) {
-    if (!start) { out[0]='\0'; return; }
-    // skip label
-    const char* colon = strchr(start, ':');
-    if (!colon) { out[0]='\0'; return; }
-    colon++;
-    // trim leading spaces
-    while (*colon == ' ') colon++;
-    // copy hingga | atau \n atau akhir string
-    int i = 0;
-    while (*colon && *colon != '|' && *colon != '\n' && i < outLen-1) {
-      out[i++] = *colon++;
-    }
-    // trim trailing spaces
-    while (i > 0 && out[i-1] == ' ') i--;
-    out[i] = '\0';
-  };
-
-  if (pT)  extractField(pT,  res.tantangan,     SCAV_CHALLENGE_LEN);
-  if (pH)  extractField(pH,  res.hasil,          16);
-  if (pTB) extractField(pTB, res.tantanganBaru,  SCAV_ACTIVE_LEN);
-  if (pK)  extractField(pK,  res.kategori,       24);
-
-  if (pP) {
-    char poinStr[16]; extractField(pP, poinStr, 16);
-    res.poin = atoi(poinStr);
-    res.poin = constrain(res.poin, 0, 10);
-  }
-
-  // Lowercase hasil untuk perbandingan
-  char hasilLow[16];
-  strncpy(hasilLow, res.hasil, 15); hasilLow[15]='\0';
-  for (int i=0; hasilLow[i]; i++) hasilLow[i]=tolower(hasilLow[i]);
-
-  res.valid = (res.tantanganBaru[0] != '\0');
-  return res;
-}
-
-// ─── Update state setelah AI menjawab ───
-void scavUpdateAfterAI(const char* aiResponse, const char* currentFile) {
-  ScavParseResult parsed = scavParseAIResponse(aiResponse);
-
-  if (!scavState.hasPending) {
-    // Ini adalah round baru (tidak ada tantangan pending)
-    // AI baru saja membuat tantangan BARU untuk foto ini
-    // Kita simpan tantangan baru sebagai aktif
-    if (parsed.valid && parsed.tantanganBaru[0]) {
-      strncpy(scavState.activeChallenge, parsed.tantanganBaru, SCAV_ACTIVE_LEN-1);
-      strncpy(scavState.pendingFrom, currentFile ? currentFile : "", 19);
-      scavState.hasPending = true;
-      Serial.printf("[SCAV] tantangan baru disimpan: %.60s...\n", scavState.activeChallenge);
-    }
-  } else {
-    // Ada tantangan pending → ini adalah evaluasi
-    // Update skor berdasarkan hasil
-    scavState.totalRounds++;
-
-    char hasilLow[16];
-    strncpy(hasilLow, parsed.hasil, 15); hasilLow[15]='\0';
-    for (int i=0; hasilLow[i]; i++) hasilLow[i]=tolower(hasilLow[i]);
-    bool passed = (strstr(hasilLow,"lulus") || strstr(hasilLow,"pass") || strstr(hasilLow,"berhasil"));
-
-    if (passed) {
-      scavState.totalScore += parsed.poin;
-      scavState.totalPassed++;
-    }
-
-    // Tambah ke riwayat
-    char histCategory[24] = "";
-    strncpy(histCategory, parsed.kategori[0] ? parsed.kategori : "umum", 23);
-    scavAddHistory(scavState.activeChallenge, passed ? parsed.poin : 0, passed, histCategory);
-
-    Serial.printf("[SCAV] round %d selesai: passed=%d poin=%d total=%d\n",
-                  scavState.totalRounds, (int)passed, parsed.poin, scavState.totalScore);
-
-    // Ganti tantangan aktif dengan yang baru
-    if (parsed.valid && parsed.tantanganBaru[0]) {
-      strncpy(scavState.activeChallenge, parsed.tantanganBaru, SCAV_ACTIVE_LEN-1);
-      strncpy(scavState.pendingFrom, currentFile ? currentFile : "", 19);
-      scavState.hasPending = true;
-    } else {
-      // Tidak ada tantangan baru dari AI → hapus pending
-      scavState.activeChallenge[0] = '\0';
-      scavState.pendingFrom[0]     = '\0';
-      scavState.hasPending = false;
-    }
-  }
-
-  // Simpan ke SD
-  scavSave();
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE DEFINITIONS
@@ -692,9 +292,6 @@ struct AIFeatureDef {
   const char* prompt;
 };
 
-// NOTE: Prompt Scavenger Hunt akan dibuild secara DINAMIS (bukan static),
-// karena perlu memasukkan riwayat dari scavState.
-// Prompt di bawah dipakai sebagai TEMPLATE dasar saja.
 static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
   {
     "Describe",
@@ -707,9 +304,13 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
   {
     "Scavenger Hunt",
     "S",
-    COL_SCAV_GOLD,
-    // Prompt ini akan diganti dengan versi dinamis saat runtime
-    "PLACEHOLDER_SCAVENGER"
+    0xFFE0,
+    "Kamu adalah game master Scavenger Hunt. "
+    "Analisis gambar ini dan tentukan apakah gambar tersebut memenuhi tantangan yang diberikan. "
+    "Pertama, sebutkan tantangan yang kamu ciptakan berdasarkan objek di gambar. "
+    "Lalu jawab apakah gambar memenuhi tantangan tersebut, berikan poin 0-10, dan tantangan baru. "
+    "Format: TANTANGAN: [kalimat] | HASIL: [lulus/gagal] | POIN: [angka] | TANTANGAN BARU: [kalimat]. "
+    "Gunakan Bahasa Indonesia."
   },
   {
     "Mood Reader",
@@ -768,80 +369,6 @@ static AIFeature aiSelectedFeature = AI_FEAT_DESCRIBE;
 static bool aiFromViewfinder = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Buat prompt Scavenger Hunt secara dinamis (dengan konteks riwayat)
-// ─────────────────────────────────────────────────────────────────────────────
-#define SCAV_PROMPT_BUF_SIZE 2400
-
-static char scavDynamicPrompt[SCAV_PROMPT_BUF_SIZE];
-
-void scavBuildPrompt(const char* currentFile) {
-  // Pastikan state sudah dimuat
-  if (!scavStateLoaded) scavLoad();
-
-  // Buat konteks riwayat
-  char histCtx[1200];
-  scavBuildHistoryContext(histCtx, sizeof(histCtx));
-
-  bool hasPending = scavState.hasPending && scavState.activeChallenge[0];
-
-  // Build prompt utama
-  char promptBase[SCAV_PROMPT_BUF_SIZE];
-
-  if (hasPending) {
-    // Ada tantangan aktif → evaluasi foto ini terhadap tantangan aktif
-    snprintf(promptBase, sizeof(promptBase),
-      "Kamu adalah game master Scavenger Hunt yang memiliki memori permanen. "
-      "Kamu INGAT semua riwayat tantangan yang pernah diberikan.\n\n"
-      "%s\n\n"
-      "INSTRUKSI:\n"
-      "Foto ini dikirim untuk menyelesaikan TANTANGAN AKTIF di atas.\n"
-      "1. Evaluasi apakah foto ini memenuhi tantangan aktif tersebut.\n"
-      "2. Berikan poin 0-10 berdasarkan seberapa baik foto memenuhi tantangan.\n"
-      "3. Buat TANTANGAN BARU yang BERBEDA dari semua riwayat di atas. "
-      "   Tantangan baru harus kreatif, spesifik, dan bisa dilakukan dengan kamera.\n"
-      "4. Tentukan kategori singkat untuk tantangan baru (1-2 kata, contoh: alam, kuliner, arsitektur, dll).\n\n"
-      "FORMAT WAJIB (ikuti persis, gunakan | sebagai pemisah):\n"
-      "TANTANGAN: [tantangan yang dievaluasi] | "
-      "HASIL: [lulus/gagal] | "
-      "POIN: [0-10] | "
-      "TANTANGAN BARU: [deskripsi tantangan baru dalam 1 kalimat] | "
-      "KATEGORI: [1-2 kata kategori]\n\n"
-      "Setelah format di atas, tambahkan penjelasan singkat kenapa lulus/gagal (2-3 kalimat). "
-      "Gunakan Bahasa Indonesia yang menyenangkan dan memotivasi.",
-      histCtx
-    );
-  } else {
-    // Tidak ada tantangan aktif → buat tantangan baru dari foto ini
-    snprintf(promptBase, sizeof(promptBase),
-      "Kamu adalah game master Scavenger Hunt yang memiliki memori permanen. "
-      "Kamu INGAT semua riwayat tantangan yang pernah diberikan.\n\n"
-      "%s\n\n"
-      "INSTRUKSI:\n"
-      "Analisis foto ini dan buat tantangan Scavenger Hunt yang BARU dan UNIK.\n"
-      "Syarat tantangan baru:\n"
-      "- JANGAN ulangi tema/kategori yang sudah ada di riwayat\n"
-      "- Harus spesifik dan bisa dicapai dengan kamera\n"
-      "- Inspirasi boleh dari objek di foto ini, tapi tidak harus sama persis\n"
-      "- Tingkat kesulitan bervariasi (tidak selalu mudah)\n"
-      "- Deskripsikan dalam 1 kalimat yang jelas\n\n"
-      "FORMAT WAJIB (ikuti persis, gunakan | sebagai pemisah):\n"
-      "TANTANGAN: [deskripsi singkat isi foto ini] | "
-      "HASIL: - | "
-      "POIN: 0 | "
-      "TANTANGAN BARU: [deskripsi tantangan baru dalam 1 kalimat] | "
-      "KATEGORI: [1-2 kata kategori]\n\n"
-      "Setelah format di atas, jelaskan tantangan baru secara detail (2-3 kalimat): "
-      "apa yang harus difoto, kondisi seperti apa, dan tips untuk berhasil. "
-      "Gunakan Bahasa Indonesia yang menyenangkan dan memotivasi.",
-      histCtx
-    );
-  }
-
-  strncpy(scavDynamicPrompt, promptBase, SCAV_PROMPT_BUF_SIZE-1);
-  scavDynamicPrompt[SCAV_PROMPT_BUF_SIZE-1] = '\0';
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  GC2145 Capture Format
 // ─────────────────────────────────────────────────────────────────────────────
 enum GC2145Format : uint8_t {
@@ -855,8 +382,8 @@ enum GC2145Format : uint8_t {
 #define WIFI_INI_PATH    "/sdcard/wifi.ini"
 #define GEMINI_INI_PATH  "/sdcard/gemini.ini"
 #define GEMINI_URL_BASE  "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key="
-#define AI_RESULT_MAX    1200
-#define AI_LINE_MAX       60
+#define AI_RESULT_MAX    800
+#define AI_LINE_MAX       40
 #define AI_LINE_W         56
 
 #define GEMINI_KEY_MAX    5
@@ -889,6 +416,13 @@ static bool kmDirty   = false;
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
 // ─────────────────────────────────────────────────────────────────────────────
+struct ButtonEvent {
+  uint8_t  pin;
+  uint32_t dur;
+  bool     isLong;
+  bool     isShort;
+  bool     valid;
+};
 
 class ButtonManager {
 public:
@@ -1159,7 +693,7 @@ void saveSettings() {
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) return;
-  fprintf(f, "# Sanzxcam v5.9-fix6 settings\n");
+  fprintf(f, "# Sanzxcam v5.9-fix5 settings\n");
   fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
   fprintf(f, "exp_preset=%d\n", (int)expPreset);
   fprintf(f, "exp_val=%d\n",    expManualVal);
@@ -1282,7 +816,7 @@ static void maskApiKey(const char* key, char* out, int outLen) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  GALLERY — type & globals
+//  GALLERY — type & globals (declared EARLY so AI menu can reference them)
 // ─────────────────────────────────────────────────────────────────────────────
 enum GalleryFileType : uint8_t {
   GFILE_JPG   = 0,
@@ -1305,7 +839,7 @@ inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
 inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
 inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
 
-// Forward declarations
+// Forward declarations for functions used in AI feature menu
 void scanGalleryFiles();
 void scanPhotoCount();
 void photoViewRender();
@@ -1351,14 +885,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_5);
     lcd.drawString(numBuf, 5, iy + 10);
 
-    // Untuk Scavenger Hunt, tampilkan badge skor
-    if (i == AI_FEAT_SCAVENGER && scavStateLoaded) {
-      char scoreBadge[12];
-      snprintf(scoreBadge, sizeof(scoreBadge), "%dpt", scavState.totalScore);
-      lcd.setTextColor(isSelected ? COL_SCAV_GOLD : COL_GRAY_5);
-      lcd.drawString(scoreBadge, DISP_W - 36, iy + 10);
-    }
-
     int iconX = 18, iconY = iy + 6;
     lcd.fillRect(iconX, iconY, 14, 14, isSelected ? feat.iconColor : COL_GRAY_3);
     lcd.setTextColor(isSelected ? COL_BLACK : COL_GRAY_7);
@@ -1368,11 +894,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_C);
     lcd.drawString(feat.label, 38, iy + 10);
 
-    // Indikator pending challenge untuk Scavenger
-    if (i == AI_FEAT_SCAVENGER && scavState.hasPending && !isSelected) {
-      lcd.fillCircle(32, iy + 14, 2, COL_SCAV_GOLD);
-    }
-
     if (isSelected) {
       lcd.setTextColor(COL_AI_ACCENT);
       lcd.drawString(">", DISP_W - 12, iy + 10);
@@ -1381,38 +902,12 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
 
   int footerY = startY + AI_FEAT_COUNT * itemH;
 
-  // Untuk Scavenger Hunt yang dipilih, tampilkan info tantangan aktif
-  if (sel == AI_FEAT_SCAVENGER && footerY + 14 < DISP_H - 22) {
-    lcd.drawFastHLine(0, footerY, DISP_W, COL_GRAY_2);
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_SCAV_GOLD);
-    if (scavState.hasPending && scavState.activeChallenge[0]) {
-      char preview[50];
-      snprintf(preview, sizeof(preview), "Aktif: %.44s", scavState.activeChallenge);
-      int maxW = DISP_W - 8;
-      while (strlen(preview) > 6 && lcd.textWidth(preview) > maxW) {
-        int l = strlen(preview);
-        preview[l-1] = '\0';
-        if (strlen(preview) > 3) {
-          preview[strlen(preview)-1] = '.';
-          preview[strlen(preview)-2] = '.';
-          preview[strlen(preview)-3] = '.';
-        }
-      }
-      lcd.drawString(preview, 4, footerY + 4);
-    } else {
-      lcd.setTextColor(COL_GRAY_5);
-      lcd.drawString("Belum ada tantangan - foto dulu!", 4, footerY + 4);
-    }
-  } else if (footerY + 14 < DISP_H - 22) {
+  if (footerY + 14 < DISP_H - 22) {
     lcd.drawFastHLine(0, footerY, DISP_W, COL_GRAY_2);
     lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
     char preview[50];
     strncpy(preview, AI_FEATURES[sel].prompt, 49);
     preview[49] = '\0';
-    // Jangan tampilkan placeholder Scavenger
-    if (strncmp(preview, "PLACEHOLDER", 11) == 0) {
-      strncpy(preview, "AI dengan memori tantangan persisten", 49);
-    }
     int maxW = DISP_W - 8;
     while (strlen(preview) > 6 && lcd.textWidth(preview) > maxW) {
       int l = strlen(preview);
@@ -1444,8 +939,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
 void openAIFeatureMenu(bool fromViewfinder) {
   aiFromViewfinder = fromViewfinder;
   aiSelectedFeature = AI_FEAT_DESCRIBE;
-  // Pastikan scav state sudah dimuat
-  if (!scavStateLoaded) scavLoad();
   drawAIFeatureMenu((int)aiSelectedFeature, fromViewfinder);
   resetAllButtons();
   appMode = MODE_AI_FEATURE_MENU;
@@ -1579,37 +1072,6 @@ void handleModeAIFeatureMenu(ButtonEvent evtBoot, ButtonEvent evtB,
     }
     return;
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  SCAVENGER RESET CONFIRM — Draw
-// ─────────────────────────────────────────────────────────────────────────────
-void drawScavResetConfirm() {
-  int dw = 260, dh = 110, dx = (DISP_W-dw)/2, dy = (DISP_H-dh)/2;
-  lcd.fillRoundRect(dx, dy, dw, dh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(dx, dy, dw, dh, 10, 0xF800);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(0xF800);
-  const char* title = "RESET SCAVENGER HUNT?";
-  lcd.drawString(title, dx+(dw-lcd.textWidth(title))/2, dy+8);
-  lcd.drawFastHLine(dx+10, dy+20, dw-20, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_7);
-  lcd.drawString("Semua data akan terhapus:", dx+10, dy+27);
-  char buf[48];
-  snprintf(buf, sizeof(buf), "  Skor: %d poin", scavState.totalScore);
-  lcd.drawString(buf, dx+10, dy+40);
-  snprintf(buf, sizeof(buf), "  Round: %d  |  Lulus: %d",
-           scavState.totalRounds, scavState.totalPassed);
-  lcd.drawString(buf, dx+10, dy+52);
-  snprintf(buf, sizeof(buf), "  Riwayat: %d tantangan", scavState.historyCount);
-  lcd.drawString(buf, dx+10, dy+64);
-  lcd.drawFastHLine(dx+10, dy+78, dw-20, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_A);
-  const char* hint = "BOOT=YA, HAPUS    B=Batal";
-  lcd.drawString(hint, dx+(dw-lcd.textWidth(hint))/2, dy+86);
-  lcd.setTextColor(COL_GRAY_3);
-  const char* warn = "Tindakan ini tidak bisa dibatalkan!";
-  lcd.drawString(warn, dx+(dw-lcd.textWidth(warn))/2, dy+98);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1866,7 +1328,7 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn,size_t jpgLen,int photoNum,const 
   snprintf(strDesc,sizeof(strDesc),"photo_%04d",photoNum);
   snprintf(strMake,sizeof(strMake),"SANZXCAM");
   snprintf(strModel,sizeof(strModel),"%s",sensorStr?sensorStr:"UNKNOWN");
-  snprintf(strSoftware,sizeof(strSoftware),"v5.9-fix6");
+  snprintf(strSoftware,sizeof(strSoftware),"v5.9-fix5");
   exifMakeTimestamp(strDt,sizeof(strDt));
   int lenDesc=strlen(strDesc)+1,lenMake=strlen(strMake)+1;
   int lenModel=strlen(strModel)+1,lenSoftware=strlen(strSoftware)+1,lenDt=20;
@@ -2994,12 +2456,10 @@ void aiWrapText(const char* text){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI — RENDER layar hasil (dengan Scavenger Hunt header khusus)
+//  AI — RENDER layar hasil
 // ─────────────────────────────────────────────────────────────────────────────
 void drawAIDescribeScreen(){
   lcd.fillScreen(COL_BLACK);
-
-  // Header bar
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
   lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
@@ -3015,37 +2475,12 @@ void drawAIDescribeScreen(){
   lcd.setTextColor(AI_FEATURES[(int)aiSelectedFeature].iconColor);
   lcd.drawString(AI_FEATURES[(int)aiSelectedFeature].icon,4,6);
 
-  // Sub-header: filename
   lcd.setTextColor(COL_GRAY_5);
   char fname[36]; snprintf(fname,sizeof(fname),"[%s]",
     (photoViewIndex>=0&&photoViewIndex<galleryCount)?galleryFiles[photoViewIndex]:"capture");
   lcd.drawString(fname,(DISP_W-lcd.textWidth(fname))/2,22);
 
-  int textStartY = 32;
-
-  // Untuk Scavenger Hunt: tampilkan status bar skor
-  if (aiSelectedFeature == AI_FEAT_SCAVENGER) {
-    lcd.fillRect(0, 32, DISP_W, 16, COL_GRAY_2);
-    lcd.drawFastHLine(0, 48, DISP_W, COL_GRAY_3);
-    lcd.setFont(&fonts::Font0);
-
-    char scoreBuf[32];
-    snprintf(scoreBuf, sizeof(scoreBuf), "S:%d R:%d L:%d/%d",
-             scavState.totalScore,
-             scavState.totalRounds,
-             scavState.totalPassed,
-             scavState.totalRounds);
-    lcd.setTextColor(COL_SCAV_GOLD);
-    lcd.drawString(scoreBuf, 4, 36);
-
-    if (scavState.hasPending) {
-      lcd.setTextColor(COL_AI_WARN);
-      lcd.drawString("*ADA TANTANGAN*", DISP_W - 90, 36);
-    }
-    textStartY = 50;
-  }
-
-  const int lineH=13;
+  const int lineH=13,textStartY=34;
   const int visLines=(DISP_H-textStartY-14)/lineH;
   lcd.fillRect(0,textStartY,DISP_W,DISP_H-textStartY-14,COL_BLACK);
 
@@ -3064,22 +2499,13 @@ void drawAIDescribeScreen(){
     lcd.fillRect(DISP_W-3,indY,3,indH,COL_GRAY_7);
   }
 
-  // Footer
   lcd.fillRect(0,DISP_H-12,DISP_W,12,COL_GRAY_D);
   lcd.drawFastHLine(0,DISP_H-12,DISP_W,COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_5);
-
-  if (aiSelectedFeature == AI_FEAT_SCAVENGER) {
-    char footBuf[52];
-    snprintf(footBuf,sizeof(footBuf),"C=^ D=v  B=kembali  Blong=RESET  %d/%d",
-             aiScrollLine+1,aiTotalLines);
-    lcd.drawString(footBuf,(DISP_W-lcd.textWidth(footBuf))/2,DISP_H-10);
-  } else {
-    char footBuf[52];
-    snprintf(footBuf,sizeof(footBuf),"C=^ D=v   B=kembali   %d/%d baris",
-             aiScrollLine+1,aiTotalLines);
-    lcd.drawString(footBuf,(DISP_W-lcd.textWidth(footBuf))/2,DISP_H-10);
-  }
+  char footBuf[52];
+  snprintf(footBuf,sizeof(footBuf),"C=^ D=v   B=kembali   %d/%d baris",
+           aiScrollLine+1,aiTotalLines);
+  lcd.drawString(footBuf,(DISP_W-lcd.textWidth(footBuf))/2,DISP_H-10);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3305,48 +2731,25 @@ bool doAICall(int idx, const char* customPrompt) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  AI — Entry point utama (dengan Scavenger Hunt memory integration)
+//  AI — Entry point utama
 // ─────────────────────────────────────────────────────────────────────────────
 void openAIDescribeWithFeature(int idx, AIFeature feature) {
   aiSelectedFeature = feature;
   aiDescribeBusy = true;
   aiResult[0] = '\0'; aiTotalLines = 0; aiScrollLine = 0;
 
-  // Tentukan prompt yang dipakai
-  const char* prompt;
-  if (feature == AI_FEAT_SCAVENGER) {
-    // Build prompt dinamis dengan konteks riwayat
-    const char* currentFile = (idx >= 0 && idx < galleryCount) ? galleryFiles[idx] : nullptr;
-    scavBuildPrompt(currentFile);
-    prompt = scavDynamicPrompt;
-    Serial.printf("[SCAV] prompt built (len=%d), hasPending=%d\n",
-                  strlen(prompt), (int)scavState.hasPending);
-  } else {
-    prompt = AI_FEATURES[(int)feature].prompt;
-  }
-
+  const char* prompt = AI_FEATURES[(int)feature].prompt;
   bool ok = doAICall(idx, prompt);
   aiDescribeBusy = false;
 
   if(ok){
-    // Jika Scavenger Hunt: update state memori setelah mendapat jawaban AI
-    if (feature == AI_FEAT_SCAVENGER) {
-      const char* currentFile = (idx >= 0 && idx < galleryCount) ? galleryFiles[idx] : nullptr;
-      scavUpdateAfterAI(aiResult, currentFile);
-    }
-
     aiWrapText(aiResult);
     drawAIDescribeScreen();
     resetAllButtons();
     appMode = MODE_AI_DESCRIBE;
     char notifBuf[32];
-    if (feature == AI_FEAT_SCAVENGER) {
-      snprintf(notifBuf, sizeof(notifBuf), "Skor: %d  Round: %d",
-               scavState.totalScore, scavState.totalRounds);
-    } else {
-      snprintf(notifBuf, sizeof(notifBuf), "%s selesai", AI_FEATURES[(int)feature].label);
-    }
-    islandPush(NOTIF_INFO, notifBuf);
+    snprintf(notifBuf,sizeof(notifBuf),"%s selesai",AI_FEATURES[(int)feature].label);
+    islandPush(NOTIF_INFO,notifBuf);
   } else {
     if(appMode==MODE_AI_NO_CONFIG) return;
     resetAllButtons();
@@ -3354,29 +2757,23 @@ void openAIDescribeWithFeature(int idx, AIFeature feature) {
     photoViewRender();
     photoViewDrawCaption(photoViewIndex);
     char warnBuf[32];
-    snprintf(warnBuf, sizeof(warnBuf), "%s gagal", AI_FEATURES[(int)feature].label);
-    islandPush(NOTIF_WARN, warnBuf);
+    snprintf(warnBuf,sizeof(warnBuf),"%s gagal",AI_FEATURES[(int)feature].label);
+    islandPush(NOTIF_WARN,warnBuf);
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Mode handler untuk MODE_AI_DESCRIBE
-//  (dengan tombol B-long untuk reset Scavenger Hunt)
 // ─────────────────────────────────────────────────────────────────────────────
-void handleModeAIDescribe(ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) {
+void handleModeAIDescribe(ButtonEvent evtB,ButtonEvent evtC,ButtonEvent evtD){
   if(aiDescribeBusy) return;
   bool redraw=false;
-
-  // Hitung visLines berdasarkan apakah Scavenger Hunt (ada status bar ekstra)
-  int textStartY = (aiSelectedFeature == AI_FEAT_SCAVENGER) ? 50 : 32;
-  const int visLines=(DISP_H-textStartY-14)/13;
-
+  const int visLines=(DISP_H-34-14)/13;
   if(evtC.valid&&evtC.isShort){ if(aiScrollLine>0){aiScrollLine--;redraw=true;} }
   if(evtD.valid&&evtD.isShort){ if(aiScrollLine<aiTotalLines-visLines){aiScrollLine++;redraw=true;} }
   if(evtC.valid&&evtC.isLong){ aiScrollLine=max(0,aiScrollLine-5);redraw=true; }
   if(evtD.valid&&evtD.isLong){ aiScrollLine=min(max(0,aiTotalLines-visLines),aiScrollLine+5);redraw=true; }
   if(redraw) drawAIDescribeScreen();
-
   if(evtB.valid&&evtB.isShort){
     resetAllButtons();
     appMode=MODE_PHOTO_VIEW;
@@ -3384,40 +2781,6 @@ void handleModeAIDescribe(ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) 
     photoViewDrawCaption(photoViewIndex);
     photoViewCaptionUntilMs=millis()+2000;
     photoViewCaptionVisible=true;
-  }
-
-  // B-long: reset scavenger (khusus saat di layar Scavenger Hunt)
-  if(evtB.valid&&evtB.isLong&&aiSelectedFeature==AI_FEAT_SCAVENGER){
-    drawScavResetConfirm();
-    resetAllButtons();
-    appMode = MODE_SCAV_RESET_CONFIRM;
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Mode handler: Scavenger Reset Confirm
-// ─────────────────────────────────────────────────────────────────────────────
-void handleModeScavResetConfirm(ButtonEvent evtBoot, ButtonEvent evtB) {
-  if (evtBoot.valid && evtBoot.isShort) {
-    // Konfirmasi reset
-    scavReset();
-    islandPush(NOTIF_WARN, "Scavenger direset!");
-    resetAllButtons();
-    appMode = MODE_PHOTO_VIEW;
-    photoViewRender();
-    photoViewDrawCaption(photoViewIndex);
-    photoViewCaptionUntilMs = millis() + 2000;
-    photoViewCaptionVisible = true;
-    return;
-  }
-  if (evtB.valid) {
-    // Batal
-    islandPush(NOTIF_INFO, "Reset dibatalkan");
-    resetAllButtons();
-    // Kembali ke layar AI describe
-    drawAIDescribeScreen();
-    appMode = MODE_AI_DESCRIBE;
-    return;
   }
 }
 
@@ -3467,16 +2830,6 @@ void renderViewfinder(){
         if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
         else             snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
         drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
-      }
-      // Scavenger skor pill (tampil jika ada data)
-      if (scavState.totalRounds > 0 || scavState.hasPending) {
-        char scavPill[16];
-        if (scavState.hasPending) {
-          snprintf(scavPill, sizeof(scavPill), "S!%d", scavState.totalScore);
-        } else {
-          snprintf(scavPill, sizeof(scavPill), "S:%d", scavState.totalScore);
-        }
-        drawPill(DISP_W/2, DISP_H-22, scavPill, COL_GRAY_2, COL_SCAV_GOLD);
       }
       const char* fmtTag;
       if(detectedSensor==PID_GC2145) fmtTag=(gc2145CaptureFormat==GFMT_BMP)?"BMP":"JPG";
@@ -3792,7 +3145,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
   const char* sub="ESP32-S3  CAMERA SYSTEM";
   lcd.drawString(sub,cx-lcd.textWidth(sub)/2,cy+10);
   lcd.setTextColor(COL_GRAY_3);
-  const char* ver="v5.9-fix6-scavmem";
+  const char* ver="v5.9-fix5";
   lcd.drawString(ver,cx-lcd.textWidth(ver)/2,cy+22);
   lcd.drawFastHLine(cx-80,cy+32,160,COL_GRAY_2);
   delay(600);esp_task_wdt_reset();
@@ -3812,7 +3165,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
   lcd.drawFastHLine(0,14,DISP_W,COL_GRAY_3);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_7);lcd.drawString("SANZXCAM",8,3);
-  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix6",DISP_W-52,3);
+  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix5",DISP_W-52,3);
   lcd.setTextColor(COL_GRAY_2);lcd.drawString("boot sequence",cx-32,3);
   delay(80);esp_task_wdt_reset();
 
@@ -3845,15 +3198,6 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
     else strncpy(keyBuf,"not found / no key",sizeof(keyBuf)-1);
     bootLogRow(y,"gemini.ini",keyBuf,geminiKeyCount>0?COL_AI_ACCENT:COL_GRAY_3);
     delay(100);y+=10;esp_task_wdt_reset();
-    // Log scavenger state
-    char scavBuf[28];
-    if(scavState.totalRounds>0)
-      snprintf(scavBuf,sizeof(scavBuf),"score=%d R=%d hist=%d",
-               scavState.totalScore,scavState.totalRounds,scavState.historyCount);
-    else
-      strncpy(scavBuf,"fresh start",sizeof(scavBuf)-1);
-    bootLogRow(y,"scavenger",scavBuf,scavState.totalRounds>0?COL_SCAV_GOLD:COL_GRAY_3);
-    delay(100);y+=10;esp_task_wdt_reset();
   }
 
   y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=2;
@@ -3865,6 +3209,19 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
   char heapBuf[16]; snprintf(heapBuf,sizeof(heapBuf),"%uKB",(unsigned)(ESP.getFreeHeap()/1024));
   bootLogRow(y,"HEAP FREE",heapBuf,COL_GRAY_7);
   delay(100);y+=10;esp_task_wdt_reset();
+
+  y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=2;
+  bootLogSection(y,"AI FEATURES");y+=13;
+  bootLogRow(y,"Clong (viewfinder)","AI Feature Menu",COL_AI_ACCENT);
+  delay(80);y+=10;esp_task_wdt_reset();
+  bootLogRow(y,"Dlong (gallery)","AI Feature Menu",COL_AI_ACCENT);
+  delay(80);y+=10;esp_task_wdt_reset();
+  bootLogRow(y,"Dlong (photo view)","AI Feature Menu",COL_AI_ACCENT);
+  delay(80);y+=10;esp_task_wdt_reset();
+  bootLogRow(y,"fitur","Describe/Scavenger/Mood/ANPR",COL_GRAY_7);
+  delay(80);y+=10;esp_task_wdt_reset();
+  bootLogRow(y,"      ","Sky/Pest/Produce",COL_GRAY_7);
+  delay(80);y+=10;esp_task_wdt_reset();
 
   y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=4;
   int barX=8,barW2=DISP_W-16,barH=3;
@@ -3900,7 +3257,7 @@ void drawUSBModeScreen(){
   lcd.setTextColor(COL_GRAY_3);lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix6",DISP_W-52,4);
+  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix5",DISP_W-52,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b);lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -3943,9 +3300,7 @@ void exitUSBMode(){
   lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
   sdReady=remountVFSOnly();
   if(sdReady){
-    scanPhotoCount();loadSettings();loadGeminiConfig();
-    scavLoad();  // reload scav state setelah USB mode
-    applyExpPreset(expPreset);
+    scanPhotoCount();loadSettings();loadGeminiConfig();applyExpPreset(expPreset);
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf2[32]; snprintf(buf2,sizeof(buf2),"sd ok  next #%04d",photoCount+1);
     lcd.setTextColor(COL_GRAY_C);lcd.drawString(buf2,(DISP_W-lcd.textWidth(buf2))/2,DISP_H/2-6);
@@ -3965,16 +3320,13 @@ void exitUSBMode(){
 // ─────────────────────────────────────────────────────────────────────────────
 void setup(){
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.9-fix6-scavmem ===");
-  Serial.println("[SCAV-MEM] Scavenger Hunt memory persisten di SD card");
-  Serial.println("[SCAV-MEM] File: /sdcard/scavenger.ini");
-  Serial.println("[SCAV-MEM] 20 riwayat tantangan, skor kumulatif, tantangan aktif antar sesi");
+  Serial.println("\n=== Sanzxcam v5.9-fix5 ===");
+  Serial.println("[AI-MENU] 7 fitur: Describe/Scavenger/Mood/ANPR/Sky/Pest/Produce");
+  Serial.println("[TRIGGER] Clong=viewfinder  Dlong=gallery  Dlong=photo view");
 
   galleryFiles   =(char(*)[32])     ps_malloc(GALLERY_MAX_FILES*32);
   galleryFileType=(GalleryFileType*)ps_malloc(GALLERY_MAX_FILES*sizeof(GalleryFileType));
   if(!galleryFiles||!galleryFileType){Serial.println("PSRAM alloc failed!");ESP.restart();}
-
-  scavInitEmpty();  // init scav state kosong
 
   pinMode(LED_PIN,  OUTPUT);digitalWrite(LED_PIN,  LOW);
   pinMode(LED_FLASH,OUTPUT);digitalWrite(LED_FLASH,LOW);
@@ -3995,7 +3347,6 @@ void setup(){
   if(sdReady){
     scanPhotoCount();scanVideoCount();
     loadSettings();loadWifiConfig();loadGeminiConfig();
-    scavLoad();  // load scavenger state dari SD card
   }
 
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
@@ -4186,7 +3537,7 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
   }
   if(evtD.valid&&(millis()-lastToggleTime)>=200){
     mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
-    char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1fx",(double)mjpegSpeeds[mjpegSpeedIdx]);
+    char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf);lastToggleTime=millis();
   }
   loopMjpegPlayer();
@@ -4237,7 +3588,9 @@ void handleModeMenuExp(ButtonEvent evt){
   else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+3)%4;drawExpMenu(menuExpSel);}
   else if(evt.pin==BTN_D){
     if(evt.isShort){menuExpSel=(menuExpSel+1)%4;drawExpMenu(menuExpSel);}
-    else if(evt.isLong&&detectedSensor==PID_GC2145){openFormatMenu();}
+    else if(evt.isLong&&detectedSensor==PID_GC2145){
+      openFormatMenu();
+    }
   }
 }
 
@@ -4309,30 +3662,28 @@ void loop(){
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
 
   switch(appMode){
-    case MODE_VIEWFINDER:         handleModeViewfinder(singleEvt);                  break;
-    case MODE_GALLERY:            handleModeGallery(singleEvt);                     break;
-    case MODE_PHOTO_VIEW:         handleModePhotoView(singleEvt);                   break;
-    case MODE_MJPEG_PLAYER:       handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD);    break;
-    case MODE_MENU_LED:           handleModeMenuLed(singleEvt);                     break;
-    case MODE_MENU_EXP:           handleModeMenuExp(singleEvt);                     break;
-    case MODE_MENU_EXP_ADJ:       handleModeMenuExpAdj(singleEvt);                  break;
-    case MODE_DIALOG_DELETE:      handleModeDialogDelete(singleEvt);                break;
-    case MODE_MENU_FORMAT:        handleModeMenuFormat(singleEvt);                  break;
-    case MODE_JUMP_INPUT:         handleModeJumpInput(evtBoot,evtB,evtC,evtD);      break;
-    case MODE_AI_FEATURE_MENU:    handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);  break;
-    case MODE_AI_DESCRIBE:        handleModeAIDescribe(evtB,evtC,evtD);             break;
-    case MODE_AI_NO_CONFIG:       handleModeAINoConfig(evtB,evtD);                  break;
-    case MODE_KEY_MANAGER:        handleModeKeyManager(evtBoot,evtB,evtC,evtD);     break;
-    case MODE_SCAV_RESET_CONFIRM: handleModeScavResetConfirm(evtBoot,evtB);         break;
+    case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
+    case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
+    case MODE_PHOTO_VIEW:      handleModePhotoView(singleEvt);                 break;
+    case MODE_MJPEG_PLAYER:    handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
+    case MODE_MENU_LED:        handleModeMenuLed(singleEvt);                   break;
+    case MODE_MENU_EXP:        handleModeMenuExp(singleEvt);                   break;
+    case MODE_MENU_EXP_ADJ:    handleModeMenuExpAdj(singleEvt);                break;
+    case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
+    case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
+    case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
+    case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
+    case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
+    case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
+    case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
-  if(appMode!=MODE_VIEWFINDER        &&
-     appMode!=MODE_JUMP_INPUT         &&
-     appMode!=MODE_AI_DESCRIBE        &&
-     appMode!=MODE_AI_NO_CONFIG       &&
-     appMode!=MODE_AI_FEATURE_MENU    &&
-     appMode!=MODE_KEY_MANAGER        &&
-     appMode!=MODE_SCAV_RESET_CONFIRM){
+  if(appMode!=MODE_VIEWFINDER      &&
+     appMode!=MODE_JUMP_INPUT       &&
+     appMode!=MODE_AI_DESCRIBE      &&
+     appMode!=MODE_AI_NO_CONFIG     &&
+     appMode!=MODE_AI_FEATURE_MENU  &&
+     appMode!=MODE_KEY_MANAGER){
     islandNoClear=false;
     islandTick();
   }
