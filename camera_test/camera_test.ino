@@ -119,6 +119,27 @@ struct NotifStyle {
   const char* sym;
 };
 
+#define SCAV_CHALLENGE_LEN  120     // max panjang 1 tantangan
+#define SCAV_ACTIVE_LEN     160     // max panjang tantangan aktif
+
+struct ScavParseResult {
+  char tantangan[SCAV_CHALLENGE_LEN];
+  char hasil[16];       // "lulus" atau "gagal"
+  int  poin;
+  char tantanganBaru[SCAV_ACTIVE_LEN];
+  char kategori[24];
+  bool valid;
+};
+
+struct ButtonEvent {
+  uint8_t  pin;
+  uint32_t dur;
+  bool     isLong;
+  bool     isShort;
+  bool     valid;
+};
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
 // ─────────────────────────────────────────────────────────────────────────────
@@ -281,8 +302,6 @@ AppMode prevMode = MODE_VIEWFINDER;
 // ─────────────────────────────────────────────────────────────────────────────
 #define SCAV_INI_PATH       "/sdcard/scavenger.ini"
 #define SCAV_HISTORY_MAX    20      // simpan 20 tantangan terakhir
-#define SCAV_CHALLENGE_LEN  120     // max panjang 1 tantangan
-#define SCAV_ACTIVE_LEN     160     // max panjang tantangan aktif
 
 // Struct untuk satu entry riwayat
 struct ScavHistoryEntry {
@@ -547,14 +566,6 @@ void scavBuildHistoryContext(char* outBuf, int outLen) {
 
 // ─── Parse hasil AI Scavenger Hunt ───
 // Format yang diminta AI: TANTANGAN: ... | HASIL: ... | POIN: ... | TANTANGAN BARU: ... | KATEGORI: ...
-struct ScavParseResult {
-  char tantangan[SCAV_CHALLENGE_LEN];
-  char hasil[16];       // "lulus" atau "gagal"
-  int  poin;
-  char tantanganBaru[SCAV_ACTIVE_LEN];
-  char kategori[24];
-  bool valid;
-};
 
 ScavParseResult scavParseAIResponse(const char* response) {
   ScavParseResult res;
@@ -878,13 +889,6 @@ static bool kmDirty   = false;
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
 // ─────────────────────────────────────────────────────────────────────────────
-struct ButtonEvent {
-  uint8_t  pin;
-  uint32_t dur;
-  bool     isLong;
-  bool     isShort;
-  bool     valid;
-};
 
 class ButtonManager {
 public:
