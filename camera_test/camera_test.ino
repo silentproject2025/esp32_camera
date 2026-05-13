@@ -112,6 +112,41 @@ enum NotifType : uint8_t {
   NOTIF_INFO  = 5,
 };
 
+enum SaveFormat : uint8_t { SAVE_BMP, SAVE_JPG, SAVE_AI_TEMP };
+
+struct SaveRequest {
+  uint8_t* buf;
+  size_t len;
+  uint16_t width;
+  uint16_t height;
+  int photoNum;
+  SaveFormat format;
+  bool isGC2145;
+  pixformat_t pixFormat;
+};
+
+struct RecRequest {
+  uint8_t* buf;
+  size_t len;
+  bool isAllocated;
+};
+
+struct AIRequest {
+  int photoIdx;
+  AIFeature feature;
+};
+
+struct BlinkRequest {
+  int n;
+  int on_ms;
+  int off_ms;
+};
+
+static QueueHandle_t saveQueue = nullptr;
+static QueueHandle_t recQueue = nullptr;
+static QueueHandle_t aiQueue = nullptr;
+static QueueHandle_t blinkQueue = nullptr;
+
 struct NotifStyle {
   uint16_t    iconBg;
   uint16_t    iconFg;
@@ -265,6 +300,10 @@ enum AppMode {
   MODE_JUMP_INPUT,
   MODE_AI_FEATURE_MENU,
   MODE_AI_DESCRIBE,
+enum CaptureState { CAP_IDLE, CAP_WAIT_FLASH, CAP_GRAB };
+static CaptureState captureState = CAP_IDLE;
+static uint32_t captureTimer = 0;
+static bool captureTargetAI = false;
   MODE_AI_NO_CONFIG,
   MODE_KEY_MANAGER,
 };
@@ -1423,6 +1462,61 @@ uint16_t* loadBMP(const char* path,uint16_t* outW,uint16_t* outH){
   uint32_t dataOffset=(uint32_t)hdr[10]|((uint32_t)hdr[11]<<8)|((uint32_t)hdr[12]<<16)|((uint32_t)hdr[13]<<24);
   int32_t bmpW=(int32_t)((uint32_t)hdr[18]|((uint32_t)hdr[19]<<8)|((uint32_t)hdr[20]<<16)|((uint32_t)hdr[21]<<24));
   int32_t bmpH=(int32_t)((uint32_t)hdr[22]|((uint32_t)hdr[23]<<8)|((uint32_t)hdr[24]<<16)|((uint32_t)hdr[25]<<24));
+void saveTask(void* p) {
+  SaveRequest req;
+  while (true) {
+    if (xQueueReceive(saveQueue, &req, portMAX_DELAY)) {
+      bool saved = false;
+      if (req.format == SAVE_BMP) {
+        char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", req.photoNum);
+        char payload[STEGO_BMP_MAX_PAYLOAD];
+        stegoMakePayload(payload, sizeof(payload), req.photoNum);
+        saved = saveBMP(req.buf, req.width, req.height, path, payload, (int)strlen(payload));
+      } else if (req.format == SAVE_JPG || req.format == SAVE_AI_TEMP) {
+        uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
+        if (req.pixFormat == PIXFORMAT_RGB565) {
+           camera_fb_t fb_temp; memset(&fb_temp, 0, sizeof(fb_temp)); fb_temp.buf = req.buf; fb_temp.len = req.len;
+           fb_temp.width = req.width; fb_temp.height = req.height; fb_temp.format = PIXFORMAT_RGB565;
+           ok = frame2jpg(&fb_temp, 85, &jpg_buf, &jpg_len);
+        } else if (req.pixFormat == PIXFORMAT_JPEG) {
+           jpg_buf = req.buf; jpg_len = req.len; ok = true;
+        }
+        if (ok && jpg_buf && jpg_len > 0) {
+          char path[48];
+          if (req.format == SAVE_AI_TEMP) {
+            strncpy(path, "/sdcard/ai_temp.jpg", sizeof(path)-1);
+            FILE* f = fopen(path, "wb");
+            if (f) { size_t w = fwrite(jpg_buf, 1, jpg_len, f); fclose(f); saved = (w == jpg_len); }
+          } else {
+            char payload[STEGO_PAYLOAD_LEN];
+            stegoMakePayload(payload, sizeof(payload), req.photoNum);
+            size_t stegoLen = 0;
+            uint8_t* stegoBuf = stegoEmbedToJpeg(jpg_buf, jpg_len, payload, (int)strlen(payload), &stegoLen);
+            if (!stegoBuf) { stegoBuf = jpg_buf; stegoLen = jpg_len; }
+            size_t finalLen = 0;
+            uint8_t* finalBuf = exifInjectToJpeg(stegoBuf, stegoLen, req.photoNum, sensorName, &finalLen);
+            if (!finalBuf) { finalBuf = stegoBuf; finalLen = stegoLen; }
+            snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", req.photoNum);
+            FILE* f = fopen(path, "wb");
+            if (f) { size_t w = fwrite(finalBuf, 1, finalLen, f); fclose(f); saved = (w == finalLen); }
+            if (finalBuf != stegoBuf) free(finalBuf);
+            if (stegoBuf != jpg_buf) free(stegoBuf);
+          }
+          if (req.pixFormat != PIXFORMAT_JPEG) free(jpg_buf);
+        }
+      }
+      if (req.buf) free(req.buf);
+      if (saved) {
+        char notifText[28];
+        if (req.format == SAVE_AI_TEMP) snprintf(notifText, sizeof(notifText), "AI CAPTURED");
+        else snprintf(notifText, sizeof(notifText), "SAVED %s #%04d", (req.format == SAVE_BMP) ? "BMP" : "JPG", req.photoNum);
+        islandPush(NOTIF_OK, notifText);
+      } else {
+        islandPush(NOTIF_WARN, "WRITE ERR");
+      }
+    }
+  }
+}
   bool topDown=false; if(bmpH<0){topDown=true;bmpH=-bmpH;}
   uint16_t bpp=(uint16_t)hdr[28]|((uint16_t)hdr[29]<<8);
   if(bpp!=24){fclose(f);return nullptr;}
@@ -1602,12 +1696,22 @@ static void blockingWaitAllRelease(uint32_t timeoutMs=500){
   delay(50);
 }
 
-void blinkLED(int n,int on_ms=100,int off_ms=100){
-  for(int i=0;i<n;i++){
-    digitalWrite(LED_PIN,HIGH);delay(on_ms);
-    digitalWrite(LED_PIN,LOW);if(i<n-1)delay(off_ms);
-    esp_task_wdt_reset();
+void blinkTask(void* p) {
+  BlinkRequest req;
+  while (true) {
+    if (xQueueReceive(blinkQueue, &req, portMAX_DELAY)) {
+      for (int i = 0; i < req.n; i++) {
+        digitalWrite(LED_PIN, HIGH); delay(req.on_ms);
+        digitalWrite(LED_PIN, LOW); if (i < req.n - 1) delay(req.off_ms);
+        esp_task_wdt_reset();
+      }
+    }
   }
+}
+
+void blinkLED(int n, int on_ms = 100, int off_ms = 100) {
+  BlinkRequest req = {n, on_ms, off_ms};
+  xQueueSend(blinkQueue, &req, 0);
 }
 
 void drawCornerBrackets(uint16_t col=COL_WHITE){
@@ -2214,29 +2318,34 @@ void mjpegDrawHUD(){
 
 void loopMjpegPlayer(){
   if(!mjpegPlaying) return;
+  static int64_t nextFrameUs = 0;
+
+  if(mjpegNotifUntilMs>0 && millis()>mjpegNotifUntilMs) mjpegClearNotif();
+
   if(!mjpegPaused){
-    int64_t frameStart=esp_timer_get_time();
-    bool ok=mjpeg.readMjpegBuf();
-    if(!ok){
-      if(mjpegLoop){
-        mjpegClose();
-        if(!mjpegOpen(mjpegPathSaved)){resetAllButtons();appMode=MODE_GALLERY;drawGallery();}
+    int64_t now = esp_timer_get_time();
+    if(now >= nextFrameUs){
+      bool ok = mjpeg.readMjpegBuf();
+      if(!ok){
+        if(mjpegLoop){
+          mjpegClose();
+          if(!mjpegOpen(mjpegPathSaved)){ resetAllButtons(); appMode=MODE_GALLERY; drawGallery(); }
+          nextFrameUs = 0;
+          return;
+        }
+        mjpegClose(); resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+        nextFrameUs = 0;
         return;
       }
-      mjpegClose();resetAllButtons();appMode=MODE_GALLERY;drawGallery();return;
+      mjpeg.drawJpg(); mjpegFrame++; mjpegDrawHUD();
+
+      float speed = mjpegSpeeds[mjpegSpeedIdx];
+      int64_t intervalUs = (int64_t)(1000000.0f / (MJPEG_FRAME_RATE * speed));
+      if(nextFrameUs == 0) nextFrameUs = now + intervalUs;
+      else nextFrameUs += intervalUs;
+
+      if(now > nextFrameUs + 500000) nextFrameUs = now + intervalUs;
     }
-    mjpeg.drawJpg();mjpegFrame++;mjpegDrawHUD();
-    if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
-    float speed=mjpegSpeeds[mjpegSpeedIdx];
-    int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
-    int64_t remain=targetUs-(esp_timer_get_time()-frameStart);
-    if(remain>1000){
-      int64_t waitEnd=esp_timer_get_time()+remain;
-      while(esp_timer_get_time()<waitEnd){delayMicroseconds(500);esp_task_wdt_reset();}
-    }
-  } else {
-    if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
-    delay(16);
   }
   esp_task_wdt_reset();
 }
@@ -2289,16 +2398,43 @@ void stopRecording(){
   fpsLastTime=millis();fpsFrameCount=0;
 }
 
+void recTask(void* p) {
+  RecRequest req;
+  while (true) {
+    if (xQueueReceive(recQueue, &req, portMAX_DELAY)) {
+      if (recFile) {
+        fwrite(req.buf, 1, req.len, recFile);
+      }
+      if (req.isAllocated) free(req.buf);
+    }
+  }
+}
+
 void recordFrame(){
   if(!recActive||!recFile) return;
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){esp_task_wdt_reset();return;}
   uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
+  bool isAllocated = false;
   if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
-  else{ok=frame2jpg(fb,70,&jpg_buf,&jpg_len);}
+  else{ok=frame2jpg(fb,70,&jpg_buf,&jpg_len); isAllocated = true;}
   if(ok&&jpg_buf){
-    fwrite(jpg_buf,1,jpg_len,recFile);recFrameCount++;
-    if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
+    RecRequest req;
+    if(fb->format == PIXFORMAT_JPEG) {
+      req.buf = (uint8_t*)ps_malloc(jpg_len);
+      if(req.buf) { memcpy(req.buf, jpg_buf, jpg_len); req.isAllocated = true; }
+    } else {
+      req.buf = jpg_buf;
+      req.isAllocated = true;
+    }
+    req.len = jpg_len;
+    if(req.buf) {
+      if(xQueueSend(recQueue, &req, 0) == pdTRUE) {
+        recFrameCount++;
+      } else {
+        if(req.isAllocated) free(req.buf);
+      }
+    }
   }
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
@@ -2711,42 +2847,24 @@ bool doAICall(int idx, const char* customPrompt) {
   }
 
   drawAIStatus(statusHdr,"parsing respons...");
-  esp_task_wdt_reset();
-
-  DynamicJsonDocument doc(8192);
-  DeserializationError err=deserializeJson(doc,resp);
-  if(err){
-    Serial.printf("[GEMINI] JSON parse error: %s\n",err.c_str());
-    drawAIStatus("parse error","respons tidak valid");
-    delay(2500);return false;
-  }
-
-  const char* text=doc["candidates"][0]["content"]["parts"][0]["text"]|"";
-  if(!text||strlen(text)==0){drawAIStatus("respons kosong","");delay(2000);return false;}
-
-  strncpy(aiResult,text,AI_RESULT_MAX);
-  aiResult[AI_RESULT_MAX]='\0';
-  Serial.printf("[GEMINI] feat=%s hasil: %.80s...\n",featLabel,aiResult);
   return true;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  AI — Entry point utama
-// ─────────────────────────────────────────────────────────────────────────────
+      const char* prompt = AI_FEATURES[(int)req.feature].prompt;
+      bool ok = doAICall(req.photoIdx, prompt);
+      aiDescribeBusy = false;
+      if(ok){
+        aiWrapText(aiResult);
+        drawAIDescribeScreen();
+        resetAllButtons();
+        appMode = MODE_AI_DESCRIBE;
+        char notifBuf[32];
+        snprintf(notifBuf,sizeof(notifBuf),"%s OK",AI_FEATURES[(int)req.feature].label);
+        islandPush(NOTIF_OK, notifBuf);
+      }
 void openAIDescribeWithFeature(int idx, AIFeature feature) {
   aiSelectedFeature = feature;
-  aiDescribeBusy = true;
-  aiResult[0] = '\0'; aiTotalLines = 0; aiScrollLine = 0;
-
-  const char* prompt = AI_FEATURES[(int)feature].prompt;
-  bool ok = doAICall(idx, prompt);
-  aiDescribeBusy = false;
-
-  if(ok){
-    aiWrapText(aiResult);
-    drawAIDescribeScreen();
-    resetAllButtons();
-    appMode = MODE_AI_DESCRIBE;
+  AIRequest req = {idx, feature};
+  xQueueSend(aiQueue, &req, 0);
+}
     char notifBuf[32];
     snprintf(notifBuf,sizeof(notifBuf),"%s selesai",AI_FEATURES[(int)feature].label);
     islandPush(NOTIF_INFO,notifBuf);
@@ -2816,106 +2934,72 @@ void renderViewfinder(){
       uint16_t bktCol=recActive?0xF800:(faceDetectMode?COL_WHITE:COL_GRAY_E);
       drawCornerBrackets(bktCol);
       if(faceDetectMode) runFaceDetect(fb);
-      char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
-      drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
-      char sensorPill[20];
-      snprintf(sensorPill,sizeof(sensorPill),"%s%s",sensorName,ledFlashEnabled?" *":"");
-      drawPill(DISP_W-42,10,sensorPill,COL_PILL_BG,COL_GRAY_A);
-      if(faceDetectMode){
-        char faceBuf[12];
-        snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
-        drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
-      } else if(expPreset>0){
-        char expBuf[12];
-        if(expPreset==3) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
-        else             snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
-        drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
-      }
-      const char* fmtTag;
-      if(detectedSensor==PID_GC2145) fmtTag=(gc2145CaptureFormat==GFMT_BMP)?"BMP":"JPG";
-      else fmtTag="JPG";
-      char shotBuf[12]; snprintf(shotBuf,sizeof(shotBuf),"#%04d %s",photoCount+1,fmtTag);
-      drawPill(38,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
-      drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
-               COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
-      lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
-      lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
-      if(recActive) drawRecIndicator();
-      updateFPS();
-    } else {
-      lcd.fillScreen(COL_BLACK);
-      lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
-      lcd.drawString("format not rgb565",10,110);
-    }
-    esp_camera_fb_return(fb);
+void captureAndPreview(bool targetAI = false){
+  if(captureState != CAP_IDLE) return;
+  captureTargetAI = targetAI;
+  if(ledFlashEnabled){
+    digitalWrite(LED_FLASH,HIGH);
+    captureTimer = millis() + 150;
+    captureState = CAP_WAIT_FLASH;
+  } else {
+    captureState = CAP_GRAB;
   }
-  islandTick();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  captureAndPreview
-// ─────────────────────────────────────────────────────────────────────────────
-void captureAndPreview(){
-  if(ledFlashEnabled){
-    digitalWrite(LED_FLASH,HIGH);delay(150);
-    for(int i=0;i<2;i++){
-      camera_fb_t *tfb=esp_camera_fb_get();
-      if(tfb) esp_camera_fb_return(tfb);
-      esp_task_wdt_reset();
-    }
-  }
-  camera_fb_t *fb=esp_camera_fb_get();
-  if(ledFlashEnabled) digitalWrite(LED_FLASH,LOW);
-  if(!fb){blinkLED(5,50,50);return;}
-  if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
-    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
-    drawCornerBrackets(COL_GRAY_E);
-  }
-  bool saved=false;
-  if(sdReady){
-    photoCount++;
-    bool isGC2145rgb=(detectedSensor==PID_GC2145&&
-                      fb->format==PIXFORMAT_RGB565&&
-                      fb->width==DISP_W&&fb->height==DISP_H);
-    if(isGC2145rgb&&gc2145CaptureFormat==GFMT_BMP){
-      char path[48]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.bmp",photoCount);
-      char payload[STEGO_BMP_MAX_PAYLOAD];
-      stegoMakePayload(payload,sizeof(payload),photoCount);
-      saved=saveBMP(fb->buf,fb->width,fb->height,path,payload,(int)strlen(payload));
-    } else {
-      uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
-      if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
-      else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
-      if(ok&&jpg_buf&&jpg_len>0){
-        char payload[STEGO_PAYLOAD_LEN];
-        stegoMakePayload(payload,sizeof(payload),photoCount);
-        size_t stegoLen=0;
-        uint8_t* stegoBuf=stegoEmbedToJpeg(jpg_buf,jpg_len,payload,(int)strlen(payload),&stegoLen);
-        if(!stegoBuf){stegoBuf=jpg_buf;stegoLen=jpg_len;}
-        size_t finalLen=0;
-        uint8_t* finalBuf=exifInjectToJpeg(stegoBuf,stegoLen,photoCount,sensorName,&finalLen);
-        if(!finalBuf){finalBuf=stegoBuf;finalLen=stegoLen;}
-        char path[40]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.jpg",photoCount);
-        FILE* f=fopen(path,"wb");
-        if(f){size_t w=fwrite(finalBuf,1,finalLen,f);fclose(f);saved=(w==finalLen);}
-        if(finalBuf!=stegoBuf) free(finalBuf);
-        if(stegoBuf!=jpg_buf)  free(stegoBuf);
-        if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
+void runCaptureStateMachine(){
+  if(captureState == CAP_IDLE) return;
+  if(captureState == CAP_WAIT_FLASH){
+    if(millis() >= captureTimer){
+      for(int i=0;i<2;i++){
+        camera_fb_t *tfb=esp_camera_fb_get();
+        if(tfb) esp_camera_fb_return(tfb);
+        esp_task_wdt_reset();
       }
+      captureState = CAP_GRAB;
     }
-    if(!saved) photoCount--;
+    return;
   }
-  esp_camera_fb_return(fb);
-  if(saved){
-    char notifText[28];
-    bool isBmpSave=(detectedSensor==PID_GC2145&&gc2145CaptureFormat==GFMT_BMP);
-    snprintf(notifText,sizeof(notifText),"SAVED %s #%04d",isBmpSave?"BMP":"JPG",photoCount);
-    islandPush(NOTIF_OK,notifText); blinkLED(2,150,80);
-  } else {
-    islandPush(NOTIF_WARN,sdReady?"WRITE ERR":"NO SD CARD"); blinkLED(5,50,50);
+  if(captureState == CAP_GRAB){
+    camera_fb_t *fb=esp_camera_fb_get();
+    if(ledFlashEnabled) digitalWrite(LED_FLASH,LOW);
+    if(!fb){ islandPush(NOTIF_WARN,"CAM ERR"); captureState=CAP_IDLE; return; }
+    if(fb->format==PIXFORMAT_RGB565 && fb->width==DISP_W){
+      lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+      drawCornerBrackets(COL_GRAY_E);
+    }
+    if(sdReady){
+      photoCount++;
+      bool isGC2145rgb=(detectedSensor==PID_GC2145 &&
+                        fb->format==PIXFORMAT_RGB565 &&
+                        fb->width==DISP_W && fb->height==DISP_H);
+      SaveRequest req;
+      req.photoNum = photoCount;
+      req.width = fb->width; req.height = fb->height; req.len = fb->len;
+      req.pixFormat = fb->format;
+      req.isGC2145 = (detectedSensor==PID_GC2145);
+      req.buf = (uint8_t*)ps_malloc(fb->len);
+      if(req.buf){
+        memcpy(req.buf, fb->buf, fb->len);
+        if(captureTargetAI) {
+           req.format = SAVE_AI_TEMP;
+        } else {
+           req.format = (isGC2145rgb && gc2145CaptureFormat==GFMT_BMP) ? SAVE_BMP : SAVE_JPG;
+        }
+        if(xQueueSend(saveQueue, &req, 0) != pdTRUE){
+          free(req.buf); photoCount--;
+          islandPush(NOTIF_WARN,"QUEUE FULL");
+        }
+      } else {
+        photoCount--;
+        islandPush(NOTIF_WARN,"MEM ERR");
+      }
+    } else {
+      islandPush(NOTIF_WARN,"NO SD CARD");
+    }
+    esp_camera_fb_return(fb);
+    captureState = CAP_IDLE;
+    resetAllButtons();
   }
-  fpsLastTime=millis();fpsFrameCount=0;
-  resetAllButtons();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3354,6 +3438,14 @@ void setup(){
   msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
   msc.mediaPresent(false);USB.begin();
 
+  blinkQueue = xQueueCreate(10, sizeof(BlinkRequest));
+  saveQueue = xQueueCreate(5, sizeof(SaveRequest));
+  recQueue = xQueueCreate(10, sizeof(RecRequest));
+  aiQueue = xQueueCreate(2, sizeof(AIRequest));
+  xTaskCreatePinnedToCore(blinkTask, "blinkTask", 2048, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(saveTask, "saveTask", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(recTask, "recTask", 4096, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(aiTask, "aiTask", 8192, NULL, 1, NULL, 0);
   bool camOK=initCamera();
   bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
   uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
@@ -3641,6 +3733,7 @@ void handleModeDialogDelete(ButtonEvent evt){
 // ─────────────────────────────────────────────────────────────────────────────
 void loop(){
   esp_task_wdt_reset();
+  runCaptureStateMachine();
   tickAllButtons();
 
   ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
