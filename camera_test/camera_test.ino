@@ -3109,20 +3109,6 @@ void glitchChromatic(const char* text,int cx,int cy,int offsetX,uint16_t colR,ui
   lcd.setTextColor(colB);lcd.drawString(text,cx-tw/2+offsetX,cy-7);
 }
 
-void bootLogRow(int y,const char* label,const char* value,uint16_t valCol){
-  lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5);lcd.drawString(label,8,y);
-  int lx=8+lcd.textWidth(label)+2;
-  for(int dx=lx;dx<230;dx+=4) lcd.drawPixel(dx,y+5,COL_GRAY_2);
-  lcd.setTextColor(valCol);lcd.drawString(value,234,y);
-  esp_task_wdt_reset();
-}
-
-void bootLogSection(int y,const char* title){
-  lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_3);lcd.drawString(title,8,y);
-  lcd.drawFastHLine(8,y+9,DISP_W-16,COL_GRAY_2);
-}
 
 void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
                      bool xclkOK,uint32_t xclkHz){
@@ -3164,83 +3150,6 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
     lcd.fillRect(0,stripe,DISP_W,8,COL_BLACK);delay(10);esp_task_wdt_reset();
   }
 
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRect(0,0,DISP_W,14,COL_GRAY_D);
-  lcd.drawFastHLine(0,14,DISP_W,COL_GRAY_3);
-  lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_7);lcd.drawString("SANZXCAM",8,3);
-  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix5",DISP_W-52,3);
-  lcd.setTextColor(COL_GRAY_2);lcd.drawString("boot sequence",cx-32,3);
-  delay(80);esp_task_wdt_reset();
-
-  int y=20;
-  bootLogSection(y,"CAMERA");y+=13;
-  bootLogRow(y,"SENSOR PID",
-             pidOK?(pid==PID_GC2145?"0x2145  GC2145":"0x3660  OV3660"):"NOT FOUND",
-             pidOK?COL_GRAY_E:COL_GRAY_5);
-  delay(100);y+=10;esp_task_wdt_reset();
-  char xclkBuf[20];
-  snprintf(xclkBuf,sizeof(xclkBuf),"%uMHz  %s",xclkHz/1000000,xclkOK?"OK":"ERR");
-  bootLogRow(y,"XCLK",xclkBuf,xclkOK?COL_GRAY_E:COL_GRAY_5);
-  delay(100);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"RESOLUTION","320x240  QVGA",COL_GRAY_7);
-  delay(100);y+=10;esp_task_wdt_reset();
-
-  y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=2;
-  bootLogSection(y,"STORAGE");y+=13;
-  char sdBuf[20];
-  if(sdOK) snprintf(sdBuf,sizeof(sdBuf),"OK  %lluMB",sdMB);
-  else      snprintf(sdBuf,sizeof(sdBuf),"NOT FOUND");
-  bootLogRow(y,"SD CARD",sdBuf,sdOK?COL_GRAY_E:COL_GRAY_5);
-  delay(100);y+=10;esp_task_wdt_reset();
-  if(sdOK){
-    char photoBuf[16]; snprintf(photoBuf,sizeof(photoBuf),"%04d files",photoCount);
-    bootLogRow(y,"PHOTOS",photoBuf,COL_GRAY_7);
-    delay(100);y+=10;esp_task_wdt_reset();
-    char keyBuf[28];
-    if(geminiKeyCount>0) snprintf(keyBuf,sizeof(keyBuf),"found  %d key valid",geminiKeyCount);
-    else strncpy(keyBuf,"not found / no key",sizeof(keyBuf)-1);
-    bootLogRow(y,"gemini.ini",keyBuf,geminiKeyCount>0?COL_AI_ACCENT:COL_GRAY_3);
-    delay(100);y+=10;esp_task_wdt_reset();
-  }
-
-  y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=2;
-  bootLogSection(y,"SYSTEM");y+=13;
-  bootLogRow(y,"CPU FREQ","240MHz  OK",COL_GRAY_E);
-  delay(100);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"PSRAM",psramFound()?"8MB  OK":"NOT FOUND",psramFound()?COL_GRAY_E:COL_GRAY_5);
-  delay(100);y+=10;esp_task_wdt_reset();
-  char heapBuf[16]; snprintf(heapBuf,sizeof(heapBuf),"%uKB",(unsigned)(ESP.getFreeHeap()/1024));
-  bootLogRow(y,"HEAP FREE",heapBuf,COL_GRAY_7);
-  delay(100);y+=10;esp_task_wdt_reset();
-
-  y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=2;
-  bootLogSection(y,"AI FEATURES");y+=13;
-  bootLogRow(y,"Clong (viewfinder)","AI Feature Menu",COL_AI_ACCENT);
-  delay(80);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"Dlong (gallery)","AI Feature Menu",COL_AI_ACCENT);
-  delay(80);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"Dlong (photo view)","AI Feature Menu",COL_AI_ACCENT);
-  delay(80);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"fitur","Describe/Scavenger/Mood/ANPR",COL_GRAY_7);
-  delay(80);y+=10;esp_task_wdt_reset();
-  bootLogRow(y,"      ","Sky/Pest/Produce",COL_GRAY_7);
-  delay(80);y+=10;esp_task_wdt_reset();
-
-  y+=4;lcd.drawFastHLine(0,y,DISP_W,COL_GRAY_2);y+=4;
-  int barX=8,barW2=DISP_W-16,barH=3;
-  lcd.fillRect(barX,y,barW2,barH,COL_GRAY_2);
-  lcd.drawRect(barX,y,barW2,barH,COL_GRAY_3);
-  for(int i=0;i<=barW2;i+=3){
-    lcd.fillRect(barX,y+1,i,barH-2,COL_GRAY_7);
-    if(i%15==0){delay(8);esp_task_wdt_reset();}
-  }
-  lcd.fillRect(barX,y+1,barW2,barH-2,COL_GRAY_C);
-  y+=barH+4;
-  lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_A);
-  const char* readyMsg="READY";
-  lcd.drawString(readyMsg,cx-lcd.textWidth(readyMsg)/2,y);
-  delay(600);esp_task_wdt_reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
