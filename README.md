@@ -477,9 +477,8 @@ Saat membuka foto di **Photo View**, caption bar bawah akan otomatis menampilkan
 
 ## 🚀 Boot Animation
 
-Boot sequence SANZXCAM terdiri dari **2 fase**:
+Boot sequence SANZXCAM terdiri dari fase Splash Glitch:
 
-### Fase 1 — Splash Glitch (~2.5 detik)
 
 ```
 1. Teks acak muncul (8 char random)
@@ -499,35 +498,6 @@ Boot sequence SANZXCAM terdiri dari **2 fase**:
 15. Wipe fade ke hitam (stripe 8px, 10ms/stripe)
 ```
 
-### Fase 2 — Boot Log (~1.5 detik)
-
-```
-SANZXCAM                                           v5.9-fix
-──────────────────────────────────────────────────────────
-
-CAMERA
-  SENSOR PID ·················· 0x2145  GC2145
-  XCLK ························ 20MHz  OK
-  RESOLUTION ················· 320x240  QVGA
-  FORMAT ····················· RGB565  BMP
-
-STORAGE
-  SD CARD ···················· OK  3814MB
-  FILESYSTEM ················· FAT32
-  PHOTOS ····················· 0042 files
-
-SYSTEM
-  CPU FREQ ··················· 240MHz  OK
-  PSRAM ······················ 8MB  OK
-  HEAP FREE ·················· 248KB
-
-BUILD
-  VERSION ···················· v5.9-fix
-  STEGO-BMP ·················· embed in saveBMP OK
-  FEATURES ··················· EXIF+STEGO+FACE+REC
-
-[████████████████████████████████████████████] READY
-```
 
 ---
 
