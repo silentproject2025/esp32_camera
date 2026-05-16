@@ -248,8 +248,10 @@ Empat LED merah SMD menampilkan status charging dan state of charge baterai dala
 | Preset | Deskripsi |
 |---|---|
 | **AUTO** | Kamera atur sendiri (AEC + AGC on) |
+| **GRAY** | Mode grayscale (AEC/AGC aktif) |
 | **MOON** | Objek terang / bulan (exposure rendah) |
 | **NIGHT** | Malam gelap (exposure & gain tinggi) |
+| **NIGHT-BW** | Malam grayscale |
 | **MANUAL** | Atur `aec_value` 0–1200 dan `agc_gain` 0–30 |
 
 ---

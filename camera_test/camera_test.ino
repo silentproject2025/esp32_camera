@@ -710,7 +710,7 @@ void loadSettings() {
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     int v = 0;
     if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
-    else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v,0,4); }
+    else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v,0,5); }
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
     else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
     else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat= (v==1)?GFMT_JPG:GFMT_BMP; }
@@ -1476,21 +1476,21 @@ unsigned long recStartMs    = 0;
 bool faceDetectMode  = false;
 int  faceDetectCount = 0;
 
-const char* expPresetNames[5] = { "AUTO", "MOON", "NIGHT", "NIGHT-BW", "MANUAL" };
+const char* expPresetNames[6] = { "AUTO", "GRAY", "MOON", "NIGHT", "NIGHT-BW", "MANUAL" };
 
 struct ExpPresetCfg {
   bool aec_on; bool aec2_on; int aec_val;
   bool agc_on; int agc_gain; int gainceiling; int ae_level;
   int special_effect;
 };
-const ExpPresetCfg expPresets[5] = {
+const ExpPresetCfg expPresets[6] = {
   { true,  true,  300,  true,  0, 2,  0, 0 },
+  { true,  true,  300,  true,  0, 2,  0, 2 },
   { false, false,  20,  false, 0, 0, -2, 0 },
   { false, true,  1200, false, 5, 6,  2, 0 },
   { false, true,  1200, false, 5, 6,  2, 2 },
   { false, false, 300,  false, 0, 0,  0, 0 },
 };
-
 int menuLedSel    = 0;
 int menuExpSel    = 0;
 int menuFormatSel = 0;
@@ -2104,7 +2104,7 @@ void openFormatMenu(){
 //  Menu Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 void drawExpMenu(int sel){
-  int mw=220,mh=177,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
+  int mw=220,mh=199,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx,my,mw,mh,10,COL_GRAY_D);
   lcd.drawRoundRect(mx,my,mw,mh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
@@ -2112,29 +2112,30 @@ void drawExpMenu(int sel){
   const char* title="EXPOSURE MODE";
   lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
   lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
-  const char* labels[5]={
+  const char* labels[6]={
     "AUTO    - kamera atur sendiri",
+    "GRAY    - mode grayscale",
     "MOON    - bulan / objek terang",
     "NIGHT   - malam gelap",
     "NIGHT-BW- malam grayscale",
     "MANUAL  - atur sendiri"
   };
-  for(int i=0;i<5;i++){
+  for(int i=0;i<6;i++){
     int iy=my+24+i*22;
     lcd.fillRect(mx+8,iy,mw-16,18,(i==sel)?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor((i==sel)?COL_WHITE:COL_GRAY_7);
     lcd.drawString(labels[i],mx+14,iy+5);
   }
-  lcd.drawFastHLine(mx+10,my+138,mw-20,COL_GRAY_2);
+  lcd.drawFastHLine(mx+10,my+160,mw-20,COL_GRAY_2);
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("C/D=pilih  BOOT=ok  B=batal",mx+8,my+142);
+  lcd.drawString("C/D=pilih  BOOT=ok  B=batal",mx+8,my+164);
   if(detectedSensor==PID_GC2145){
-    lcd.drawFastHLine(mx+10,my+154,mw-20,COL_GRAY_2);
+    lcd.drawFastHLine(mx+10,my+176,mw-20,COL_GRAY_2);
     lcd.setTextColor(COL_GRAY_5);
     char fmtBuf[28];
     snprintf(fmtBuf,sizeof(fmtBuf),"Format: %s  [D-long=ganti]",
              gc2145CaptureFormat==GFMT_BMP?"BMP":"JPG");
-    lcd.drawString(fmtBuf,mx+8,my+158);
+    lcd.drawString(fmtBuf,mx+8,my+180);
   }
 }
 
@@ -2372,8 +2373,8 @@ void applyExpPreset(uint8_t preset){
   sensor_t *s=esp_camera_sensor_get(); if(!s) return;
   expPreset=preset;
   const ExpPresetCfg& c=expPresets[preset];
-  int aecVal=(preset==4)?expManualVal:c.aec_val;
-  int gainVal=(preset==4)?expManualGain:c.agc_gain;
+  int aecVal=(preset==5)?expManualVal:c.aec_val;
+  int gainVal=(preset==5)?expManualGain:c.agc_gain;
   s->set_exposure_ctrl(s,c.aec_on?1:0);
   s->set_aec2(s,c.aec2_on?1:0);
   if(!c.aec_on) s->set_aec_value(s,aecVal);
@@ -2831,7 +2832,7 @@ void renderViewfinder(){
         drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
       } else if(expPreset>0){
         char expBuf[12];
-        if(expPreset==4) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
+        if(expPreset==5) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
         else             snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
         drawPill(DISP_W/2,10,expBuf,COL_PILL_BG,COL_GRAY_E);
       }
@@ -3489,7 +3490,7 @@ void handleModeMenuExp(ButtonEvent evt){
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
     applyExpPreset((uint8_t)menuExpSel);
-    if(menuExpSel==4){
+    if(menuExpSel==5){
       lcd.fillScreen(COL_BLACK);resetAllButtons();appMode=MODE_MENU_EXP_ADJ;return;
     }
     char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[menuExpSel]);
@@ -3498,9 +3499,9 @@ void handleModeMenuExp(ButtonEvent evt){
     islandNoClear=true;appMode=MODE_VIEWFINDER;
   }
   else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
-  else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+4)%5;drawExpMenu(menuExpSel);}
+  else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+5)%6;drawExpMenu(menuExpSel);}
   else if(evt.pin==BTN_D){
-    if(evt.isShort){menuExpSel=(menuExpSel+1)%5;drawExpMenu(menuExpSel);}
+    if(evt.isShort){menuExpSel=(menuExpSel+1)%6;drawExpMenu(menuExpSel);}
     else if(evt.isLong&&detectedSensor==PID_GC2145){
       openFormatMenu();
     }
@@ -3520,7 +3521,7 @@ void handleModeMenuExpAdj(ButtonEvent evt){
   drawExpAdjOverlay();esp_task_wdt_reset();
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
-    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[4]);
+    char fbBuf[24]; snprintf(fbBuf,sizeof(fbBuf),"MODE: %s",expPresetNames[5]);
     islandPush(NOTIF_INFO,fbBuf);saveSettings();
     lcd.fillScreen(COL_BLACK);resetAllButtons();
     islandNoClear=true;appMode=MODE_VIEWFINDER;return;
@@ -3530,7 +3531,7 @@ void handleModeMenuExpAdj(ButtonEvent evt){
   if(evt.pin==BTN_C){expManualVal=constrain(expManualVal-step,0,1200);changed=true;}
   if(evt.pin==BTN_D){expManualVal=constrain(expManualVal+step,0,1200);changed=true;}
   if(evt.pin==BTN_B){expManualGain=(expManualGain+1)%31;changed=true;}
-  if(changed) applyExpPreset(4);
+  if(changed) applyExpPreset(5);
 }
 
 void handleModeDialogDelete(ButtonEvent evt){
