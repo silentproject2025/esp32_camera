@@ -257,6 +257,8 @@ static const NotifStyle NOTIF_STYLES[6] = {
 // ─────────────────────────────────────────────────────────────────────────────
 //  SCREENSAVER (FLIP CLOCK) DEFINITIONS
 // ─────────────────────────────────────────────────────────────────────────────
+#define SS_WIFI_SSID "Infinix HOT 8"
+#define SS_WIFI_PASS "cimanaja"
 #define SS_CARD_W    72
 #define SS_CARD_H   108
 #define SS_CARD_R     7
@@ -3308,13 +3310,10 @@ void setup(){
   TJpgDec.setJpgScale(1);TJpgDec.setSwapBytes(true);TJpgDec.setCallback(tjpgdecOutput);
 
   sdReady=mountSDFull();
-if(sdReady){
+  if(sdReady){
     scanPhotoCount();scanVideoCount();
     loadSettings();loadWifiConfig();loadGeminiConfig();
-}
-// HARDCODE TEST - hapus setelah konfirmasi
-strncpy(wifiSSID, "Infinix NOTE 30", 63);
-strncpy(wifiPass, "FransiscaAjal", 63);
+  }
 
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
   msc.onRead(onRead);msc.onWrite(onWrite);
@@ -3609,59 +3608,7 @@ void handleModeDialogDelete(ButtonEvent evt){
 // ─────────────────────────────────────────────────────────────────────────────
 //  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
-void loop(){
-  esp_task_wdt_reset();
-  tickAllButtons();
 
-  ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
-  btnBoot.pollEvent(evtBoot);
-  btnB.pollEvent(evtB);
-  btnC.pollEvent(evtC);
-  btnD.pollEvent(evtD);
-
-  ButtonEvent singleEvt={};
-  if     (evtBoot.valid) singleEvt=evtBoot;
-  else if(evtB.valid)    singleEvt=evtB;
-  else if(evtC.valid)    singleEvt=evtC;
-  else if(evtD.valid)    singleEvt=evtD;
-
-  if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
-    photoViewClearCaption();
-
-  if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
-  if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
-
-  switch(appMode){
-    case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
-    case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
-    case MODE_PHOTO_VIEW:      handleModePhotoView(singleEvt);                 break;
-    case MODE_MJPEG_PLAYER:    handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
-    case MODE_MENU_LED:        handleModeMenuLed(singleEvt);                   break;
-    case MODE_MENU_EXP:        handleModeMenuExp(singleEvt);                   break;
-    case MODE_MENU_EXP_ADJ:    handleModeMenuExpAdj(singleEvt);                break;
-    case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
-    case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
-    case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
-    case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
-    case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
-    case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
-    case MODE_SCREENSAVER:     handleModeScreensaver(evtBoot,evtB,evtC,evtD); break;
-    case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
-  }
-
-  if(appMode!=MODE_VIEWFINDER      &&
-     appMode!=MODE_JUMP_INPUT       &&
-     appMode!=MODE_AI_DESCRIBE      &&
-     appMode!=MODE_AI_NO_CONFIG     &&
-     appMode!=MODE_AI_FEATURE_MENU  &&
-     appMode!=MODE_SCREENSAVER     &&
-     appMode!=MODE_KEY_MANAGER){
-    islandNoClear=false;
-    islandTick();
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  SCREENSAVER IMPLEMENTATION
 // ─────────────────────────────────────────────────────────────────────────────
 void initSSThemes() {
@@ -3949,50 +3896,48 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
     return;
   }
 
-  // 2. NTP Sync Attempt
+  // 2. NTP Sync Attempt (Hardcoded WiFi)
   if (!ssNtpSynced) {
-    if (wifiSSID[0] != '\0' && strcmp(wifiSSID, "NamaWiFiKamu") != 0) {
-      static bool attempted = false;
-      if (!attempted) {
-        attempted = true;
+    static bool attempted = false;
+    if (!attempted) {
+      attempted = true;
+      lcd.fillScreen(COL_BLACK);
+      lcd.setFont(&fonts::Font0);
+      lcd.setTextColor(COL_GRAY_7);
+      lcd.drawString("Connecting WiFi...", 85, 100);
+      lcd.drawString(SS_WIFI_SSID, 85, 120);
+
+      Serial.printf("[SS] WiFi Hardcoded: %s\n", SS_WIFI_SSID);
+      WiFi.disconnect(true);
+      delay(100);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(SS_WIFI_SSID, SS_WIFI_PASS);
+
+      unsigned long start = millis();
+      while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
+        delay(100); esp_task_wdt_reset(); tickAllButtons();
+        ButtonEvent abortEvt = {};
+        if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
         lcd.fillScreen(COL_BLACK);
-        lcd.setFont(&fonts::Font0);
-        lcd.setTextColor(COL_GRAY_7);
-        lcd.drawString("Connecting WiFi...", 85, 100);
-        lcd.drawString(wifiSSID, 85, 120);
-
-        Serial.printf("[SS] WiFi Begin: %s\n", wifiSSID);
-        WiFi.disconnect(true);
-        delay(100);
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(wifiSSID, wifiPass);
-
-        unsigned long start = millis();
-        while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
+        lcd.drawString("Syncing Time...", 85, 110);
+        configTime(25200, 0, "pool.ntp.org");
+        start = millis();
+        struct tm t_sync;
+        while(!getLocalTime(&t_sync) && millis()-start < 10000) {
           delay(100); esp_task_wdt_reset(); tickAllButtons();
           ButtonEvent abortEvt = {};
           if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
         }
-
-        if (WiFi.status() == WL_CONNECTED) {
-          lcd.fillScreen(COL_BLACK);
-          lcd.drawString("Syncing Time...", 85, 110);
-          configTime(25200, 0, "pool.ntp.org");
-          start = millis();
-          struct tm t_sync;
-          while(!getLocalTime(&t_sync) && millis()-start < 10000) {
-            delay(100); esp_task_wdt_reset(); tickAllButtons();
-            ButtonEvent abortEvt = {};
-            if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
-          }
-          if (getLocalTime(&t_sync)) {
-            ssNtpSynced = true;
-            ssDigits[0].cur = t_sync.tm_hour/10; ssDigits[1].cur = t_sync.tm_hour%10;
-            ssDigits[2].cur = t_sync.tm_min/10;  ssDigits[3].cur = t_sync.tm_min%10;
-            ssPrevH = t_sync.tm_hour; ssPrevM = t_sync.tm_min;
-            ssPrayLoaded = ssFetchPrayerTimes(t_sync.tm_mday, t_sync.tm_mon+1, t_sync.tm_year+1900);
-            ssLastPrayDay = t_sync.tm_mday;
-          }
+        if (getLocalTime(&t_sync)) {
+          ssNtpSynced = true;
+          ssDigits[0].cur = t_sync.tm_hour/10; ssDigits[1].cur = t_sync.tm_hour%10;
+          ssDigits[2].cur = t_sync.tm_min/10;  ssDigits[3].cur = t_sync.tm_min%10;
+          ssPrevH = t_sync.tm_hour; ssPrevM = t_sync.tm_min;
+          ssPrayLoaded = ssFetchPrayerTimes(t_sync.tm_mday, t_sync.tm_mon+1, t_sync.tm_year+1900);
+          ssLastPrayDay = t_sync.tm_mday;
         }
       }
     }
@@ -4010,8 +3955,7 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
       lcd.fillScreen(COL_BLACK);
       lcd.setTextColor(COL_GRAY_5);
       lcd.drawString("WiFi/NTP Failed", 95, 100);
-      lcd.drawString("Check wifi.ini on SD", 85, 120);
-      lcd.drawString("Press B to exit", 100, 140);
+      lcd.drawString("Press B to exit", 100, 120);
       return;
     }
     return;
@@ -4045,3 +3989,56 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
   // 5. Render Frame
   drawScreensaverFrame(t);
 }
+void loop(){
+  esp_task_wdt_reset();
+  tickAllButtons();
+
+  ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
+  btnBoot.pollEvent(evtBoot);
+  btnB.pollEvent(evtB);
+  btnC.pollEvent(evtC);
+  btnD.pollEvent(evtD);
+
+  ButtonEvent singleEvt={};
+  if     (evtBoot.valid) singleEvt=evtBoot;
+  else if(evtB.valid)    singleEvt=evtB;
+  else if(evtC.valid)    singleEvt=evtC;
+  else if(evtD.valid)    singleEvt=evtD;
+
+  if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
+    photoViewClearCaption();
+
+  if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
+  if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
+
+  switch(appMode){
+    case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
+    case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
+    case MODE_PHOTO_VIEW:      handleModePhotoView(singleEvt);                 break;
+    case MODE_MJPEG_PLAYER:    handleModeMjpegPlayer(evtBoot,evtB,evtC,evtD); break;
+    case MODE_MENU_LED:        handleModeMenuLed(singleEvt);                   break;
+    case MODE_MENU_EXP:        handleModeMenuExp(singleEvt);                   break;
+    case MODE_MENU_EXP_ADJ:    handleModeMenuExpAdj(singleEvt);                break;
+    case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
+    case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
+    case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
+    case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
+    case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
+    case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
+    case MODE_SCREENSAVER:     handleModeScreensaver(evtBoot,evtB,evtC,evtD); break;
+    case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
+  }
+
+  if(appMode!=MODE_VIEWFINDER      &&
+     appMode!=MODE_JUMP_INPUT       &&
+     appMode!=MODE_AI_DESCRIBE      &&
+     appMode!=MODE_AI_NO_CONFIG     &&
+     appMode!=MODE_AI_FEATURE_MENU  &&
+     appMode!=MODE_SCREENSAVER     &&
+     appMode!=MODE_KEY_MANAGER){
+    islandNoClear=false;
+    islandTick();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
