@@ -254,6 +254,45 @@ static const NotifStyle NOTIF_STYLES[6] = {
 // ─────────────────────────────────────────────────────────────────────────────
 //  App Mode
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+//  SCREENSAVER (FLIP CLOCK) DEFINITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+#define SS_CARD_W    72
+#define SS_CARD_H   108
+#define SS_CARD_R     7
+#define SS_CARD_GAP   5
+#define SS_COLON_W   18
+
+struct SSTheme {
+  const char* name;
+  uint8_t     style;
+  uint16_t bg, cardTop, cardBot;
+  uint16_t text, textDim;
+  uint16_t hinge, shine, colon;
+  uint16_t sec, date, accent;
+};
+
+struct SSDigitState { int cur, nxt; bool flipping; float progress; };
+struct SSPrayTime { int hour; int minute; };
+
+static SSTheme ssThemes[12];
+static int     ssCurTheme = 0;
+static SSDigitState ssDigits[4];
+static int     ssPrevH = -1, ssPrevM = -1, ssPrevS = -1;
+static bool    ssNtpSynced = false;
+static bool    ssColonVisible = true;
+static SSPrayTime ssPrayTimes[5];
+static const char* ssPrayNames[] = { "SUBUH","DZUHUR","ASHAR","MAGHRIB","ISYA" };
+static bool    ssPrayLoaded = false;
+static int     ssLastPrayDay = -1;
+static uint32_t ssNotifShowUntil = 0;
+static int     ssNotifPrayIdx = -1;
+static uint32_t ssLastRetryMs = 0;
+#define SS_RETRY_INTERVAL 300000
+
+static int ssCardX[4], ssCardY;
+static LGFX_Sprite ssScreen(&lcd);
+static LGFX_Sprite ssCardSpr(&lcd);
 enum AppMode {
   MODE_VIEWFINDER,
   MODE_GALLERY,
@@ -337,46 +376,6 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
     "Gunakan Bahasa Indonesia."
   },
   {
-// ─────────────────────────────────────────────────────────────────────────────
-//  SCREENSAVER (FLIP CLOCK) DEFINITIONS
-// ─────────────────────────────────────────────────────────────────────────────
-#define SS_CARD_W    72
-#define SS_CARD_H   108
-#define SS_CARD_R     7
-#define SS_CARD_GAP   5
-#define SS_COLON_W   18
-
-struct SSTheme {
-  const char* name;
-  uint8_t     style;
-  uint16_t bg, cardTop, cardBot;
-  uint16_t text, textDim;
-  uint16_t hinge, shine, colon;
-  uint16_t sec, date, accent;
-};
-
-struct SSDigitState { int cur, nxt; bool flipping; float progress; };
-struct SSPrayTime { int hour; int minute; };
-
-static SSTheme ssThemes[12];
-static int     ssCurTheme = 0;
-static SSDigitState ssDigits[4];
-static int     ssPrevH = -1, ssPrevM = -1, ssPrevS = -1;
-static bool    ssNtpSynced = false;
-static bool    ssColonVisible = true;
-static SSPrayTime ssPrayTimes[5];
-static const char* ssPrayNames[] = { "SUBUH","DZUHUR","ASHAR","MAGHRIB","ISYA" };
-static bool    ssPrayLoaded = false;
-static int     ssLastPrayDay = -1;
-static uint32_t ssNotifShowUntil = 0;
-static int     ssNotifPrayIdx = -1;
-static uint32_t ssLastRetryMs = 0;
-#define SS_RETRY_INTERVAL 300000
-
-static int ssCardX[4], ssCardY;
-static LGFX_Sprite ssScreen(&lcd);
-static LGFX_Sprite ssCardSpr(&lcd);
-
     "Sky Watch",
     "W",
     0x841F,
