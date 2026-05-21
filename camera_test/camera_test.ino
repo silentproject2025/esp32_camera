@@ -3313,8 +3313,8 @@ if(sdReady){
     loadSettings();loadWifiConfig();loadGeminiConfig();
 }
 // HARDCODE TEST - hapus setelah konfirmasi
-strncpy(wifiSSID, "Infinix HOT 8", 63);
-strncpy(wifiPass, "cimanaja", 63);
+strncpy(wifiSSID, "Infinix NOTE 30", 63);
+strncpy(wifiPass, "FransiscaAjal", 63);
 
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
   msc.onRead(onRead);msc.onWrite(onWrite);
