@@ -3308,11 +3308,14 @@ void setup(){
   TJpgDec.setJpgScale(1);TJpgDec.setSwapBytes(true);TJpgDec.setCallback(tjpgdecOutput);
 
   sdReady=mountSDFull();
-  if(sdReady){
+ if(sdReady){
     scanPhotoCount();scanVideoCount();
     loadSettings();loadWifiConfig();loadGeminiConfig();
-  }
-
+}
+// HARDCODE TEST - hapus setelah konfirmasi
+strncpy(wifiSSID, "Infinix HOT 8", 63);
+strncpy(wifiPass, "cimanaja", 63);
+  
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
   msc.onRead(onRead);msc.onWrite(onWrite);
   msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
