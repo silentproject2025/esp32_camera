@@ -3937,6 +3937,16 @@ void drawScreensaverFrame(struct tm& t) {
 }
 
 void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) {
+  // 1. Prioritize Exit
+  if (evtB.valid) {
+    lcd.fillScreen(COL_BLACK);
+    islandNoClear = true;
+    resetAllButtons();
+    appMode = MODE_VIEWFINDER;
+    return;
+  }
+
+  // 2. NTP Sync Attempt
   if (!ssNtpSynced) {
     if (wifiSSID[0] != '\0' && strcmp(wifiSSID, "NamaWiFiKamu") != 0) {
       static bool attempted = false;
@@ -3945,16 +3955,33 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
         lcd.fillScreen(COL_BLACK);
         lcd.setFont(&fonts::Font0);
         lcd.setTextColor(COL_GRAY_7);
-        lcd.drawString("Syncing Time...", 110, 110);
-        Serial.printf("[SS] Connecting to %s...\n", wifiSSID);
+        lcd.drawString("Connecting WiFi...", 85, 100);
+        lcd.drawString(wifiSSID, 85, 120);
+
+        Serial.printf("[SS] WiFi Begin: %s\n", wifiSSID);
+        WiFi.disconnect(true);
+        delay(100);
+        WiFi.mode(WIFI_STA);
         WiFi.begin(wifiSSID, wifiPass);
+
         unsigned long start = millis();
-        while(WiFi.status() != WL_CONNECTED && millis()-start < 8000) { delay(100); esp_task_wdt_reset(); }
+        while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
+          delay(100); esp_task_wdt_reset(); tickAllButtons();
+          ButtonEvent abortEvt = {};
+          if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
+        }
+
         if (WiFi.status() == WL_CONNECTED) {
+          lcd.fillScreen(COL_BLACK);
+          lcd.drawString("Syncing Time...", 85, 110);
           configTime(25200, 0, "pool.ntp.org");
           start = millis();
           struct tm t_sync;
-          while(!getLocalTime(&t_sync) && millis()-start < 5000) { delay(100); esp_task_wdt_reset(); }
+          while(!getLocalTime(&t_sync) && millis()-start < 10000) {
+            delay(100); esp_task_wdt_reset(); tickAllButtons();
+            ButtonEvent abortEvt = {};
+            if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
+          }
           if (getLocalTime(&t_sync)) {
             ssNtpSynced = true;
             ssDigits[0].cur = t_sync.tm_hour/10; ssDigits[1].cur = t_sync.tm_hour%10;
@@ -3968,28 +3995,34 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
     }
   }
 
-  if (evtB.valid) {
-    lcd.fillScreen(COL_BLACK); islandNoClear = true;
-    resetAllButtons(); appMode = MODE_VIEWFINDER; return;
-  }
+  // 3. Handle Other Inputs
   if (evtBoot.valid && evtBoot.isShort) {
     ssCurTheme = (ssCurTheme + 1) % 12;
   }
 
+  // 4. Update Clock State
   struct tm t;
   if (!getLocalTime(&t)) {
     if (!ssNtpSynced) {
       lcd.fillScreen(COL_BLACK);
       lcd.setTextColor(COL_GRAY_5);
-      lcd.drawString("Clock requires WiFi/NTP", 85, 110);
-      lcd.drawString("Press B to exit", 115, 130);
+      lcd.drawString("WiFi/NTP Failed", 95, 100);
+      lcd.drawString("Check wifi.ini on SD", 85, 120);
+      lcd.drawString("Press B to exit", 100, 140);
       return;
     }
     return;
   }
 
-  if (ssPrayLoaded && t.tm_mday != ssLastPrayDay) { ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900); if (ssPrayLoaded) ssLastPrayDay = t.tm_mday; }
-  if (!ssPrayLoaded && (millis()-ssLastRetryMs) > SS_RETRY_INTERVAL) { ssLastRetryMs = millis(); ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900); if (ssPrayLoaded) ssLastPrayDay = t.tm_mday; }
+  if (ssPrayLoaded && t.tm_mday != ssLastPrayDay) {
+    ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900);
+    if (ssPrayLoaded) ssLastPrayDay = t.tm_mday;
+  }
+  if (!ssPrayLoaded && (millis()-ssLastRetryMs) > SS_RETRY_INTERVAL) {
+    ssLastRetryMs = millis();
+    ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900);
+    if (ssPrayLoaded) ssLastPrayDay = t.tm_mday;
+  }
 
   if (t.tm_sec != ssPrevS) { ssColonVisible = !ssColonVisible; ssCheckPrayerNotif(t); ssPrevS = t.tm_sec; }
   if (t.tm_hour != ssPrevH) { ssTriggerFlip(0, t.tm_hour/10); ssTriggerFlip(1, t.tm_hour%10); ssPrevH = t.tm_hour; }
@@ -3998,8 +4031,14 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
   for (int i=0; i<4; i++) {
     if (ssDigits[i].flipping) {
       ssDigits[i].progress += 0.07f;
-      if (ssDigits[i].progress >= 1.f) { ssDigits[i].cur = ssDigits[i].nxt; ssDigits[i].flipping = false; ssDigits[i].progress = 0.f; }
+      if (ssDigits[i].progress >= 1.f) {
+        ssDigits[i].cur = ssDigits[i].nxt;
+        ssDigits[i].flipping = false;
+        ssDigits[i].progress = 0.f;
+      }
     }
   }
+
+  // 5. Render Frame
   drawScreensaverFrame(t);
 }
