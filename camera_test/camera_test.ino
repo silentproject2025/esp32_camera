@@ -45,6 +45,8 @@
  *    D short     = toggle Face Detect
  *    D long      = Exposure menu (+ format di dalamnya)
  *
+#include <time.h>
+#include <math.h>
  *  GALLERY:
  *    BOOT short  = buka foto/video
  *    BOOT long   = Jump to index
@@ -266,6 +268,7 @@ enum AppMode {
   MODE_AI_FEATURE_MENU,
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
+  MODE_SCREENSAVER,
   MODE_KEY_MANAGER,
 };
 AppMode appMode  = MODE_VIEWFINDER;
@@ -334,6 +337,46 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
     "Gunakan Bahasa Indonesia."
   },
   {
+// ─────────────────────────────────────────────────────────────────────────────
+//  SCREENSAVER (FLIP CLOCK) DEFINITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+#define SS_CARD_W    72
+#define SS_CARD_H   108
+#define SS_CARD_R     7
+#define SS_CARD_GAP   5
+#define SS_COLON_W   18
+
+struct SSTheme {
+  const char* name;
+  uint8_t     style;
+  uint16_t bg, cardTop, cardBot;
+  uint16_t text, textDim;
+  uint16_t hinge, shine, colon;
+  uint16_t sec, date, accent;
+};
+
+struct SSDigitState { int cur, nxt; bool flipping; float progress; };
+struct SSPrayTime { int hour; int minute; };
+
+static SSTheme ssThemes[12];
+static int     ssCurTheme = 0;
+static SSDigitState ssDigits[4];
+static int     ssPrevH = -1, ssPrevM = -1, ssPrevS = -1;
+static bool    ssNtpSynced = false;
+static bool    ssColonVisible = true;
+static SSPrayTime ssPrayTimes[5];
+static const char* ssPrayNames[] = { "SUBUH","DZUHUR","ASHAR","MAGHRIB","ISYA" };
+static bool    ssPrayLoaded = false;
+static int     ssLastPrayDay = -1;
+static uint32_t ssNotifShowUntil = 0;
+static int     ssNotifPrayIdx = -1;
+static uint32_t ssLastRetryMs = 0;
+#define SS_RETRY_INTERVAL 300000
+
+static int ssCardX[4], ssCardY;
+static LGFX_Sprite ssScreen(&lcd);
+static LGFX_Sprite ssCardSpr(&lcd);
+
     "Sky Watch",
     "W",
     0x841F,
@@ -2029,22 +2072,28 @@ void photoViewNext(){
 //  Menu LED
 // ─────────────────────────────────────────────────────────────────────────────
 void drawLedMenu(int sel){
-  int mw=200,mh=90,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
+  int mw=200,mh=114,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx,my,mw,mh,10,COL_GRAY_D);
   lcd.drawRoundRect(mx,my,mw,mh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title="LED FLASH";
+  const char* title="SETTINGS";
   lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
   lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
-  for(int i=0;i<2;i++){
+  for(int i=0;i<3;i++){
     int iy=my+24+i*24;
-    bool isChecked=(i==0)?ledFlashEnabled:!ledFlashEnabled,isHighlight=(i==sel);
+    bool isChecked=(i==0)?ledFlashEnabled:(i==1)?!ledFlashEnabled:false,isHighlight=(i==sel);
     lcd.fillRect(mx+8,iy,mw-16,18,isHighlight?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor(isHighlight?COL_WHITE:(isChecked?COL_GRAY_E:COL_GRAY_7));
-    lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
-    if(isChecked){lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);}
-    lcd.drawString((i==0)?"LED ON   - flash saat capture":"LED OFF  - tanpa flash",mx+24,iy+5);
+    if(i<2){
+      lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
+      if(isChecked){lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);}
+    }else{
+      lcd.drawString(">",mx+13,iy+5);
+    }
+    if(i==0)      lcd.drawString("FLASH ON",mx+24,iy+5);
+    else if(i==1) lcd.drawString("FLASH OFF",mx+24,iy+5);
+    else if(i==2) lcd.drawString("CLOCK / SCREENSAVER",mx+24,iy+5);
   }
   lcd.setTextColor(COL_GRAY_3);
   const char* hint="C/D=pilih  BOOT=ok  B=batal";
@@ -2626,6 +2675,7 @@ bool doAICall(int idx, const char* customPrompt) {
       drawAIStatus("WiFi gagal","periksa wifi.ini");
       delay(2500);return false;
     }
+    configTime(25200, 0, "pool.ntp.org"); struct tm t; if(getLocalTime(&t)){ ssNtpSynced=true; ssDigits[0].cur=t.tm_hour/10; ssDigits[1].cur=t.tm_hour%10; ssDigits[2].cur=t.tm_min/10; ssDigits[3].cur=t.tm_min%10; ssPrevH=t.tm_hour; ssPrevM=t.tm_min; ssPrayLoaded=ssFetchPrayerTimes(t.tm_mday,t.tm_mon+1,t.tm_year+1900); ssLastPrayDay=t.tm_mday; }
   }
 
   char featLabel[24];
@@ -3251,6 +3301,7 @@ void setup(){
 
   setCpuFrequencyMhz(240);
   lcd.init();lcd.setRotation(3);lcd.fillScreen(COL_BLACK);
+  initSSThemes(); initSSLayout(); ssScreen.setColorDepth(16); ssScreen.createSprite(DISP_W, DISP_H); ssCardSpr.setColorDepth(16); ssCardSpr.createSprite(SS_CARD_W, SS_CARD_H); for (int i=0; i<4; i++) ssDigits[i] = {0,0,false,0.f};
 
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
@@ -3453,14 +3504,19 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
     mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
     char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf);lastToggleTime=millis();
-  }
-  loopMjpegPlayer();
-}
-
-void handleModeMenuLed(ButtonEvent evt){
-  if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
-    ledFlashEnabled=(menuLedSel==0);
+    if(menuLedSel<2){
+      ledFlashEnabled=(menuLedSel==0);
+      islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
+      saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
+      islandNoClear=true;appMode=MODE_VIEWFINDER;
+    }else{
+      lcd.fillScreen(COL_BLACK);resetAllButtons();appMode=MODE_SCREENSAVER;
+    }
+  }
+  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
+  else if(evt.pin==BTN_C){menuLedSel=(menuLedSel+2)%3;drawLedMenu(menuLedSel);}
+  else if(evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
     islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
     saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
     islandNoClear=true;appMode=MODE_VIEWFINDER;
@@ -3589,6 +3645,7 @@ void loop(){
     case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
+    case MODE_SCREENSAVER:     handleModeScreensaver(singleEvt);               break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
@@ -3597,8 +3654,353 @@ void loop(){
      appMode!=MODE_AI_DESCRIBE      &&
      appMode!=MODE_AI_NO_CONFIG     &&
      appMode!=MODE_AI_FEATURE_MENU  &&
+     appMode!=MODE_SCREENSAVER     &&
      appMode!=MODE_KEY_MANAGER){
     islandNoClear=false;
     islandTick();
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  SCREENSAVER IMPLEMENTATION
+// ─────────────────────────────────────────────────────────────────────────────
+void initSSThemes() {
+  ssThemes[0] = { "DARK", 0, lcd.color565(12,12,12), lcd.color565(68,68,68), lcd.color565(40,40,40), lcd.color565(240,240,240), lcd.color565(145,145,145), lcd.color565(18,18,18), lcd.color565(95,95,95), lcd.color565(200,200,200), lcd.color565(175,175,175), lcd.color565(88,88,88), lcd.color565(200,200,200) };
+  ssThemes[1] = { "RETRO", 0, lcd.color565(14,7,2), lcd.color565(90,45,5), lcd.color565(55,25,2), lcd.color565(255,165,40), lcd.color565(180,95,20), lcd.color565(20,10,0), lcd.color565(120,60,10), lcd.color565(255,140,20), lcd.color565(220,120,15), lcd.color565(140,70,10), lcd.color565(255,165,40) };
+  ssThemes[2] = { "PAPER", 0, lcd.color565(230,225,215), lcd.color565(200,195,182), lcd.color565(175,170,158), lcd.color565(30,25,18), lcd.color565(95,88,75), lcd.color565(140,135,122), lcd.color565(220,215,205), lcd.color565(60,55,45), lcd.color565(50,45,38), lcd.color565(110,100,85), lcd.color565(30,25,18) };
+  ssThemes[3] = { "BOLD", 1, lcd.color565(0,0,0), lcd.color565(255,255,255), lcd.color565(200,200,200), lcd.color565(0,0,0), lcd.color565(40,40,40), lcd.color565(128,128,128), lcd.color565(255,255,255), lcd.color565(0,0,0), lcd.color565(80,80,80), lcd.color565(160,160,160), lcd.color565(0,0,0) };
+  ssThemes[4] = { "BRICK", 1, lcd.color565(18,5,2), lcd.color565(180,45,15), lcd.color565(130,30,8), lcd.color565(255,230,200), lcd.color565(210,160,110), lcd.color565(90,20,5), lcd.color565(220,80,35), lcd.color565(255,200,150), lcd.color565(230,170,100), lcd.color565(150,60,20), lcd.color565(255,220,160) };
+  ssThemes[5] = { "NEON", 2, lcd.color565(0,0,0), lcd.color565(0,0,0), lcd.color565(0,0,0), lcd.color565(0,255,180), lcd.color565(0,180,120), lcd.color565(0,255,180), lcd.color565(0,100,60), lcd.color565(0,255,180), lcd.color565(0,200,140), lcd.color565(0,180,120), lcd.color565(0,255,180) };
+  ssThemes[6] = { "PLASMA", 2, lcd.color565(2,0,10), lcd.color565(2,0,10), lcd.color565(2,0,10), lcd.color565(255,80,255), lcd.color565(180,40,180), lcd.color565(255,80,255), lcd.color565(120,20,120), lcd.color565(255,80,255), lcd.color565(220,60,220), lcd.color565(160,30,160), lcd.color565(255,80,255) };
+  ssThemes[7] = { "MONO", 3, lcd.color565(18,18,18), lcd.color565(18,18,18), lcd.color565(18,18,18), lcd.color565(220,220,220), lcd.color565(100,100,100), lcd.color565(220,220,220), lcd.color565(60,60,60), lcd.color565(220,220,220), lcd.color565(160,160,160), lcd.color565(80,80,80), lcd.color565(220,220,220) };
+  ssThemes[8] = { "FROST", 3, lcd.color565(230,238,248), lcd.color565(230,238,248), lcd.color565(230,238,248), lcd.color565(20,50,100), lcd.color565(80,120,180), lcd.color565(20,50,100), lcd.color565(180,210,240), lcd.color565(20,50,100), lcd.color565(40,80,140), lcd.color565(90,130,190), lcd.color565(20,50,100) };
+  ssThemes[9] = { "SUNSET", 4, lcd.color565(10,4,14), lcd.color565(160,50,10), lcd.color565(60,10,80), lcd.color565(255,200,120), lcd.color565(200,130,80), lcd.color565(30,5,35), lcd.color565(200,90,40), lcd.color565(255,160,60), lcd.color565(220,130,50), lcd.color565(130,50,100), lcd.color565(255,180,80) };
+  ssThemes[10] = { "OCEAN", 4, lcd.color565(2,8,20), lcd.color565(10,110,140), lcd.color565(5,35,95), lcd.color565(160,245,255), lcd.color565(70,175,215), lcd.color565(4,15,40), lcd.color565(15,140,170), lcd.color565(120,225,245), lcd.color565(90,200,225), lcd.color565(30,90,150), lcd.color565(160,245,255) };
+  ssThemes[11] = { "VINTAGE", 5, lcd.color565(28,22,12), lcd.color565(58,46,26), lcd.color565(42,33,18), lcd.color565(210,185,130), lcd.color565(155,130,80), lcd.color565(75,60,35), lcd.color565(80,65,38), lcd.color565(190,165,110), lcd.color565(170,148,95), lcd.color565(95,78,45), lcd.color565(210,185,130) };
+}
+
+void initSSLayout() {
+  int totalW = 4*SS_CARD_W + 3*SS_CARD_GAP + SS_COLON_W;
+  int startX = (DISP_W - totalW) / 2;
+  ssCardY    = (DISP_H - SS_CARD_H) / 2 - 8;
+  ssCardX[0] = startX;
+  ssCardX[1] = ssCardX[0] + SS_CARD_W + SS_CARD_GAP;
+  ssCardX[2] = ssCardX[1] + SS_CARD_W + SS_CARD_GAP + SS_COLON_W;
+  ssCardX[3] = ssCardX[2] + SS_CARD_W + SS_CARD_GAP;
+}
+
+bool ssFetchPrayerTimes(int day, int month, int year) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  char url[256];
+  snprintf(url, sizeof(url), "http://api.aladhan.com/v1/timings/%02d-%02d-%04d?latitude=%s&longitude=%s&method=%s",
+           day, month, year, "-0.2217", "100.6139", "20");
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != 200) { http.end(); return false; }
+  String payload = http.getString();
+  http.end();
+  StaticJsonDocument<3072> doc;
+  if (deserializeJson(doc, payload)) return false;
+  JsonObject timings = doc["data"]["timings"];
+  auto parseHHMM = [](const char* s, int& h, int& m) {
+    if (!s || strlen(s) < 5) return;
+    char buf[3] = {s[0], s[1], 0}; h = atoi(buf);
+    char buf2[3] = {s[3], s[4], 0}; m = atoi(buf2);
+  };
+  parseHHMM(timings["Fajr"],    ssPrayTimes[0].hour, ssPrayTimes[0].minute);
+  parseHHMM(timings["Dhuhr"],   ssPrayTimes[1].hour, ssPrayTimes[1].minute);
+  parseHHMM(timings["Asr"],     ssPrayTimes[2].hour, ssPrayTimes[2].minute);
+  parseHHMM(timings["Maghrib"], ssPrayTimes[3].hour, ssPrayTimes[3].minute);
+  parseHHMM(timings["Isha"],    ssPrayTimes[4].hour, ssPrayTimes[4].minute);
+  return true;
+}
+
+void ssCheckPrayerNotif(struct tm& t) {
+  for (int i = 0; i < 5; i++) {
+    if (t.tm_hour == ssPrayTimes[i].hour && t.tm_min == ssPrayTimes[i].minute && t.tm_sec == 0) {
+      ssNotifPrayIdx   = i;
+      ssNotifShowUntil = millis() + 30000;
+    }
+  }
+}
+
+void ssDrawHalfCard_classic(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2;
+  SSTheme& t = ssThemes[ssCurTheme];
+  if (isTop) {
+    sp.fillRect(x, y, SS_CARD_W, half, bgCol);
+    sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
+    sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
+    sp.drawFastHLine(x+SS_CARD_R, y+1, SS_CARD_W-SS_CARD_R*2, t.shine);
+  } else {
+    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
+    sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
+    sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
+  }
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard_bold(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
+  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, bgCol); else sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
+  sp.drawRect(x, y, SS_CARD_W, SS_CARD_H, t.hinge); sp.drawRect(x+1, y+1, SS_CARD_W-2, SS_CARD_H-2, t.shine);
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard_neon(LGFX_Sprite& sp, int num, int x, int y, uint16_t glowCol, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
+  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, t.bg); else sp.fillRect(x, y+half, SS_CARD_W, half, t.bg);
+  sp.drawRoundRect(x, y, SS_CARD_W, SS_CARD_H, SS_CARD_R, glowCol);
+  sp.drawRoundRect(x+1, y+1, SS_CARD_W-2, SS_CARD_H-2, SS_CARD_R-1, lcd.color565(min(((glowCol>>11)&0x1F)*2, 31), min(((glowCol>>5)&0x3F)*2, 63), min((glowCol&0x1F)*2, 31)));
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard_minimal(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
+  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, bgCol); else sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
+  if (isTop) sp.drawFastHLine(x, y+half-1, SS_CARD_W, t.hinge); else sp.drawFastHLine(x, y+SS_CARD_H-1, SS_CARD_W, t.hinge);
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard_split(LGFX_Sprite& sp, int num, int x, int y, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme]; uint16_t bgCol = isTop ? t.cardTop : t.cardBot;
+  if (isTop) {
+    sp.fillRect(x, y, SS_CARD_W, half, bgCol); sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
+  } else {
+    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol); sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
+  }
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard_vintage(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
+  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
+  if (isTop) {
+    sp.fillRect(x, y, SS_CARD_W, half, bgCol); sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
+  } else {
+    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol); sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
+    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
+  }
+  int yS = isTop ? y : y+half; int yE = isTop ? y+half : y+SS_CARD_H;
+  for (int ly = yS+2; ly < yE; ly += 4) sp.drawFastHLine(x+2, ly, SS_CARD_W-4, lcd.color565(max(((bgCol>>11)&0x1F)-3, 0), max(((bgCol>>5)&0x3F)-4, 0), max((bgCol&0x1F)-3, 0)));
+  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
+  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
+  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
+  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
+}
+
+void ssDrawHalfCard(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
+  switch (ssThemes[ssCurTheme].style) {
+    case 1: ssDrawHalfCard_bold(sp,num,x,y,bgCol,txtCol,isTop); break;
+    case 2: ssDrawHalfCard_neon(sp,num,x,y,bgCol,txtCol,isTop); break;
+    case 3: ssDrawHalfCard_minimal(sp,num,x,y,bgCol,txtCol,isTop); break;
+    case 4: ssDrawHalfCard_split(sp,num,x,y,txtCol,isTop); break;
+    case 5: ssDrawHalfCard_vintage(sp,num,x,y,bgCol,txtCol,isTop); break;
+    default: ssDrawHalfCard_classic(sp,num,x,y,bgCol,txtCol,isTop); break;
+  }
+}
+
+void ssDrawStaticCard(LGFX_Sprite& sp, int idx) {
+  int x = ssCardX[idx], y = ssCardY, num = ssDigits[idx].cur;
+  SSTheme& t = ssThemes[ssCurTheme];
+  ssDrawHalfCard(sp, num, x, y, t.cardTop, t.text, true);
+  ssDrawHalfCard(sp, num, x, y, t.cardBot, t.textDim, false);
+  sp.drawFastHLine(x, y+SS_CARD_H/2, SS_CARD_W, t.hinge); sp.drawFastHLine(x, y+SS_CARD_H/2+1, SS_CARD_W, t.hinge);
+  for (int i=0;i<5;i++) { uint8_t v = 4+i*4; sp.drawFastHLine(x+2, y+SS_CARD_H+i, SS_CARD_W-4, lcd.color565(v,v,v)); }
+}
+
+void ssDrawFlipCard(LGFX_Sprite& sp, int idx) {
+  int x = ssCardX[idx], y = ssCardY; float p = ssDigits[idx].progress;
+  int cur = ssDigits[idx].cur, nxt = ssDigits[idx].nxt;
+  int half = SS_CARD_H / 2; float ep = p < 0.5f ? 2.f*p*p : 1.f-2.f*(1.f-p)*(1.f-p);
+  SSTheme& t = ssThemes[ssCurTheme];
+  if (ep < 0.5f) {
+    ssDrawHalfCard(sp, nxt, x, y, t.cardTop, t.text, true);
+    ssDrawHalfCard(sp, cur, x, y, t.cardBot, t.textDim, false);
+    int flipH = (int)(half*(1.f-ep*2.f));
+    if (flipH > 0) {
+      ssCardSpr.fillSprite(t.bg); ssDrawHalfCard(ssCardSpr, cur, 0, 0, t.cardTop, t.text, true);
+      for (int row=0; row<flipH; row++) {
+        int srcRow = (int)((float)row/flipH*half);
+        for (int col=0; col<SS_CARD_W; col++) sp.drawPixel(x+col, y+half-flipH+row, ssCardSpr.readPixel(col,srcRow));
+      }
+    }
+  } else {
+    ssDrawHalfCard(sp, nxt, x, y, t.cardTop, t.text, true);
+    ssDrawHalfCard(sp, cur, x, y, t.cardBot, t.textDim, false);
+    int flipH = (int)(half*(ep-0.5f)*2.f);
+    if (flipH > 0) {
+      ssCardSpr.fillSprite(t.bg); ssDrawHalfCard(ssCardSpr, nxt, 0, 0, t.cardBot, t.textDim, false);
+      for (int row=0; row<flipH; row++) {
+        int srcRow = half+(int)((float)row/flipH*half); if (srcRow>=SS_CARD_H) srcRow=SS_CARD_H-1;
+        for (int col=0; col<SS_CARD_W; col++) sp.drawPixel(x+col, y+half+row, ssCardSpr.readPixel(col,srcRow));
+      }
+    }
+  }
+  sp.drawFastHLine(x, y+SS_CARD_H/2, SS_CARD_W, t.hinge); sp.drawFastHLine(x, y+SS_CARD_H/2+1, SS_CARD_W, t.hinge);
+  for (int i=0;i<5;i++) { uint8_t v=4+i*4; sp.drawFastHLine(x+2, y+SS_CARD_H+i, SS_CARD_W-4, lcd.color565(v,v,v)); }
+}
+
+void ssDrawColon(LGFX_Sprite& sp) {
+  int cx = ssCardX[1] + SS_CARD_W + SS_CARD_GAP/2 + SS_COLON_W/2;
+  int y1 = ssCardY + SS_CARD_H/3; int y2 = ssCardY + SS_CARD_H*2/3;
+  SSTheme& t = ssThemes[ssCurTheme]; uint16_t col = ssColonVisible ? t.colon : t.bg;
+  switch (t.style) {
+    case 1: sp.fillRect(cx-4, y1-4, 8, 8, col); sp.fillRect(cx-4, y2-4, 8, 8, col); break;
+    case 2: sp.drawCircle(cx, y1, 5, col); sp.drawCircle(cx, y2, 5, col); if (ssColonVisible) { sp.fillCircle(cx, y1, 3, col); sp.fillCircle(cx, y2, 3, col); } break;
+    case 3: sp.drawFastVLine(cx, y1-5, 10, col); sp.drawFastVLine(cx, y2-5, 10, col); break;
+    default: sp.fillCircle(cx, y1, 5, col); sp.fillCircle(cx, y2, 5, col); break;
+  }
+}
+
+void ssDrawSeconds(LGFX_Sprite& sp, int sec) {
+  int x = 252, y = 185; SSTheme& t = ssThemes[ssCurTheme];
+  sp.fillRoundRect(x, y, 56, 38, 4, t.bg); sp.drawRoundRect(x, y, 56, 38, 4, t.hinge);
+  sp.setTextColor(t.date); sp.setTextSize(1); sp.setCursor(x+18, y+3); sp.print("SEC");
+  sp.setTextColor(t.sec); sp.setTextSize(2); char buf[4]; snprintf(buf, sizeof(buf), "%02d", sec);
+  sp.setCursor(x+10, y+14); sp.print(buf); int fill = map(sec, 0, 59, 0, 48);
+  sp.drawFastHLine(x+4, y+35, 48, t.hinge); sp.drawFastHLine(x+4, y+35, fill, t.accent);
+}
+
+void ssDrawDate(LGFX_Sprite& sp, struct tm& t) {
+  const char* days[] = {"MINGGU","SENIN","SELASA","RABU","KAMIS","JUMAT","SABTU"};
+  const char* months[] = {"JAN","FEB","MAR","APR","MEI","JUN","JUL","AGU","SEP","OKT","NOV","DES"};
+  char buf[32]; SSTheme& theme = ssThemes[ssCurTheme];
+  snprintf(buf, sizeof(buf), "%s, %02d %s %04d", days[t.tm_wday], t.tm_mday, months[t.tm_mon], t.tm_year+1900);
+  sp.setTextColor(theme.date); sp.setTextSize(1); sp.setCursor((DISP_W-strlen(buf)*6)/2, ssCardY+SS_CARD_H+14); sp.print(buf);
+}
+
+void ssDrawPrayNotif(LGFX_Sprite& sp) {
+  if (millis() > ssNotifShowUntil || ssNotifPrayIdx < 0) return;
+  SSTheme& t = ssThemes[ssCurTheme];
+  uint32_t remaining = ssNotifShowUntil - millis(); int barFill = map(remaining, 0, 30000, 0, 280);
+  int nx = 16, ny = ssCardY - 38; sp.fillRoundRect(nx, ny, 288, 32, 5, t.accent);
+  uint16_t innerCol = lcd.color565(min(((t.accent>>11)&0x1F)+4, 31), min(((t.accent>>5)&0x3F)+5, 63), min((t.accent&0x1F)+4, 31));
+  sp.fillRoundRect(nx+1, ny+1, 286, 30, 4, innerCol); sp.fillCircle(nx+14, ny+16, 4, t.bg); sp.fillCircle(nx+14, ny+16, 2, t.accent);
+  char buf[40]; snprintf(buf, sizeof(buf), "Waktu %s  %02d:%02d WIB", ssPrayNames[ssNotifPrayIdx], ssPrayTimes[ssNotifPrayIdx].hour, ssPrayTimes[ssNotifPrayIdx].minute);
+  sp.setTextColor(t.bg); sp.setTextSize(1); int tw = strlen(buf)*6; sp.setCursor(nx + (288-tw)/2, ny+12); sp.print(buf);
+  sp.drawFastHLine(nx+4, ny+30, 280, t.bg); sp.drawFastHLine(nx+4, ny+30, barFill, t.colon);
+}
+
+void ssDrawThemeLabel(LGFX_Sprite& sp) {
+  SSTheme& t = ssThemes[ssCurTheme]; sp.setTextColor(t.date); sp.setTextSize(1);
+  sp.setCursor(312 - strlen(t.name)*6, 8); sp.print(t.name);
+}
+
+void ssDrawPraySchedule(LGFX_Sprite& sp) {
+  if (!ssPrayLoaded) return;
+  int nowMin = -1; struct tm t; getLocalTime(&t); nowMin = t.tm_hour*60 + t.tm_min;
+  int nextIdx = -1; for (int i = 0; i < 5; i++) { int pm = ssPrayTimes[i].hour*60 + ssPrayTimes[i].minute; if (pm > nowMin) { nextIdx = i; break; } }
+  if (nextIdx < 0) nextIdx = 0;
+  char buf[24]; snprintf(buf, sizeof(buf), "%s %02d:%02d", ssPrayNames[nextIdx], ssPrayTimes[nextIdx].hour, ssPrayTimes[nextIdx].minute);
+  SSTheme& theme = ssThemes[ssCurTheme]; sp.setTextColor(theme.date); sp.setTextSize(1); sp.setCursor(8, 226); sp.print(buf);
+}
+
+void ssTriggerFlip(int idx, int newVal) {
+  if (!ssDigits[idx].flipping && ssDigits[idx].cur != newVal) {
+    ssDigits[idx].nxt = newVal; ssDigits[idx].flipping = true; ssDigits[idx].progress = 0.f;
+  }
+}
+
+void drawScreensaverFrame(struct tm& t) {
+  SSTheme& theme = ssThemes[ssCurTheme];
+  ssScreen.fillScreen(theme.bg);
+  if (theme.style == 2) { for (int y=0; y<DISP_H; y+=4) ssScreen.drawFastHLine(0, y, DISP_W, lcd.color565(3,3,3)); }
+  else { for (int x=10; x<DISP_W; x+=20) for (int y=10; y<DISP_H; y+=20) ssScreen.drawPixel(x, y, lcd.color565(min(((theme.bg>>11)&0x1F)+2,31), min(((theme.bg>>5)&0x3F)+3,63), min((theme.bg&0x1F)+2,31))); }
+  ssScreen.setTextColor(theme.date); ssScreen.setTextSize(1); ssScreen.setCursor(8, 8); ssScreen.print("FLIP CLOCK");
+  ssDrawThemeLabel(ssScreen); ssScreen.drawFastHLine(0, 20, DISP_W, theme.hinge);
+  ssScreen.setTextColor(ssNtpSynced ? theme.accent : theme.date); ssScreen.setCursor(270, 226); ssScreen.print(ssNtpSynced ? "NTP" : "---");
+  ssDrawPraySchedule(ssScreen); ssDrawColon(ssScreen);
+  for (int i=0; i<4; i++) { if (ssDigits[i].flipping) ssDrawFlipCard(ssScreen, i); else ssDrawStaticCard(ssScreen, i); }
+  ssDrawSeconds(ssScreen, t.tm_sec); ssDrawDate(ssScreen, t); ssDrawPrayNotif(ssScreen);
+  ssScreen.pushSprite(0, 0);
+}
+
+void handleModeScreensaver(ButtonEvent evt) {
+  if (!ssNtpSynced) {
+    if (strlen(wifiSSID) > 0) {
+      static bool attempted = false;
+      if (!attempted) {
+        attempted = true;
+        lcd.fillScreen(COL_BLACK);
+        lcd.setTextColor(COL_GRAY_7);
+        lcd.drawString("Syncing Time...", 110, 110);
+        WiFi.begin(wifiSSID, wifiPass);
+        unsigned long start = millis();
+        while(WiFi.status() != WL_CONNECTED && millis()-start < 8000) { delay(100); esp_task_wdt_reset(); }
+        if (WiFi.status() == WL_CONNECTED) {
+          configTime(25200, 0, "pool.ntp.org");
+          start = millis();
+          struct tm t_sync;
+          while(!getLocalTime(&t_sync) && millis()-start < 5000) { delay(100); esp_task_wdt_reset(); }
+          if (getLocalTime(&t_sync)) {
+            ssNtpSynced = true;
+            ssDigits[0].cur = t_sync.tm_hour/10; ssDigits[1].cur = t_sync.tm_hour%10;
+            ssDigits[2].cur = t_sync.tm_min/10;  ssDigits[3].cur = t_sync.tm_min%10;
+            ssPrevH = t_sync.tm_hour; ssPrevM = t_sync.tm_min;
+            ssPrayLoaded = ssFetchPrayerTimes(t_sync.tm_mday, t_sync.tm_mon+1, t_sync.tm_year+1900);
+            ssLastPrayDay = t_sync.tm_mday;
+          }
+        }
+      }
+    }
+  }
+
+  if (evt.valid) {
+    if (evt.pin == BTN_BOOT && evt.isShort) {
+      ssCurTheme = (ssCurTheme + 1) % 12;
+    } else if (evt.pin == BTN_B) {
+      lcd.fillScreen(COL_BLACK); islandNoClear = true; appMode = MODE_VIEWFINDER; return;
+    }
+  }
+
+  struct tm t;
+  if (!getLocalTime(&t)) {
+    if (!ssNtpSynced) {
+      lcd.fillScreen(COL_BLACK);
+      lcd.setTextColor(COL_GRAY_5);
+      lcd.drawString("Clock requires WiFi/NTP", 85, 110);
+      lcd.drawString("Press B to exit", 115, 130);
+      return;
+    }
+    return;
+  }
+
+  if (ssPrayLoaded && t.tm_mday != ssLastPrayDay) { ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900); if (ssPrayLoaded) ssLastPrayDay = t.tm_mday; }
+  if (!ssPrayLoaded && (millis()-ssLastRetryMs) > SS_RETRY_INTERVAL) { ssLastRetryMs = millis(); ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900); if (ssPrayLoaded) ssLastPrayDay = t.tm_mday; }
+
+  if (t.tm_sec != ssPrevS) { ssColonVisible = !ssColonVisible; ssCheckPrayerNotif(t); ssPrevS = t.tm_sec; }
+  if (t.tm_hour != ssPrevH) { ssTriggerFlip(0, t.tm_hour/10); ssTriggerFlip(1, t.tm_hour%10); ssPrevH = t.tm_hour; }
+  if (t.tm_min != ssPrevM) { ssTriggerFlip(2, t.tm_min/10); ssTriggerFlip(3, t.tm_min%10); ssPrevM = t.tm_min; }
+
+  for (int i=0; i<4; i++) {
+    if (ssDigits[i].flipping) {
+      ssDigits[i].progress += 0.07f;
+      if (ssDigits[i].progress >= 1.f) { ssDigits[i].cur = ssDigits[i].nxt; ssDigits[i].flipping = false; ssDigits[i].progress = 0.f; }
+    }
+  }
+  drawScreensaverFrame(t);
 }
