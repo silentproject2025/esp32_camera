@@ -45,8 +45,6 @@
  *    D short     = toggle Face Detect
  *    D long      = Exposure menu (+ format di dalamnya)
  *
-#include <time.h>
-#include <math.h>
  *  GALLERY:
  *    BOOT short  = buka foto/video
  *    BOOT long   = Jump to index
@@ -75,6 +73,9 @@
 
 #include "esp_camera.h"
 #include "esp_timer.h"
+#include <time.h>
+#include <Preferences.h>
+#include <math.h>
 #include "img_converters.h"
 #include "FS.h"
 #include "esp_task_wdt.h"
@@ -260,6 +261,9 @@ static const NotifStyle NOTIF_STYLES[6] = {
 #define SS_WIFI_SSID "Infinix HOT 8"
 #define SS_WIFI_PASS "cimanaja"
 #define SS_CARD_W    72
+#define SS_LAT_STR    "-0.2217"
+#define SS_LON_STR    "100.6139"
+#define SS_PRAY_METHOD "20"
 #define SS_CARD_H   108
 #define SS_CARD_R     7
 #define SS_CARD_GAP   5
@@ -277,6 +281,7 @@ struct SSTheme {
 struct SSDigitState { int cur, nxt; bool flipping; float progress; };
 struct SSPrayTime { int hour; int minute; };
 
+static Preferences ssPrefs;
 static SSTheme ssThemes[12];
 static int     ssCurTheme = 0;
 static SSDigitState ssDigits[4];
@@ -3302,7 +3307,7 @@ void setup(){
 
   setCpuFrequencyMhz(240);
   lcd.init();lcd.setRotation(3);lcd.fillScreen(COL_BLACK);
-  initSSThemes(); initSSLayout(); ssScreen.setColorDepth(16); ssScreen.createSprite(DISP_W, DISP_H); ssCardSpr.setColorDepth(16); ssCardSpr.createSprite(SS_CARD_W, SS_CARD_H); for (int i=0; i<4; i++) ssDigits[i] = {0,0,false,0.f};
+  ssPrefs.begin("flipclock", false); ssCurTheme = ssPrefs.getInt("theme", 0); initSSThemes(); initSSLayout(); ssScreen.setColorDepth(16); ssScreen.createSprite(DISP_W, DISP_H); ssCardSpr.setColorDepth(16); ssCardSpr.createSprite(SS_CARD_W, SS_CARD_H); for (int i=0; i<4; i++) ssDigits[i] = {0,0,false,0.f};
 
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
@@ -3640,7 +3645,7 @@ bool ssFetchPrayerTimes(int day, int month, int year) {
   if (WiFi.status() != WL_CONNECTED) return false;
   char url[256];
   snprintf(url, sizeof(url), "http://api.aladhan.com/v1/timings/%02d-%02d-%04d?latitude=%s&longitude=%s&method=%s",
-           day, month, year, "-0.2217", "100.6139", "20");
+           day, month, year, SS_LAT_STR, SS_LON_STR, SS_PRAY_METHOD);
   HTTPClient http;
   http.begin(url);
   http.setTimeout(10000);
@@ -3945,7 +3950,7 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
 
   // 3. Handle Other Inputs
   if (evtBoot.valid && evtBoot.isShort) {
-    ssCurTheme = (ssCurTheme + 1) % 12;
+    ssCurTheme = (ssCurTheme + 1) % 12; ssPrefs.putInt("theme", ssCurTheme);
   }
 
   // 4. Update Clock State
