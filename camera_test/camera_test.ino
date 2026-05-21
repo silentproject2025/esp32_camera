@@ -3642,7 +3642,7 @@ void loop(){
     case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
-    case MODE_SCREENSAVER:     handleModeScreensaver(singleEvt);               break;
+    case MODE_SCREENSAVER:     handleModeScreensaver(evtBoot,evtB,evtC,evtD); break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
@@ -3936,15 +3936,17 @@ void drawScreensaverFrame(struct tm& t) {
   ssScreen.pushSprite(0, 0);
 }
 
-void handleModeScreensaver(ButtonEvent evt) {
+void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) {
   if (!ssNtpSynced) {
-    if (strlen(wifiSSID) > 0) {
+    if (wifiSSID[0] != '\0' && strcmp(wifiSSID, "NamaWiFiKamu") != 0) {
       static bool attempted = false;
       if (!attempted) {
         attempted = true;
         lcd.fillScreen(COL_BLACK);
+        lcd.setFont(&fonts::Font0);
         lcd.setTextColor(COL_GRAY_7);
         lcd.drawString("Syncing Time...", 110, 110);
+        Serial.printf("[SS] Connecting to %s...\n", wifiSSID);
         WiFi.begin(wifiSSID, wifiPass);
         unsigned long start = millis();
         while(WiFi.status() != WL_CONNECTED && millis()-start < 8000) { delay(100); esp_task_wdt_reset(); }
@@ -3966,12 +3968,12 @@ void handleModeScreensaver(ButtonEvent evt) {
     }
   }
 
-  if (evt.valid) {
-    if (evt.pin == BTN_BOOT && evt.isShort) {
-      ssCurTheme = (ssCurTheme + 1) % 12;
-    } else if (evt.pin == BTN_B) {
-      lcd.fillScreen(COL_BLACK); islandNoClear = true; appMode = MODE_VIEWFINDER; return;
-    }
+  if (evtB.valid) {
+    lcd.fillScreen(COL_BLACK); islandNoClear = true;
+    resetAllButtons(); appMode = MODE_VIEWFINDER; return;
+  }
+  if (evtBoot.valid && evtBoot.isShort) {
+    ssCurTheme = (ssCurTheme + 1) % 12;
   }
 
   struct tm t;
