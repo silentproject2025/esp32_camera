@@ -3500,9 +3500,14 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
     mjpegLoop=!mjpegLoop;mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");lastToggleTime=millis();
   }
   if(evtD.valid&&(millis()-lastToggleTime)>=200){
-    mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
     char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf);lastToggleTime=millis();
+  }
+  loopMjpegPlayer();
+}
+
+void handleModeMenuLed(ButtonEvent evt){
+  if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
     if(menuLedSel<2){
       ledFlashEnabled=(menuLedSel==0);
@@ -3516,14 +3521,7 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
   else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuLedSel=(menuLedSel+2)%3;drawLedMenu(menuLedSel);}
   else if(evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
-    islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
-    saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
-    islandNoClear=true;appMode=MODE_VIEWFINDER;
-  }
-  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
-  else if(evt.pin==BTN_C||evt.pin==BTN_D){menuLedSel=(menuLedSel==0)?1:0;drawLedMenu(menuLedSel);}
 }
-
 void handleModeMenuFormat(ButtonEvent evt){
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
