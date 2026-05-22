@@ -73,6 +73,8 @@
 
 #include "esp_camera.h"
 #include "esp_timer.h"
+#include <ctype.h>
+#include <string.h>
 #include <time.h>
 #include <Preferences.h>
 #include <math.h>
@@ -786,17 +788,33 @@ bool loadWifiConfig() {
       "pass=PasswordWiFiKamu\n");
     return false;
   }
-  char line[128]; bool gotSSID=false, gotPass=false;
+  char line[128]; bool gotSSID=false;
   while (fgets(line, sizeof(line), f)) {
-    if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
-    char val[64]="";
-    if      (sscanf(line,"ssid=%63[^\r\n]",val)==1) { strncpy(wifiSSID,val,63); gotSSID=true; }
-    else if (sscanf(line,"pass=%63[^\r\n]",val)==1) { strncpy(wifiPass,val,63); gotPass=true; }
+    char* l = line;
+    while(isspace((unsigned char)*l)) l++;
+    if (*l == '#' || *l == '\0') continue;
+    char* eq = strchr(l, '=');
+    if (eq) {
+      *eq = '\0';
+      char* key = l;
+      char* val = eq + 1;
+      char* k_end = key + strlen(key) - 1;
+      while(k_end > key && isspace((unsigned char)*k_end)) { *k_end = '\0'; k_end--; }
+      while(isspace((unsigned char)*val)) val++;
+      char* v_end = val + strlen(val) - 1;
+      while(v_end >= val && isspace((unsigned char)*v_end)) { *v_end = '\0'; v_end--; }
+      if (strcasecmp(key, "ssid") == 0) {
+        strncpy(wifiSSID, val, 63); wifiSSID[63] = '\0';
+        gotSSID = true;
+      } else if (strcasecmp(key, "pass") == 0) {
+        strncpy(wifiPass, val, 63); wifiPass[63] = '\0';
+      }
+    }
   }
   fclose(f);
-  if (strcmp(wifiSSID,"NamaWiFiKamu")==0) return false;
-  Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
-  return gotSSID && gotPass;
+  if (gotSSID && strcmp(wifiSSID, "NamaWiFiKamu") == 0) return false;
+  if (gotSSID) Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
+  return gotSSID;
 }
 
 bool startWiFiConnection() {
@@ -3934,7 +3952,7 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
       lcd.drawString(wifiSSID, 85, 120);
 
       unsigned long start = millis();
-      while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
+      while(WiFi.status() != WL_CONNECTED && millis()-start < 15000) {
         delay(100); esp_task_wdt_reset(); tickAllButtons();
         ButtonEvent abortEvt = {};
         if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
@@ -3946,7 +3964,7 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
         configTime(25200, 0, "pool.ntp.org");
         start = millis();
         struct tm t_sync;
-        while(!getLocalTime(&t_sync) && millis()-start < 10000) {
+        while(!getLocalTime(&t_sync) && millis()-start < 15000) {
           delay(100); esp_task_wdt_reset(); tickAllButtons();
           ButtonEvent abortEvt = {};
           if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
@@ -3959,6 +3977,11 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
           ssPrayLoaded = ssFetchPrayerTimes(t_sync.tm_mday, t_sync.tm_mon+1, t_sync.tm_year+1900);
           ssLastPrayDay = t_sync.tm_mday;
         }
+      } else {
+        lcd.setTextColor(COL_AI_ACCENT);
+        lcd.drawString("WiFi gagal", 85, 110);
+        lcd.drawString("periksa wifi.ini", 85, 125);
+        delay(2500);
       }
     }
   }
