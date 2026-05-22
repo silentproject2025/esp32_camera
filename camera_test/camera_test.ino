@@ -258,8 +258,6 @@ static const NotifStyle NOTIF_STYLES[6] = {
 // ─────────────────────────────────────────────────────────────────────────────
 //  SCREENSAVER (FLIP CLOCK) DEFINITIONS
 // ─────────────────────────────────────────────────────────────────────────────
-#define SS_WIFI_SSID "Infinix HOT 8"
-#define SS_WIFI_PASS "cimanaja"
 #define SS_CARD_W    72
 #define SS_LAT_STR    "-0.2217"
 #define SS_LON_STR    "100.6139"
@@ -799,6 +797,19 @@ bool loadWifiConfig() {
   if (strcmp(wifiSSID,"NamaWiFiKamu")==0) return false;
   Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
   return gotSSID && gotPass;
+}
+
+bool startWiFiConnection() {
+  bool wifiOK = (wifiSSID[0] != '\0' && strcmp(wifiSSID, "NamaWiFiKamu") != 0);
+  if (!wifiOK) wifiOK = loadWifiConfig();
+  if (!wifiOK) return false;
+
+  Serial.printf("[WIFI] Connecting to %s...\n", wifiSSID);
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID, wifiPass);
+  return true;
 }
 
 bool loadGeminiConfig() {
@@ -2674,7 +2685,10 @@ bool doAICall(int idx, const char* customPrompt) {
   drawAIStatus("CONNECTING","menghubungkan WiFi...");
 
   if(WiFi.status()!=WL_CONNECTED){
-    WiFi.begin(wifiSSID,wifiPass);
+    if(!startWiFiConnection()){
+      drawAIStatus("WiFi Error","periksa wifi.ini");
+      delay(2500); return false;
+    }
     unsigned long t0=millis();
     while(WiFi.status()!=WL_CONNECTED&&millis()-t0<15000){delay(300);esp_task_wdt_reset();}
     if(WiFi.status()!=WL_CONNECTED){
@@ -3901,7 +3915,7 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
     return;
   }
 
-  // 2. NTP Sync Attempt (Hardcoded WiFi)
+  // 2. NTP Sync Attempt (wifi.ini)
   if (!ssNtpSynced) {
     static bool attempted = false;
     if (!attempted) {
@@ -3910,13 +3924,14 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
       lcd.setFont(&fonts::Font0);
       lcd.setTextColor(COL_GRAY_7);
       lcd.drawString("Connecting WiFi...", 85, 100);
-      lcd.drawString(SS_WIFI_SSID, 85, 120);
 
-      Serial.printf("[SS] WiFi Hardcoded: %s\n", SS_WIFI_SSID);
-      WiFi.disconnect(true);
-      delay(100);
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(SS_WIFI_SSID, SS_WIFI_PASS);
+      if (!startWiFiConnection()) {
+        lcd.setTextColor(COL_AI_ACCENT);
+        lcd.drawString("periksa wifi.ini", 85, 120);
+        delay(2000);
+        return;
+      }
+      lcd.drawString(wifiSSID, 85, 120);
 
       unsigned long start = millis();
       while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
