@@ -57,9 +57,23 @@ jobs:
           # Install MPU6050 tanpa deps agar tidak pull BusIO versi lama
           arduino-cli lib install "Adafruit MPU6050@2.2.6" --no-deps
 
-          # FIX: BusIO 1.16.1+ sudah punya guard untuk BitOrder
-          # yang dihapus di ESP32 core 3.0.7
+          # Install BusIO — versi apapun, akan kita patch manual
           arduino-cli lib install "Adafruit BusIO@1.16.1"
+
+      - name: Patch Adafruit BusIO - Fix BitOrder for ESP32 core 3.x
+        run: |
+          SPIDEV=~/Arduino/libraries/Adafruit_BusIO/Adafruit_SPIDevice.h
+
+          echo "=== Before patch ==="
+          grep -n "BitOrder" "$SPIDEV" || echo "(not found)"
+
+          # Ganti: typedef BitOrder BusIOBitOrder;
+          # Dengan guard yang aman untuk ESP32 core 3.x yang sudah hapus BitOrder
+          sed -i 's/typedef BitOrder BusIOBitOrder;/#ifndef BusIOBitOrder\n#ifdef ARDUINO_ARCH_ESP32\ntypedef uint8_t BusIOBitOrder;\n#define SPI_BITORDER_MSBFIRST SPI_MSBFIRST\n#define SPI_BITORDER_LSBFIRST SPI_LSBFIRST\n#else\ntypedef BitOrder BusIOBitOrder;\n#endif\n#endif/' "$SPIDEV"
+
+          echo "=== After patch ==="
+          grep -n -A5 "BusIOBitOrder" "$SPIDEV" | head -20
+          echo "Patch selesai."
 
       - name: Verify BusIO Version
         run: |
@@ -69,10 +83,10 @@ jobs:
           echo "=== BusIO version in use ==="
           cat ~/Arduino/libraries/Adafruit_BusIO/library.properties | grep version
           echo ""
-          echo "=== BitOrder typedef check ==="
-          grep -r "typedef BitOrder" ~/Arduino/libraries/Adafruit_BusIO/ \
-            && echo "MASALAH: BitOrder typedef ditemukan — build akan gagal!" \
-            || echo "OK: BitOrder typedef tidak ada — aman"
+          echo "=== BitOrder check after patch ==="
+          grep -n "typedef BitOrder BusIOBitOrder" ~/Arduino/libraries/Adafruit_BusIO/Adafruit_SPIDevice.h \
+            && echo "MASALAH: Unguarded typedef masih ada!" \
+            || echo "OK: Patch berhasil — typedef sudah di-guard"
 
       - name: Install esptool
         run: pip install esptool
