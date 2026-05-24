@@ -3481,8 +3481,9 @@ void enterUSBMode(){
   if(!sdReady) return;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   islandForceHide();
-  unmountVFSOnly();sdReady=false;
-  WiFi.disconnect(true);
+  unmountVFSOnly(); sdReady=false;
+  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  esp_camera_deinit(); delay(100);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
   blinkLED(3,200,100);resetAllButtons();
@@ -3491,10 +3492,11 @@ void enterUSBMode(){
 void exitUSBMode(){
   usbModeActive=false;msc.mediaPresent(false);esp_task_wdt_reset();
   lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
+  lcd.drawString("reinitializing...",(DISP_W-lcd.textWidth("reinitializing..."))/2,DISP_H/2-6);
+  initCamera(); delay(100); applyExpPreset(expPreset);
   sdReady=remountVFSOnly();
   if(sdReady){
-    scanPhotoCount();loadSettings();loadGeminiConfig();applyExpPreset(expPreset);
+    scanPhotoCount();loadSettings();loadGeminiConfig();
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf2[32]; snprintf(buf2,sizeof(buf2),"sd ok  next #%04d",photoCount+1);
     lcd.setTextColor(COL_GRAY_C);lcd.drawString(buf2,(DISP_W-lcd.textWidth(buf2))/2,DISP_H/2-6);
@@ -3508,7 +3510,6 @@ void exitUSBMode(){
   appMode=MODE_VIEWFINDER;
   fpsLastTime=millis();fpsFrameCount=0;fpsValue=0.0f;
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4228,6 +4229,13 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
 }
 void loop(){
   esp_task_wdt_reset();
+  if(usbModeActive){
+    tickAllButtons();
+    ButtonEvent evtBoot={};
+    btnBoot.pollEvent(evtBoot);
+    if(evtBoot.valid) exitUSBMode();
+    return;
+  }
   // ── MPU6050 tick ──
   mpuTick();
 
@@ -4248,9 +4256,7 @@ void loop(){
   if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
-  if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
-
   switch(appMode){
     case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
     case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
