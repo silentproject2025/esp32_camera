@@ -2538,11 +2538,12 @@ void mpuTick() {
 
   mpuOrientation = mpuCalcOrientation(mpuPitch, mpuRoll);
   if (mpuOrientation != mpuPrevOrientation) {
-    const char* orientNames[] = { "LANDSCAPE", "PORTRAIT CW", "TERBALIK", "PORTRAIT CCW" };
-    islandPush(NOTIF_INFO, orientNames[mpuOrientation]);
+    if (mpuPrevOrientation != 255) {
+      const char* orientNames[] = { "LANDSCAPE", "PORTRAIT CW", "TERBALIK", "PORTRAIT CCW" };
+      islandPush(NOTIF_INFO, orientNames[mpuOrientation]);
+    }
     mpuPrevOrientation = mpuOrientation;
   }
-
   if (sdReady && (now - mpuLastLogMs > MPU_LOG_INTERVAL_MS)) {
     mpuLastLogMs = now;
     FILE* f = fopen(MPU_LOG_PATH, "a");
@@ -3575,22 +3576,17 @@ void setup(){
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
   // ── MPU6050 init ──
+  mpuLastTiltNotifMs = millis(); mpuLastShakeNotifMs = millis();
   delay(200); Serial.println("[DEBUG] MPU Init start");
   mpuReady = mpuInit();
-  if (mpuReady) {
-    islandPush(NOTIF_INFO, "MPU6050 OK");
-  } else {
-    islandPush(NOTIF_WARN, "MPU6050 gagal");
-  }
+  if (mpuReady) Serial.println("[MPU] OK");
+  else          Serial.println("[MPU] Gagal");
 
   blockingWaitAllRelease(600);
   Serial.println("[DEBUG] Setup end");
   resetAllButtons();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MODE HANDLERS
-// ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt){
   if(!evt.valid){renderViewfinder();return;}
   if(evt.pin==BTN_BOOT){
