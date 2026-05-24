@@ -98,6 +98,40 @@
 #include "USBMSC.h"
 
 #include <JPEGDEC.h>
+// ── MPU6050 ──────────────────────────────────────────────────────────────────
+#include <Wire.h>
+#define sensor_t adafruit_sensor_t
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#undef sensor_t
+
+static Adafruit_MPU6050 mpu;
+static bool     mpuReady              = false;
+static float    mpuAccX, mpuAccY, mpuAccZ = 0;
+static float    mpuGyrX, mpuGyrY, mpuGyrZ = 0;
+static float    mpuTemp               = 0;
+static float    mpuRoll               = 0;
+static float    mpuPitch              = 0;
+static bool     mpuShakeDetected      = false;
+static bool     mpuTilted             = false;
+static uint8_t  mpuOrientation        = 0;
+static uint8_t  mpuPrevOrientation    = 255; // nilai mustahil agar notif pertama muncul
+static unsigned long mpuLastReadMs    = 0;
+static unsigned long mpuLastTiltNotifMs  = 0;
+static unsigned long mpuLastShakeNotifMs = 0;
+static unsigned long mpuLastLogMs     = 0;
+
+#define MPU_SDA_PIN              43
+#define MPU_SCL_PIN              44
+#define MPU_ADDR                 0x68
+#define MPU_READ_INTERVAL_MS     80
+#define MPU_TILT_WARN_DEG        15.0f
+#define MPU_SHAKE_THRESH         3.5f
+#define MPU_TILT_NOTIF_COOLDOWN  3000
+#define MPU_SHAKE_NOTIF_COOLDOWN 1500
+#define MPU_LOG_INTERVAL_MS      5000
+#define MPU_LOG_PATH             "/sdcard/mpu_log.csv"
+
 #include "MjpegClass.h"
 
 #define LGFX_USE_V1
@@ -2427,6 +2461,148 @@ void runFaceDetect(camera_fb_t *fb){
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  MPU6050
+// ─────────────────────────────────────────────────────────────────────────────
+
+bool mpuInit() {
+  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
+  if (!mpu.begin(MPU_ADDR, &Wire)) {
+    Serial.println("[MPU] MPU6050 tidak ditemukan!");
+    return false;
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("[MPU] MPU6050 OK");
+  return true;
+}
+
+static uint8_t mpuCalcOrientation(float pitch, float roll) {
+  if (fabsf(roll) < 45.0f && fabsf(pitch) < 45.0f) return 0;
+  if (roll >  45.0f) return 1;
+  if (roll < -45.0f) return 3;
+  if (pitch >  45.0f) return 2;
+  return 0;
+}
+
+void mpuTick() {
+  if (!mpuReady) return;
+  unsigned long now = millis();
+  if (now - mpuLastReadMs < MPU_READ_INTERVAL_MS) return;
+  mpuLastReadMs = now;
+
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+
+  mpuAccX = accel.acceleration.x;
+  mpuAccY = accel.acceleration.y;
+  mpuAccZ = accel.acceleration.z;
+  mpuGyrX = gyro.gyro.x;
+  mpuGyrY = gyro.gyro.y;
+  mpuGyrZ = gyro.gyro.z;
+  mpuTemp = temp.temperature;
+
+  mpuRoll  = atan2f(mpuAccY, mpuAccZ) * 57.2958f;
+  mpuPitch = atan2f(-mpuAccX, sqrtf(mpuAccY*mpuAccY + mpuAccZ*mpuAccZ)) * 57.2958f;
+
+  bool isTilted = (fabsf(mpuRoll) > MPU_TILT_WARN_DEG || fabsf(mpuPitch) > MPU_TILT_WARN_DEG);
+  if (isTilted && !mpuTilted) {
+    mpuTilted = true;
+  } else if (!isTilted && mpuTilted) {
+    mpuTilted = false;
+  }
+
+  if (mpuTilted && (now - mpuLastTiltNotifMs > MPU_TILT_NOTIF_COOLDOWN)) {
+    char tiltBuf[32];
+    if (fabsf(mpuRoll) >= fabsf(mpuPitch))
+      snprintf(tiltBuf, sizeof(tiltBuf), "MIRING %.0f\xb0 %s", fabsf(mpuRoll), mpuRoll > 0 ? "kanan" : "kiri");
+    else
+      snprintf(tiltBuf, sizeof(tiltBuf), "MIRING %.0f\xb0 %s", fabsf(mpuPitch), mpuPitch > 0 ? "depan" : "belakang");
+    islandPush(NOTIF_WARN, tiltBuf);
+    mpuLastTiltNotifMs = now;
+  }
+
+  float mag = sqrtf(mpuAccX*mpuAccX + mpuAccY*mpuAccY + mpuAccZ*mpuAccZ);
+  float shakeVal = fabsf(mag - 9.8f);
+
+  if (shakeVal > MPU_SHAKE_THRESH) {
+    mpuShakeDetected = true;
+    if (now - mpuLastShakeNotifMs > MPU_SHAKE_NOTIF_COOLDOWN) {
+      islandPush(NOTIF_WARN, "SHAKE - foto blur?");
+      mpuLastShakeNotifMs = now;
+    }
+  } else {
+    mpuShakeDetected = false;
+  }
+
+  mpuOrientation = mpuCalcOrientation(mpuPitch, mpuRoll);
+  if (mpuOrientation != mpuPrevOrientation) {
+    const char* orientNames[] = { "LANDSCAPE", "PORTRAIT CW", "TERBALIK", "PORTRAIT CCW" };
+    islandPush(NOTIF_INFO, orientNames[mpuOrientation]);
+    mpuPrevOrientation = mpuOrientation;
+  }
+
+  if (sdReady && (now - mpuLastLogMs > MPU_LOG_INTERVAL_MS)) {
+    mpuLastLogMs = now;
+    FILE* f = fopen(MPU_LOG_PATH, "a");
+    if (f) {
+      fseek(f, 0, SEEK_END);
+      if (ftell(f) == 0) {
+        fprintf(f, "millis,accX,accY,accZ,gyrX,gyrY,gyrZ,roll,pitch,temp,orient\n");
+      }
+      fprintf(f, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d\n",
+              now, mpuAccX, mpuAccY, mpuAccZ, mpuGyrX, mpuGyrY, mpuGyrZ, mpuRoll, mpuPitch, mpuTemp, (int)mpuOrientation);
+      fclose(f);
+    }
+    esp_task_wdt_reset();
+  }
+}
+
+uint16_t* mpuRotateBuffer(const uint16_t* src, int w, int h, uint8_t orient) {
+  if (orient == 0) return nullptr;
+  int dstW = (orient == 1 || orient == 3) ? h : w;
+  int dstH = (orient == 1 || orient == 3) ? w : h;
+  uint16_t* dst = (uint16_t*)ps_malloc((size_t)dstW * dstH * sizeof(uint16_t));
+  if (!dst) dst = (uint16_t*)malloc((size_t)dstW * dstH * sizeof(uint16_t));
+  if (!dst) return nullptr;
+  for (int y = 0; y < h; y++) {
+    for (int x = 0; x < w; x++) {
+      uint16_t px = src[y * w + x];
+      int dx, dy;
+      switch (orient) {
+        case 1: dx = h - 1 - y; dy = x; break;
+        case 2: dx = w - 1 - x; dy = h - 1 - y; break;
+        case 3: dx = y; dy = w - 1 - x; break;
+        default: dx = x; dy = y;
+      }
+      dst[dy * dstW + dx] = px;
+    }
+    if (y % 20 == 0) esp_task_wdt_reset();
+  }
+  return dst;
+}
+
+void mpuDrawViewfinderIndicator() {
+  if (!mpuReady) return;
+  char buf[16];
+  uint16_t col;
+  if (mpuShakeDetected) {
+    strncpy(buf, "SHAKE!", sizeof(buf));
+    col = COL_AI_WARN;
+  } else if (mpuTilted) {
+    if (fabsf(mpuRoll) >= fabsf(mpuPitch))
+      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(mpuRoll), mpuRoll > 0 ? "R" : "L");
+    else
+      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(mpuPitch), mpuPitch > 0 ? "F" : "B");
+    col = COL_AI_WARN;
+  } else {
+    strncpy(buf, "LEVEL", sizeof(buf));
+    col = COL_GRAY_7;
+  }
+  drawPill(DISP_W - 36, DISP_H - 22, buf, COL_PILL_BG, col);
+}
+
 void toggleFaceDetect(){
   faceDetectMode=!faceDetectMode;faceDetectCount=0;
   islandPush(NOTIF_FACE,faceDetectMode?"FACE DETECT  ON":"FACE DETECT  OFF");
@@ -2913,6 +3089,9 @@ void renderViewfinder(){
       drawPill(38,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
       drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
                COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
+      // MPU6050 indicator
+      mpuDrawViewfinderIndicator();
+
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
       lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
       if(recActive) drawRecIndicator();
@@ -2952,16 +3131,55 @@ void captureAndPreview(){
     bool isGC2145rgb=(detectedSensor==PID_GC2145&&
                       fb->format==PIXFORMAT_RGB565&&
                       fb->width==DISP_W&&fb->height==DISP_H);
-    if(isGC2145rgb&&gc2145CaptureFormat==GFMT_BMP){
+    if(isGC2145rgb && gc2145CaptureFormat==GFMT_BMP){
       char path[48]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.bmp",photoCount);
       char payload[STEGO_BMP_MAX_PAYLOAD];
       stegoMakePayload(payload,sizeof(payload),photoCount);
-      saved=saveBMP(fb->buf,fb->width,fb->height,path,payload,(int)strlen(payload));
-    } else {
+
+      // Auto-rotate jika orientasi bukan normal
+      if (mpuReady && mpuOrientation != 0) {
+        uint16_t* rotBuf = mpuRotateBuffer(
+          (const uint16_t*)fb->buf, fb->width, fb->height, mpuOrientation);
+        if (rotBuf) {
+          int rW = (mpuOrientation==1||mpuOrientation==3) ? fb->height : fb->width;
+          int rH = (mpuOrientation==1||mpuOrientation==3) ? fb->width  : fb->height;
+          saved = saveBMP((uint8_t*)rotBuf, rW, rH, path, payload, (int)strlen(payload));
+          free(rotBuf);
+        } else {
+          saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, (int)strlen(payload));
+        }
+      } else {
+        saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, (int)strlen(payload));
+      }
+    }
+    else {
       uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
       if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
       else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
       if(ok&&jpg_buf&&jpg_len>0){
+        // Auto-rotate JPG jika orientasi bukan normal
+        if (mpuReady && mpuOrientation != 0 && fb->format == PIXFORMAT_RGB565) {
+          uint16_t* rotBuf = mpuRotateBuffer(
+            (const uint16_t*)fb->buf, fb->width, fb->height, mpuOrientation);
+          if (rotBuf) {
+            int rW = (mpuOrientation==1||mpuOrientation==3) ? fb->height : fb->width;
+            int rH = (mpuOrientation==1||mpuOrientation==3) ? fb->width  : fb->height;
+            uint8_t* rJpg = nullptr; size_t rJpgLen = 0;
+            // buat frame buffer sementara
+            camera_fb_t fakeFb;
+            fakeFb.buf    = (uint8_t*)rotBuf;
+            fakeFb.len    = (size_t)rW * rH * 2;
+            fakeFb.width  = rW;
+            fakeFb.height = rH;
+            fakeFb.format = PIXFORMAT_RGB565;
+            bool rOk = frame2jpg(&fakeFb, 85, &rJpg, &rJpgLen);
+            free(rotBuf);
+            if (rOk && rJpg) {
+              if (jpg_buf && fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+              jpg_buf = rJpg; jpg_len = rJpgLen;
+            }
+          }
+        }
         char payload[STEGO_PAYLOAD_LEN];
         stegoMakePayload(payload,sizeof(payload),photoCount);
         size_t stegoLen=0;
@@ -3356,6 +3574,14 @@ void setup(){
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
+  // ── MPU6050 init ──
+  mpuReady = mpuInit();
+  if (mpuReady) {
+    islandPush(NOTIF_INFO, "MPU6050 OK");
+  } else {
+    islandPush(NOTIF_WARN, "MPU6050 gagal");
+  }
+
   blockingWaitAllRelease(600);
   resetAllButtons();
 }
@@ -4011,6 +4237,9 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
 }
 void loop(){
   esp_task_wdt_reset();
+  // ── MPU6050 tick ──
+  mpuTick();
+
   tickAllButtons();
 
   ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
