@@ -574,6 +574,7 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 //  DYNAMIC ISLAND
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
@@ -612,39 +613,43 @@ static bool          islandDrawnOnce = false;
 static unsigned long islandFreezeUntilMs = 0;
 static bool          islandNoClear   = false;
 
+static LGFX_Sprite   islandSpr(&lcd);
+static bool         islandSprCreated = false;
+static int          islandSprLastN   = -1;
+
 static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
   iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
   iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
   iX = ISLAND_CX - iW / 2;
 }
 
-static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
+static void islandDrawRow(LGFX_Sprite& sp, int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
   NotifEntry& n        = islandStack[idx];
   const NotifStyle& s  = NOTIF_STYLES[(int)n.type];
   uint16_t rowBg = isFresh ? COL_GRAY_D : COL_BLACK;
-  lcd.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
+  sp.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
   int iconY = y + (ISLAND_H_ROW - ISLAND_ICON_SZ) / 2;
-  lcd.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(s.iconFg);
-  lcd.drawString(s.sym, x + 2, iconY + 1);
-  lcd.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
+  sp.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
+  sp.setFont(&fonts::Font0); sp.setTextSize(1);
+  sp.setTextColor(s.iconFg);
+  sp.drawString(s.sym, x + 2, iconY + 1);
+  sp.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
   char buf[28];
   strncpy(buf, n.text, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
   int maxW = w - ISLAND_ICON_SZ - 8;
-  while (strlen(buf) > 4 && lcd.textWidth(buf) > maxW) {
-    int l = strlen(buf);
+  while (strlen(buf) > 4 && sp.textWidth(buf) > maxW) {
+    int l = (int)strlen(buf);
     buf[l-1] = '\0';
     if (strlen(buf) > 3) { buf[strlen(buf)-1] = '.'; buf[strlen(buf)-2] = '.'; }
   }
-  lcd.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
+  sp.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
   if (n.type == NOTIF_REC && isFresh) {
     int dotX = x + w - 4;
     int dotY = y + ISLAND_H_ROW / 2;
     bool blink = (millis() / 400) % 2;
-    lcd.fillCircle(dotX, dotY, 2, blink ? 0xF800 : COL_GRAY_3);
+    sp.fillCircle(dotX, dotY, 2, blink ? 0xF800 : COL_GRAY_3);
   }
 }
 
@@ -653,13 +658,12 @@ static void islandErase() {
   if (!islandDrawnOnce) return;
   if (islandLastW <= 0 || islandLastH <= 0) return;
   int eraseX = islandLastX - 3;
-  int eraseY = islandLastY;
+  int eraseY = max(0, islandLastY);
   int eraseW = islandLastW + 6;
   int eraseH = islandLastH + 4;
-  if (eraseY < 0) { eraseH += eraseY; eraseY = 0; }
-  if (eraseH <= 0) return;
-  if (eraseX < 0) { eraseW += eraseX; eraseX = 0; }
-  if (eraseW <= 0) return;
+  if (eraseY + eraseH > DISP_H) eraseH = DISP_H - eraseY;
+  if (eraseX + eraseW > DISP_W) eraseW = DISP_W - eraseX;
+  if (eraseH <= 0 || eraseW <= 0) return;
   lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
 }
 
@@ -669,20 +673,35 @@ static void islandDraw(int offsetY = 0) {
   int iW, iH, iX;
   islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
-  islandLastX = iX; islandLastY = iY; islandLastW = iW; islandLastH = iH;
-  if (iY + iH <= 0) return;
-  lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
-  lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
-  lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
+
+  if (islandSprLastN != n || !islandSprCreated) {
+    if (islandSprCreated) islandSpr.deleteSprite();
+    islandSpr.setColorDepth(16);
+    if (!islandSpr.createSprite(iW + 6, iH + 6)) {
+      islandSprCreated = false; return;
+    }
+    islandSprCreated = true;
+    islandSprLastN = n;
+  }
+
+  islandSpr.fillSprite(0);
+  islandSpr.fillRoundRect(3, 3, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
+  islandSpr.drawRoundRect(3, 3, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
   if (iH > 4 && iW > 4)
-    lcd.drawRoundRect(iX + 1, iY + 1, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
-  int rowY = iY + ISLAND_PAD_V;
+    islandSpr.drawRoundRect(4, 4, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
+
+  int rowY = 3 + ISLAND_PAD_V;
   for (int i = 0; i < n; i++) {
-    islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
+    islandDrawRow(islandSpr, i, 3 + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
     if (i < n - 1)
-      lcd.drawFastHLine(iX + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
-                        iW - ISLAND_PAD_H * 2, COL_GRAY_3);
+      islandSpr.drawFastHLine(3 + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
+                              iW - ISLAND_PAD_H * 2, COL_GRAY_3);
     rowY += ISLAND_H_ROW + 2;
+  }
+
+  islandLastX = iX; islandLastY = iY; islandLastW = iW; islandLastH = iH;
+  if (iY + iH > 0) {
+    islandSpr.pushSprite(iX - 3, iY);
   }
   islandDrawnOnce = true;
 }
@@ -709,6 +728,7 @@ void islandPush(NotifType type, const char* text) {
 
 void islandTick() {
   unsigned long now = millis();
+  esp_task_wdt_reset();
   switch (islandState) {
     case ISLAND_HIDDEN: break;
     case ISLAND_SLIDING_IN: {
@@ -731,7 +751,7 @@ void islandTick() {
         islandAnimStart = now; islandState = ISLAND_SLIDING_OUT;
       } else {
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
-          islandErase(); islandDraw(0);
+          islandDraw(0);
         }
       }
       break;
@@ -741,12 +761,12 @@ void islandTick() {
       int iW, iH, iX;
       islandCalcDims(nItems, iW, iH, iX);
       if (elapsed >= ISLAND_ANIM_MS) {
-        islandHide();
+        islandErase(); islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = pow(progress, 3);
         int offsetY = (int)(-iH * progress);
-        islandDraw(offsetY);
+        islandErase(); islandDraw(offsetY);
       }
       break;
     }
@@ -754,10 +774,7 @@ void islandTick() {
 }
 
 void islandForceHide() {
-  islandNoClear = false;
-  if (islandState != ISLAND_HIDDEN && islandDrawnOnce) islandErase();
-  islandHide();
-  islandFreezeUntilMs = 0;
+  islandErase(); islandHide();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
