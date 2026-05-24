@@ -35,8 +35,11 @@ jobs:
           arduino-cli core install esp32:esp32@3.0.7 \
             --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 
-      - name: Clean Old Libraries
-        run: rm -rf ~/Arduino/libraries
+      - name: Clean Old Libraries and Cache
+        run: |
+          rm -rf ~/Arduino/libraries
+          rm -rf ~/.arduino15/cache
+          echo "Libraries and cache cleared."
 
       - name: Install Libraries
         run: |
@@ -50,7 +53,6 @@ jobs:
 
           # Adafruit sensor stack
           # BusIO 1.14.5 = versi terakhir yang TIDAK pakai typedef BitOrder
-          # sehingga kompatibel dengan semua versi esp32 core
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
           arduino-cli lib install "Adafruit BusIO@1.14.5"
           arduino-cli lib install "Adafruit MPU6050@2.2.6"
@@ -79,31 +81,56 @@ jobs:
             --output-dir ./output \
             camera_test/camera_test.ino
 
+      - name: List Output Files (debug)
+        if: always()
+        run: |
+          echo "=== ./output contents ==="
+          ls -lh ./output || echo "output folder tidak ada!"
+          echo ""
+          echo "=== All .bin files ==="
+          find ./output -name "*.bin" 2>/dev/null || echo "Tidak ada .bin ditemukan"
+
       - name: Merge Binaries
         run: |
-          BOOTLOADER=$(ls ./output/*.bootloader.bin)
-          PARTITIONS=$(ls ./output/*.partitions.bin)
-          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/3.0.7/tools/partitions/boot_app0.bin)
-          APP=$(ls ./output/camera_test.ino.bin)
+          BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
+          PARTITIONS=$(ls ./output/*.partitions.bin 2>/dev/null | head -1)
+          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/3.0.7/tools/partitions/boot_app0.bin 2>/dev/null | head -1)
+          APP=$(ls ./output/camera_test.ino.bin 2>/dev/null | head -1)
 
           echo "Bootloader : $BOOTLOADER"
           echo "Partitions : $PARTITIONS"
           echo "boot_app0  : $BOOTAPP0"
           echo "App        : $APP"
 
+          # Validasi semua file ada sebelum merge
+          for f in "$BOOTLOADER" "$PARTITIONS" "$BOOTAPP0" "$APP"; do
+            if [ -z "$f" ] || [ ! -f "$f" ]; then
+              echo "ERROR: File tidak ditemukan: $f"
+              exit 1
+            fi
+          done
+
           esptool.py --chip esp32s3 merge_bin \
             -o ./output/merged-firmware.bin \
             --flash_mode dio \
             --flash_size 16MB \
-            0x0000 $BOOTLOADER \
-            0x8000 $PARTITIONS \
-            0xe000 $BOOTAPP0 \
-            0x10000 $APP
+            0x0000 "$BOOTLOADER" \
+            0x8000 "$PARTITIONS" \
+            0xe000 "$BOOTAPP0" \
+            0x10000 "$APP"
 
-      - name: List Output Files
-        run: ls -lh ./output
+          echo ""
+          echo "=== Merge result ==="
+          ls -lh ./output/merged-firmware.bin
+
+      - name: List Final Output
+        if: always()
+        run: |
+          echo "=== Final output folder ==="
+          ls -lh ./output/
 
       - name: Upload Artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: esp32-firmware-${{ github.sha }}
@@ -111,3 +138,11 @@ jobs:
             ./output/merged-firmware.bin
             ./output/*.bin
           retention-days: 30
+
+      - name: Upload Partial Artifact on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-debug-${{ github.sha }}
+          path: ./output/
+          retention-days: 7
