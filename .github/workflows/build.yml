@@ -23,9 +23,9 @@ jobs:
           path: |
             ~/.arduino15/packages
             ~/.arduino15/cache
-          key: ${{ runner.os }}-arduino-esp32-3.0.7-v3-${{ hashFiles('**/*.ino') }}
+          key: ${{ runner.os }}-arduino-esp32-3.0.7-v4-${{ hashFiles('**/*.ino') }}
           restore-keys: |
-            ${{ runner.os }}-arduino-esp32-3.0.7-v3-
+            ${{ runner.os }}-arduino-esp32-3.0.7-v4-
             ${{ runner.os }}-arduino-
 
       - name: Install ESP32 Platform
@@ -51,13 +51,15 @@ jobs:
           # JSON
           arduino-cli lib install "ArduinoJson"
 
-          # Adafruit stack — KRITIS: install MPU6050 dengan --no-deps
-          # supaya tidak auto-pull BusIO versi baru
+          # Adafruit Unified Sensor
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
+
+          # Install MPU6050 tanpa deps agar tidak pull BusIO versi lama
           arduino-cli lib install "Adafruit MPU6050@2.2.6" --no-deps
 
-          # Install BusIO 1.14.5 SETELAH MPU6050, supaya override versi yang ditarik dependency
-          arduino-cli lib install "Adafruit BusIO@1.14.5"
+          # FIX: BusIO 1.16.1+ sudah punya guard untuk BitOrder
+          # yang dihapus di ESP32 core 3.0.7
+          arduino-cli lib install "Adafruit BusIO@1.16.1"
 
       - name: Verify BusIO Version
         run: |
