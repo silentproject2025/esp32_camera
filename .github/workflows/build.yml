@@ -41,11 +41,11 @@ jobs:
           # Install base sensor library first (IMPORTANT ORDER)
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
           
-          # Install compatible Adafruit BusIO version (FIX for BitOrder)
-          arduino-cli lib install "Adafruit BusIO@1.14.5"
+          # Install compatible Adafruit BusIO version (FIXED - BitOrder compatibility)
+          arduino-cli lib install "Adafruit BusIO@1.13.2"
           
           # Install Adafruit MPU6050 with compatible version
-          arduino-cli lib install "Adafruit MPU6050"
+          arduino-cli lib install "Adafruit MPU6050@2.2.6"
       
       - name: Install esptool
         run: pip install esptool
