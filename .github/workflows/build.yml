@@ -32,6 +32,8 @@ jobs:
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "JPEGDEC"
           arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "Adafruit MPU6050"
+          arduino-cli lib install "Adafruit Unified Sensor"
       - name: Install esptool
         run: pip install esptool
       - name: Debug Board Info
