@@ -155,6 +155,15 @@ struct NotifStyle {
   const char* sym;
 };
 
+// Forward Declarations
+bool ssFetchPrayerTimes(int day, int month, int year);
+bool captureHDRFrame(const char* path, int aecValue);
+void initSSThemes();
+void initSSLayout();
+void recordFrame();
+void stopRecording();
+void startRecording();
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2424,10 +2433,14 @@ void startRecording(){
 
 void stopRecording(){
   if(!recActive||!recFile) return;
-          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
-  (void)offset;
+  fclose(recFile); recFile=nullptr; recActive=false;
+  char buf[20]; snprintf(buf,sizeof(buf),"SAVED #%04d",recVideoCount);
+  islandPush(NOTIF_OK,buf);
+}
+
 void recordFrame(){
   if(!recActive||!recFile) return;
+
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){esp_task_wdt_reset();return;}
 
@@ -2480,8 +2493,11 @@ void recordFrame(){
   }
   esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
+static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize){
+  uint8_t* u8buf = (uint8_t*)buffer;
+  (void)offset;
   if(!sdCard||!sdmmcDriverInit) return -1;
-  return(sdmmc_read_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
+  return(sdmmc_read_sectors(sdCard,u8buf,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
 }
 static int32_t onWrite(uint32_t lba,uint32_t offset,uint8_t* buffer,uint32_t bufsize){
   (void)offset;
@@ -3222,46 +3238,34 @@ void captureAndPreview_internal(){
     }
     else {
       uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
-      if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
-
-
-  if (eisModeEnabled) {
-    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-    float gx = g.gyro.x; float gy = g.gyro.y;
-    eisGyroBiasX = eisGyroBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
-    eisGyroBiasY = eisGyroBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
-    float gdx = gx - eisGyroBiasX; float gdy = gy - eisGyroBiasY;
-    eisOffsetX = constrain(eisOffsetX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    eisOffsetY = constrain(eisOffsetY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
-
-    if (fb->format == PIXFORMAT_RGB565) {
-      uint16_t* src = (uint16_t*)fb->buf;
-      uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2);
-      if (tmp) {
-        int startX = EIS_CROP_X + (int)eisOffsetX;
-        int startY = EIS_CROP_Y + (int)eisOffsetY;
-        for (int y = 0; y < 240; y++) {
-          int sy = startY + (y * EIS_VIEWPORT_H / 240);
-          for (int x = 0; x < 320; x++) {
-            int sx = startX + (x * EIS_VIEWPORT_W / 320);
-            tmp[y * 320 + x] = src[sy * 320 + sx];
+      if(fb->format==PIXFORMAT_RGB565){
+        if(eisModeEnabled){
+          sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+          float gx=g.gyro.x, gy=g.gyro.y;
+          eisGyroBiasX = eisGyroBiasX*(1.0f-EIS_ALPHA) + gx*EIS_ALPHA;
+          eisGyroBiasY = eisGyroBiasY*(1.0f-EIS_ALPHA) + gy*EIS_ALPHA;
+          float gdx=gx-eisGyroBiasX, gdy=gy-eisGyroBiasY;
+          eisOffsetX = constrain(eisOffsetX+gdx*EIS_GYRO_SCALE, 0, EIS_CROP_X*2);
+          eisOffsetY = constrain(eisOffsetY+gdy*EIS_GYRO_SCALE, 0, EIS_CROP_Y*2);
+          uint16_t* src=(uint16_t*)fb->buf;
+          uint16_t* tmp=(uint16_t*)ps_malloc(320*240*2);
+          if(tmp){
+            int startX=EIS_CROP_X+(int)eisOffsetX, startY=EIS_CROP_Y+(int)eisOffsetY;
+            for(int y=0;y<240;y++){
+              int sy=startY+(y*EIS_VIEWPORT_H/240);
+              for(int x=0;x<320;x++){
+                int sx=startX+(x*EIS_VIEWPORT_W/320);
+                tmp[y*320+x]=src[sy*320+sx];
+              }
+            }
+            camera_fb_t fakeFb=*fb; fakeFb.buf=(uint8_t*)tmp; fakeFb.width=320; fakeFb.height=240;
+            if(frame2jpg(&fakeFb,85,&jpg_buf,&jpg_len)) ok=true;
+            free(tmp);
           }
+        } else {
+          ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);
         }
-        // Replace buffer for compression
-        uint8_t* out_jpg = nullptr; size_t out_len = 0;
-        camera_fb_t fakeFb = *fb; fakeFb.buf = (uint8_t*)tmp;
-        if (frame2jpg(&fakeFb, 70, &out_jpg, &out_len)) {
-          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
-          free(out_jpg);
-        }
-          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
-          free(out_jpg);
-        }
-        free(tmp);
       }
-      esp_camera_fb_return(fb); return; // bypass normal write
-    }
-  }
       else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
       if(ok&&jpg_buf&&jpg_len>0){
         // Auto-rotate JPG jika orientasi bukan normal
