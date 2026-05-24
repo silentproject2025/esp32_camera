@@ -33,7 +33,7 @@ jobs:
           arduino-cli lib install "JPEGDEC"
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "Adafruit MPU6050"
-          arduino-cli lib install "Adafruit Sensor@1.1.33"
+          arduino-cli lib install "Adafruit Unified Sensor"
       - name: Install esptool
         run: pip install esptool
       - name: Debug Board Info
