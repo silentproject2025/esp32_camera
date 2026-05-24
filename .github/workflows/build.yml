@@ -23,9 +23,9 @@ jobs:
           path: |
             ~/.arduino15/packages
             ~/.arduino15/cache
-          key: ${{ runner.os }}-arduino-esp32-3.0.7-${{ hashFiles('**/*.ino') }}
+          key: ${{ runner.os }}-arduino-esp32-3.0.7-busio1145-${{ hashFiles('**/*.ino') }}
           restore-keys: |
-            ${{ runner.os }}-arduino-esp32-3.0.7-
+            ${{ runner.os }}-arduino-esp32-3.0.7-busio1145-
             ${{ runner.os }}-arduino-
 
       - name: Install ESP32 Platform
@@ -48,10 +48,22 @@ jobs:
           # JSON
           arduino-cli lib install "ArduinoJson"
 
-          # Adafruit sensor stack — urutan penting!
+          # Adafruit sensor stack
+          # BusIO 1.14.5 = versi terakhir yang TIDAK pakai typedef BitOrder
+          # sehingga kompatibel dengan semua versi esp32 core
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
-          arduino-cli lib install "Adafruit BusIO@1.16.2"
+          arduino-cli lib install "Adafruit BusIO@1.14.5"
           arduino-cli lib install "Adafruit MPU6050@2.2.6"
+
+      - name: Verify Library Versions
+        run: |
+          echo "=== Installed Libraries ==="
+          arduino-cli lib list
+          echo ""
+          echo "=== BusIO BitOrder check ==="
+          grep -r "typedef BitOrder" ~/Arduino/libraries/Adafruit_BusIO/ \
+            && echo "MASALAH: BitOrder typedef ditemukan!" \
+            || echo "OK: BitOrder typedef tidak ada di BusIO ini"
 
       - name: Install esptool
         run: pip install esptool
