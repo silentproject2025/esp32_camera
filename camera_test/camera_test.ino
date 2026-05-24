@@ -3575,19 +3575,21 @@ void setup(){
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
-  // ── MPU6050 init ──
-  mpuLastTiltNotifMs = millis(); mpuLastShakeNotifMs = millis();
-  delay(200); Serial.println("[DEBUG] MPU Init start");
-  mpuReady = mpuInit();
-  if (mpuReady) Serial.println("[MPU] OK");
-  else          Serial.println("[MPU] Gagal");
-
   blockingWaitAllRelease(600);
   Serial.println("[DEBUG] Setup end");
   resetAllButtons();
 }
 
 void handleModeViewfinder(ButtonEvent evt){
+  static bool mpuPostBootInitDone = false;
+  if(!mpuPostBootInitDone){
+    renderViewfinder();
+    delay(100);
+    mpuLastTiltNotifMs = millis(); mpuLastShakeNotifMs = millis();
+    mpuReady = mpuInit();
+    if(mpuReady) Serial.println("[MPU] Async OK");
+    mpuPostBootInitDone = true;
+  }
   if(!evt.valid){renderViewfinder();return;}
   if(evt.pin==BTN_BOOT){
     if(evt.isLong){if(sdReady) enterUSBMode();}
