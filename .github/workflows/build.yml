@@ -43,16 +43,10 @@ jobs:
 
       - name: Install Libraries
         run: |
-          # Display & graphics
           arduino-cli lib install "LovyanGFX"
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "JPEGDEC"
-
-          # JSON
           arduino-cli lib install "ArduinoJson"
-
-          # Adafruit sensor stack
-          # BusIO 1.14.5 = versi terakhir yang TIDAK pakai typedef BitOrder
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
           arduino-cli lib install "Adafruit BusIO@1.14.5"
           arduino-cli lib install "Adafruit MPU6050@2.2.6"
@@ -65,7 +59,15 @@ jobs:
           echo "=== BusIO BitOrder check ==="
           grep -r "typedef BitOrder" ~/Arduino/libraries/Adafruit_BusIO/ \
             && echo "MASALAH: BitOrder typedef ditemukan!" \
-            || echo "OK: BitOrder typedef tidak ada di BusIO ini"
+            || echo "OK: BitOrder typedef tidak ada"
+
+      - name: Debug Sketch Path
+        run: |
+          echo "=== Repo structure ==="
+          find . -name "*.ino" | head -20
+          echo ""
+          echo "=== camera_test folder ==="
+          ls -lh camera_test/ || echo "folder camera_test tidak ada!"
 
       - name: Install esptool
         run: pip install esptool
@@ -73,28 +75,33 @@ jobs:
       - name: Debug Board Info
         run: arduino-cli board details -b esp32:esp32:esp32s3
 
+      - name: Create output dir
+        run: mkdir -p ./output
+
       - name: Compile Sketch
         run: |
           arduino-cli compile \
             --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
             --build-property "build.extra_flags=-DBOARD_HAS_PSRAM" \
             --output-dir ./output \
+            --verbose \
             camera_test/camera_test.ino
 
-      - name: List Output Files (debug)
+      - name: List Output Files
         if: always()
         run: |
           echo "=== ./output contents ==="
-          ls -lh ./output || echo "output folder tidak ada!"
+          ls -lh ./output/ 2>/dev/null || echo "output folder kosong atau tidak ada"
           echo ""
           echo "=== All .bin files ==="
-          find ./output -name "*.bin" 2>/dev/null || echo "Tidak ada .bin ditemukan"
+          find ./output -name "*.bin" 2>/dev/null || echo "Tidak ada .bin"
 
       - name: Merge Binaries
         run: |
           BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
           PARTITIONS=$(ls ./output/*.partitions.bin 2>/dev/null | head -1)
-          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/3.0.7/tools/partitions/boot_app0.bin 2>/dev/null | head -1)
+          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/3.0.7/tools/partitions/ \
+            -name "boot_app0.bin" 2>/dev/null | head -1)
           APP=$(ls ./output/camera_test.ino.bin 2>/dev/null | head -1)
 
           echo "Bootloader : $BOOTLOADER"
@@ -102,10 +109,9 @@ jobs:
           echo "boot_app0  : $BOOTAPP0"
           echo "App        : $APP"
 
-          # Validasi semua file ada sebelum merge
           for f in "$BOOTLOADER" "$PARTITIONS" "$BOOTAPP0" "$APP"; do
             if [ -z "$f" ] || [ ! -f "$f" ]; then
-              echo "ERROR: File tidak ditemukan: $f"
+              echo "ERROR: File tidak ditemukan -> '$f'"
               exit 1
             fi
           done
@@ -119,17 +125,16 @@ jobs:
             0xe000 "$BOOTAPP0" \
             0x10000 "$APP"
 
-          echo ""
           echo "=== Merge result ==="
           ls -lh ./output/merged-firmware.bin
 
       - name: List Final Output
         if: always()
         run: |
-          echo "=== Final output folder ==="
-          ls -lh ./output/
+          echo "=== Final output ==="
+          ls -lh ./output/ 2>/dev/null || echo "output folder tidak ada"
 
-      - name: Upload Artifact
+      - name: Upload Firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
@@ -139,10 +144,11 @@ jobs:
             ./output/*.bin
           retention-days: 30
 
-      - name: Upload Partial Artifact on Failure
+      - name: Upload Debug on Failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: esp32-debug-${{ github.sha }}
           path: ./output/
+          if-no-files-found: warn
           retention-days: 7
