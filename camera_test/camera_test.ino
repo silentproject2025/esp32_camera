@@ -2486,6 +2486,7 @@ static uint8_t mpuCalcOrientation(float pitch, float roll) {
   return 0;
 }
 
+
 void mpuTick() {
   if (!mpuReady) return;
   unsigned long now = millis();
@@ -2513,13 +2514,8 @@ void mpuTick() {
     mpuTilted = false;
   }
 
+  // Tilt logic without notification
   if (mpuTilted && (now - mpuLastTiltNotifMs > MPU_TILT_NOTIF_COOLDOWN)) {
-    char tiltBuf[32];
-    if (fabsf(mpuRoll) >= fabsf(mpuPitch))
-      snprintf(tiltBuf, sizeof(tiltBuf), "MIRING %.0f\xb0 %s", fabsf(mpuRoll), mpuRoll > 0 ? "kanan" : "kiri");
-    else
-      snprintf(tiltBuf, sizeof(tiltBuf), "MIRING %.0f\xb0 %s", fabsf(mpuPitch), mpuPitch > 0 ? "depan" : "belakang");
-    islandPush(NOTIF_WARN, tiltBuf);
     mpuLastTiltNotifMs = now;
   }
 
@@ -2529,7 +2525,6 @@ void mpuTick() {
   if (shakeVal > MPU_SHAKE_THRESH) {
     mpuShakeDetected = true;
     if (now - mpuLastShakeNotifMs > MPU_SHAKE_NOTIF_COOLDOWN) {
-      islandPush(NOTIF_WARN, "SHAKE - foto blur?");
       mpuLastShakeNotifMs = now;
     }
   } else {
@@ -2538,12 +2533,9 @@ void mpuTick() {
 
   mpuOrientation = mpuCalcOrientation(mpuPitch, mpuRoll);
   if (mpuOrientation != mpuPrevOrientation) {
-    if (mpuPrevOrientation != 255) {
-      const char* orientNames[] = { "LANDSCAPE", "PORTRAIT CW", "TERBALIK", "PORTRAIT CCW" };
-      islandPush(NOTIF_INFO, orientNames[mpuOrientation]);
-    }
     mpuPrevOrientation = mpuOrientation;
   }
+
   if (sdReady && (now - mpuLastLogMs > MPU_LOG_INTERVAL_MS)) {
     mpuLastLogMs = now;
     FILE* f = fopen(MPU_LOG_PATH, "a");
@@ -2559,7 +2551,6 @@ void mpuTick() {
     esp_task_wdt_reset();
   }
 }
-
 uint16_t* mpuRotateBuffer(const uint16_t* src, int w, int h, uint8_t orient) {
   if (orient == 0) return nullptr;
   int dstW = (orient == 1 || orient == 3) ? h : w;
