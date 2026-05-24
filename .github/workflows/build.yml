@@ -45,7 +45,7 @@ jobs:
           arduino-cli lib install "Adafruit BusIO@1.14.5"
           
           # Install Adafruit MPU6050 with compatible version
-          arduino-cli lib install "Adafruit MPU6050@2.0.9"
+          arduino-cli lib install "Adafruit MPU6050"
       
       - name: Install esptool
         run: pip install esptool
