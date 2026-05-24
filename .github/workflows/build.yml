@@ -42,7 +42,7 @@ jobs:
           arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
           
           # Install compatible Adafruit BusIO version (FIXED - BitOrder compatibility)
-          arduino-cli lib install "Adafruit BusIO@1.13.2"
+          arduino-cli lib install "Adafruit BusIO@1.16.2"
           
           # Install Adafruit MPU6050 with compatible version
           arduino-cli lib install "Adafruit MPU6050@2.2.6"
