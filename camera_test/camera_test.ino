@@ -3575,6 +3575,7 @@ void setup(){
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
   // ── MPU6050 init ──
+  delay(200); Serial.println("[DEBUG] MPU Init start");
   mpuReady = mpuInit();
   if (mpuReady) {
     islandPush(NOTIF_INFO, "MPU6050 OK");
@@ -3583,6 +3584,7 @@ void setup(){
   }
 
   blockingWaitAllRelease(600);
+  Serial.println("[DEBUG] Setup end");
   resetAllButtons();
 }
 
@@ -4278,7 +4280,7 @@ void loop(){
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
-  if(appMode!=MODE_VIEWFINDER      &&
+  if(
      appMode!=MODE_JUMP_INPUT       &&
      appMode!=MODE_AI_DESCRIBE      &&
      appMode!=MODE_AI_NO_CONFIG     &&
