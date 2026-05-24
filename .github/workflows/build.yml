@@ -10,8 +10,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
+      
       - name: Cache Arduino CLI
         uses: actions/cache@v4
         with:
@@ -22,28 +24,42 @@ jobs:
           key: ${{ runner.os }}-arduino-${{ hashFiles('**/*.ino') }}
           restore-keys: |
             ${{ runner.os }}-arduino-
+      
       - name: Install ESP32 Platform
         run: |
           arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
           arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+      
       - name: Install Libraries
         run: |
+          # Core graphics and display libraries
           arduino-cli lib install LovyanGFX
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "JPEGDEC"
           arduino-cli lib install "ArduinoJson"
-          arduino-cli lib install "Adafruit MPU6050"
-          arduino-cli lib install "Adafruit Unified Sensor"
+          
+          # Install base sensor library first (IMPORTANT ORDER)
+          arduino-cli lib install "Adafruit Unified Sensor@1.1.14"
+          
+          # Install compatible Adafruit BusIO version (FIX for BitOrder)
+          arduino-cli lib install "Adafruit BusIO@1.14.5"
+          
+          # Install Adafruit MPU6050 with compatible version
+          arduino-cli lib install "Adafruit MPU6050@2.0.9"
+      
       - name: Install esptool
         run: pip install esptool
+      
       - name: Debug Board Info
         run: |
           arduino-cli board details -b esp32:esp32:esp32s3
+      
       - name: Compile Sketch
         run: |
           arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
             --build-property "build.extra_flags=-DBOARD_HAS_PSRAM" \
             --output-dir ./output camera_test/camera_test.ino
+      
       - name: Merge Binaries
         run: |
           BOOTLOADER=$(ls ./output/*.bootloader.bin)
@@ -58,8 +74,10 @@ jobs:
             0x8000 $PARTITIONS \
             0xe000 $BOOTAPP0 \
             0x10000 $APP
+      
       - name: List Output Files
         run: ls -R ./output
+      
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
