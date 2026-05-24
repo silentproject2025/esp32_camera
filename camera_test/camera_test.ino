@@ -347,8 +347,25 @@ enum AppMode {
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
   MODE_SCREENSAVER,
-  MODE_KEY_MANAGER,
+  MODE_KEY_MANAGER, MODE_MENU_EXPERIMENTAL,
 };
+static bool hdrModeEnabled = false;
+static bool eisModeEnabled = false;
+static int  menuExpIdx     = 0;
+static unsigned long hdrFirstTapMs   = 0;
+static bool          hdrWaitingSecondTap = false;
+#define HDR_DOUBLE_TAP_MS 400
+static float eisOffsetX = 0.f;
+static float eisOffsetY = 0.f;
+static float eisGyroBiasX = 0.f;
+static float eisGyroBiasY = 0.f;
+#define EIS_CROP_PERCENT 0.12f
+#define EIS_ALPHA 0.05f
+#define EIS_GYRO_SCALE 8.0f
+#define EIS_CROP_X  ((int)(320 * EIS_CROP_PERCENT / 2))
+#define EIS_CROP_Y  ((int)(240 * EIS_CROP_PERCENT / 2))
+#define EIS_VIEWPORT_W (320 - EIS_CROP_X*2)
+#define EIS_VIEWPORT_H (240 - EIS_CROP_Y*2)
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
 
@@ -780,6 +797,8 @@ void saveSettings() {
   fprintf(f, "exp_val=%d\n",    expManualVal);
   fprintf(f, "exp_gain=%d\n",   expManualGain);
   fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
+  fprintf(f, "hdr_mode=%d\n", (int)hdrModeEnabled);
+  fprintf(f, "eis_mode=%d\n", (int)eisModeEnabled);
   fclose(f);
 }
 
@@ -795,6 +814,8 @@ void loadSettings() {
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
     else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
     else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat= (v==1)?GFMT_JPG:GFMT_BMP; }
+    else if (sscanf(line, "hdr_mode=%d",   &v) == 1) { hdrModeEnabled     = (bool)v; }
+    else if (sscanf(line, "eis_mode=%d",   &v) == 1) { eisModeEnabled     = (bool)v; }
   }
   fclose(f);
 }
@@ -2377,6 +2398,7 @@ void startRecording(){
   recVideoCount++;
   char path[48]; snprintf(path,sizeof(path),"/sdcard/video_%04d.mjpeg",recVideoCount);
   recFile=fopen(path,"wb");
+  eisOffsetX=EIS_CROP_X; eisOffsetY=EIS_CROP_Y; eisGyroBiasX=0; eisGyroBiasY=0;
   if(!recFile){recVideoCount--;return;}
   recFrameCount=0;recStartMs=millis();recActive=true;
   char buf[20]; snprintf(buf,sizeof(buf),"REC  #%04d",recVideoCount);
@@ -2385,37 +2407,62 @@ void startRecording(){
 
 void stopRecording(){
   if(!recActive||!recFile) return;
-  fclose(recFile);recFile=nullptr;recActive=false;
-  unsigned long dur=(millis()-recStartMs)/1000;
-  char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
-  islandPush(NOTIF_OK,buf);
-  blinkLED(3,100,80);
-  fpsLastTime=millis();fpsFrameCount=0;
-}
-
+          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
+  (void)offset;
 void recordFrame(){
   if(!recActive||!recFile) return;
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){esp_task_wdt_reset();return;}
+
+  if (eisModeEnabled && fb->format == PIXFORMAT_RGB565) {
+    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+    float gx = g.gyro.x; float gy = g.gyro.y;
+    eisGyroBiasX = eisGyroBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
+    eisGyroBiasY = eisGyroBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
+    float gdx = gx - eisGyroBiasX; float gdy = gy - eisGyroBiasY;
+    eisOffsetX = constrain(eisOffsetX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
+    eisOffsetY = constrain(eisOffsetY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
+
+    uint16_t* src = (uint16_t*)fb->buf;
+    uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2);
+    if (tmp) {
+      int startX = EIS_CROP_X + (int)eisOffsetX;
+      int startY = EIS_CROP_Y + (int)eisOffsetY;
+      for (int y = 0; y < 240; y++) {
+        int sy = startY + (y * EIS_VIEWPORT_H / 240);
+        for (int x = 0; x < 320; x++) {
+          int sx = startX + (x * EIS_VIEWPORT_W / 320);
+          tmp[y * 320 + x] = src[sy * 320 + sx];
+        }
+      }
+      uint8_t* out_jpg = nullptr; size_t out_len = 0;
+      camera_fb_t fakeFb = *fb; fakeFb.buf = (uint8_t*)tmp; fakeFb.width=320; fakeFb.height=240;
+      if (frame2jpg(&fakeFb, 70, &out_jpg, &out_len)) {
+        fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
+        free(out_jpg);
+      }
+      if (recFrameCount % 3 == 0) {
+        lcd.pushImage(0, 0, 320, 240, tmp);
+        drawRecIndicator(); islandTick();
+      }
+      free(tmp);
+    }
+    esp_camera_fb_return(fb); return;
+  }
+
   uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
   if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
   else{ok=frame2jpg(fb,70,&jpg_buf,&jpg_len);}
   if(ok&&jpg_buf){
-    fwrite(jpg_buf,1,jpg_len,recFile);recFrameCount++;
+    fwrite(jpg_buf,1,jpg_len,recFile); recFrameCount++;
     if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
   }
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawRecIndicator();islandTick();
   }
-  esp_camera_fb_return(fb);esp_task_wdt_reset();
+  esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  USB MSC
-// ─────────────────────────────────────────────────────────────────────────────
-static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize){
-  (void)offset;
   if(!sdCard||!sdmmcDriverInit) return -1;
   return(sdmmc_read_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
 }
@@ -3082,6 +3129,13 @@ void renderViewfinder(){
       drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
                COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
       // MPU6050 indicator
+
+
+      if(hdrModeEnabled) drawPill(DISP_W/2, 35, "HDR", COL_PILL_BG, COL_AI_ACCENT);
+      if(eisModeEnabled){
+        char ebuf[12]; snprintf(ebuf,sizeof(ebuf),recActive?"EIS●":"EIS");
+        drawPill(DISP_W/2 - (hdrModeEnabled?45:0), 35, ebuf, COL_PILL_BG, COL_GRAY_C);
+      }
       mpuDrawViewfinderIndicator();
 
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
@@ -3101,7 +3155,12 @@ void renderViewfinder(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
-void captureAndPreview(){
+void captureAndPreview() {
+  captureAndPreview_internal();
+}
+
+void captureAndPreview_internal(){
+  // renamed existing capture to internal
   if(ledFlashEnabled){
     digitalWrite(LED_FLASH,HIGH);delay(150);
     for(int i=0;i<2;i++){
@@ -3147,6 +3206,45 @@ void captureAndPreview(){
     else {
       uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
       if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
+
+
+  if (eisModeEnabled) {
+    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+    float gx = g.gyro.x; float gy = g.gyro.y;
+    eisGyroBiasX = eisGyroBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
+    eisGyroBiasY = eisGyroBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
+    float gdx = gx - eisGyroBiasX; float gdy = gy - eisGyroBiasY;
+    eisOffsetX = constrain(eisOffsetX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
+    eisOffsetY = constrain(eisOffsetY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
+
+    if (fb->format == PIXFORMAT_RGB565) {
+      uint16_t* src = (uint16_t*)fb->buf;
+      uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2);
+      if (tmp) {
+        int startX = EIS_CROP_X + (int)eisOffsetX;
+        int startY = EIS_CROP_Y + (int)eisOffsetY;
+        for (int y = 0; y < 240; y++) {
+          int sy = startY + (y * EIS_VIEWPORT_H / 240);
+          for (int x = 0; x < 320; x++) {
+            int sx = startX + (x * EIS_VIEWPORT_W / 320);
+            tmp[y * 320 + x] = src[sy * 320 + sx];
+          }
+        }
+        // Replace buffer for compression
+        uint8_t* out_jpg = nullptr; size_t out_len = 0;
+        camera_fb_t fakeFb = *fb; fakeFb.buf = (uint8_t*)tmp;
+        if (frame2jpg(&fakeFb, 70, &out_jpg, &out_len)) {
+          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
+          free(out_jpg);
+        }
+          fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
+          free(out_jpg);
+        }
+        free(tmp);
+      }
+      esp_camera_fb_return(fb); return; // bypass normal write
+    }
+  }
       else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
       if(ok&&jpg_buf&&jpg_len>0){
         // Auto-rotate JPG jika orientasi bukan normal
@@ -3481,8 +3579,9 @@ void enterUSBMode(){
   if(!sdReady) return;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   islandForceHide();
-  unmountVFSOnly();sdReady=false;
-  WiFi.disconnect(true);
+  unmountVFSOnly(); sdReady=false;
+  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  esp_camera_deinit(); delay(100);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
   blinkLED(3,200,100);resetAllButtons();
@@ -3491,10 +3590,11 @@ void enterUSBMode(){
 void exitUSBMode(){
   usbModeActive=false;msc.mediaPresent(false);esp_task_wdt_reset();
   lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
+  lcd.drawString("reinitializing...",(DISP_W-lcd.textWidth("reinitializing..."))/2,DISP_H/2-6);
+  initCamera(); delay(100); applyExpPreset(expPreset);
   sdReady=remountVFSOnly();
   if(sdReady){
-    scanPhotoCount();loadSettings();loadGeminiConfig();applyExpPreset(expPreset);
+    scanPhotoCount();loadSettings();loadGeminiConfig();
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf2[32]; snprintf(buf2,sizeof(buf2),"sd ok  next #%04d",photoCount+1);
     lcd.setTextColor(COL_GRAY_C);lcd.drawString(buf2,(DISP_W-lcd.textWidth(buf2))/2,DISP_H/2-6);
@@ -3508,10 +3608,156 @@ void exitUSBMode(){
   appMode=MODE_VIEWFINDER;
   fpsLastTime=millis();fpsFrameCount=0;fpsValue=0.0f;
 }
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Experimental Menu
+// ─────────────────────────────────────────────────────────────────────────────
+void drawExperimentalMenu(int sel) {
+  int mw=220, mh=150, mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
+  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "EXPERIMENTAL MENU";
+  lcd.drawString(title, mx+(mw-lcd.textWidth(title))/2, my+7);
+  lcd.drawFastHLine(mx+10, my+19, mw-20, COL_GRAY_3);
+
+  const char* labels[] = { "HDR Mode", "EIS Video", "LED/Flash Settings" };
+  for(int i=0; i<3; i++) {
+    int iy = my+28+i*30;
+    bool isHighlighted = (i == sel);
+    lcd.fillRect(mx+8, iy, mw-16, 26, isHighlighted ? COL_GRAY_5 : COL_GRAY_D);
+    lcd.setTextColor(isHighlighted ? COL_WHITE : COL_GRAY_7);
+    lcd.drawString(labels[i], mx+14, iy+8);
+
+    if(i < 2) {
+      bool val = (i==0) ? hdrModeEnabled : eisModeEnabled;
+      lcd.setTextColor(isHighlighted ? COL_WHITE : (val ? COL_AI_ACCENT : COL_GRAY_5));
+      const char* st = val ? "[ ON ]" : "[ OFF ]";
+      lcd.drawString(st, mx+mw-lcd.textWidth(st)-14, iy+8);
+    } else {
+      lcd.setTextColor(isHighlighted ? COL_WHITE : COL_GRAY_5);
+      lcd.drawString(">", mx+mw-20, iy+8);
+    }
+  }
+  lcd.setTextColor(COL_GRAY_3);
+  const char* hint = "C/D=pilih  BOOT=ok/toggle  B=back";
+  lcd.drawString(hint, mx+(mw-lcd.textWidth(hint))/2, my+mh-13);
+}
+
+void openExperimentalMenu() {
+  menuExpIdx = 0;
+  drawExperimentalMenu(menuExpIdx);
+  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_EXPERIMENTAL;
+}
+
+void handleModeMenuExperimental(ButtonEvent evt) {
+  if(!evt.valid) return;
+  if(evt.pin == BTN_BOOT) {
+    if(menuExpIdx == 0) { hdrModeEnabled = !hdrModeEnabled; saveSettings(); drawExperimentalMenu(menuExpIdx); }
+    else if(menuExpIdx == 1) { eisModeEnabled = !eisModeEnabled; saveSettings(); drawExperimentalMenu(menuExpIdx); }
+    else if(menuExpIdx == 2) { openLedMenu(); }
+  }
+  else if(evt.pin == BTN_B) {
+    lcd.fillScreen(COL_BLACK); resetAllButtons(); islandNoClear = true; appMode = MODE_VIEWFINDER;
+  }
+  else if(evt.pin == BTN_C) { menuExpIdx = (menuExpIdx+2)%3; drawExperimentalMenu(menuExpIdx); }
+  else if(evt.pin == BTN_D) { menuExpIdx = (menuExpIdx+1)%3; drawExperimentalMenu(menuExpIdx); }
+}
+
+
+void runHDRFlow() {
+  lcd.fillScreen(COL_BLACK);
+  int cx=DISP_W/2, cy=DISP_H/2;
+  unsigned long start = millis();
+  bool failed = false;
+
+  int origAEC = expManualVal;
+
+  while (millis() - start < 3000) {
+    esp_task_wdt_reset();
+    mpuTick();
+    float gyroMag = sqrt(mpuGyrX*mpuGyrX + mpuGyrY*mpuGyrY + mpuGyrZ*mpuGyrZ);
+    bool stable = (gyroMag < 0.08f);
+
+    if (!stable) { failed = true; break; }
+
+    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_AI_ACCENT);
+    lcd.drawString("HDR CAPTURE", cx-lcd.textWidth("HDR CAPTURE")/2, cy-40);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString("tahan kamera diam...", cx-lcd.textWidth("tahan kamera diam...")/2, cy-15);
+
+    char buf[48]; snprintf(buf, sizeof(buf), "roll:%.1f pitch:%.1f", mpuRoll, mpuPitch);
+    lcd.setTextColor(COL_GRAY_C); lcd.drawString(buf, cx-lcd.textWidth(buf)/2, cy+5);
+
+    int barW = 200, barH = 8;
+    lcd.drawRect(cx-barW/2, cy+25, barW, barH, COL_GRAY_3);
+    int prog = (int)(barW * (millis()-start)/3000.0f);
+    lcd.fillRect(cx-barW/2, cy+25, prog, barH, COL_AI_ACCENT);
+
+    lcd.fillCircle(cx, cy+45, 5, stable ? 0x07E0 : 0xF800);
+    delay(30);
+  }
+
+  if (failed) {
+    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_AI_WARN);
+    lcd.drawString("GAGAL - tekan lagi", cx-lcd.textWidth("GAGAL - tekan lagi")/2, cy);
+    delay(1500);
+  } else {
+    photoCount++;
+    char p0[48], p1[48], p2[48];
+    snprintf(p0, sizeof(p0), "/sdcard/photo_%04d_hdr0.jpg", photoCount);
+    snprintf(p1, sizeof(p1), "/sdcard/photo_%04d_hdr1.jpg", photoCount);
+    snprintf(p2, sizeof(p2), "/sdcard/photo_%04d_hdr2.jpg", photoCount);
+
+    captureHDRFrame(p0, 50);
+    captureHDRFrame(p1, origAEC);
+    captureHDRFrame(p2, 800);
+
+    applyExpPreset(expPreset); // restore
+    char msg[32]; snprintf(msg, sizeof(msg), "HDR OK #%04d x3", photoCount);
+    islandPush(NOTIF_OK, msg);
+  }
+  lcd.fillScreen(COL_BLACK);
+  resetAllButtons();
+}
+bool captureHDRFrame(const char* path, int aecValue) {
+  sensor_t *s = esp_camera_sensor_get(); if(!s) return false;
+  s->set_exposure_ctrl(s, 0);
+  s->set_aec_value(s, aecValue);
+  delay(250); esp_task_wdt_reset();
+  for(int i=0; i<3; i++) {
+    camera_fb_t *tfb = esp_camera_fb_get();
+    if(tfb) esp_camera_fb_return(tfb);
+    esp_task_wdt_reset();
+  }
+  camera_fb_t *fb = esp_camera_fb_get();
+  if(!fb) return false;
+
+  uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
+  if(fb->format == PIXFORMAT_RGB565) { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
+  else if(fb->format == PIXFORMAT_JPEG) { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
+
+  if(ok && jpg_buf) {
+    char payload[STEGO_PAYLOAD_LEN];
+    stegoMakePayload(payload, sizeof(payload), photoCount);
+    size_t stLen=0; uint8_t* stBuf=stegoEmbedToJpeg(jpg_buf, jpg_len, payload, (int)strlen(payload), &stLen);
+    if(!stBuf) { stBuf=jpg_buf; stLen=jpg_len; }
+    size_t exLen=0; uint8_t* exBuf=exifInjectToJpeg(stBuf, stLen, photoCount, sensorName, &exLen);
+    if(!exBuf) { exBuf=stBuf; exLen=stLen; }
+    FILE* f = fopen(path, "wb");
+    if(f) { fwrite(exBuf, 1, exLen, f); fclose(f); }
+    if(exBuf != stBuf) free(exBuf);
+    if(stBuf != jpg_buf) free(stBuf);
+    if(fb->format != PIXFORMAT_JPEG) free(jpg_buf);
+  }
+  esp_camera_fb_return(fb);
+  return ok;
+}
 void setup(){
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.9-fix5 ===");
@@ -3584,11 +3830,16 @@ void handleModeViewfinder(ButtonEvent evt){
   if(!evt.valid){renderViewfinder();return;}
   if(evt.pin==BTN_BOOT){
     if(evt.isLong){if(sdReady) enterUSBMode();}
-    else          {captureAndPreview();}
+    else {
+      if(hdrModeEnabled){
+        if(!hdrWaitingSecondTap){ hdrWaitingSecondTap=true; hdrFirstTapMs=millis(); }
+        else { if(millis()-hdrFirstTapMs < 400){ hdrWaitingSecondTap=false; captureAndPreview(); } }
+      } else { captureAndPreview(); }
+    }
   }
   else if(evt.pin==BTN_B){
     if(evt.isShort){if(recActive) stopRecording();else startRecording();}
-    else           {openLedMenu();}
+    else           {openExperimentalMenu();}
   }
   else if(evt.pin==BTN_C){
     if(evt.isShort){
@@ -3756,7 +4007,12 @@ void handleModeMenuLed(ButtonEvent evt){
       lcd.fillScreen(COL_BLACK);resetAllButtons();appMode=MODE_SCREENSAVER;
     }
   }
-  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
+  else if(evt.pin==BTN_B){
+    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
+    else           {openExperimentalMenu();}
+  }
+  /* removed old B handler */
+  else if(false){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuLedSel=(menuLedSel+2)%3;drawLedMenu(menuLedSel);}
   else if(evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
 }
@@ -3772,6 +4028,11 @@ void handleModeMenuFormat(ButtonEvent evt){
     appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_B){
+    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
+    else           {openExperimentalMenu();}
+  }
+  /* removed old B handler */
+  else if(false){
     drawExpMenu(menuExpSel);resetAllButtons();appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_C||evt.pin==BTN_D){menuFormatSel=(menuFormatSel==0)?1:0;drawFormatMenu(menuFormatSel);}
@@ -3789,7 +4050,12 @@ void handleModeMenuExp(ButtonEvent evt){
     lcd.fillScreen(COL_BLACK);resetAllButtons();
     islandNoClear=true;appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
+  else if(evt.pin==BTN_B){
+    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
+    else           {openExperimentalMenu();}
+  }
+  /* removed old B handler */
+  else if(false){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+5)%6;drawExpMenu(menuExpSel);}
   else if(evt.pin==BTN_D){
     if(evt.isShort){menuExpSel=(menuExpSel+1)%6;drawExpMenu(menuExpSel);}
@@ -4228,6 +4494,17 @@ void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent ev
 }
 void loop(){
   esp_task_wdt_reset();
+  if(hdrWaitingSecondTap && millis()-hdrFirstTapMs >= HDR_DOUBLE_TAP_MS){
+    hdrWaitingSecondTap = false;
+    if(appMode==MODE_VIEWFINDER) runHDRFlow();
+  }
+  if(usbModeActive){
+    tickAllButtons();
+    ButtonEvent evtBoot={};
+    btnBoot.pollEvent(evtBoot);
+    if(evtBoot.valid) exitUSBMode();
+    return;
+  }
   // ── MPU6050 tick ──
   mpuTick();
 
@@ -4248,9 +4525,7 @@ void loop(){
   if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
-  if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
-
   switch(appMode){
     case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
     case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
@@ -4267,6 +4542,7 @@ void loop(){
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
     case MODE_SCREENSAVER:     handleModeScreensaver(evtBoot,evtB,evtC,evtD); break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
+    case MODE_MENU_EXPERIMENTAL: handleModeMenuExperimental(singleEvt); break;
   }
 
   if(
