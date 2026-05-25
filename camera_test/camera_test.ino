@@ -73,9 +73,6 @@
 
 #include "esp_camera.h"
 #include "esp_timer.h"
-#include <time.h>
-#include <Preferences.h>
-#include <math.h>
 #include "img_converters.h"
 #include "FS.h"
 #include "esp_task_wdt.h"
@@ -98,40 +95,6 @@
 #include "USBMSC.h"
 
 #include <JPEGDEC.h>
-// ── MPU6050 ──────────────────────────────────────────────────────────────────
-#include <Wire.h>
-#define sensor_t adafruit_sensor_t
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#undef sensor_t
-
-static Adafruit_MPU6050 mpu;
-static bool     mpuReady              = false;
-static float    mpuAccX, mpuAccY, mpuAccZ = 0;
-static float    mpuGyrX, mpuGyrY, mpuGyrZ = 0;
-static float    mpuTemp               = 0;
-static float    mpuRoll               = 0;
-static float    mpuPitch              = 0;
-static bool     mpuShakeDetected      = false;
-static bool     mpuTilted             = false;
-static uint8_t  mpuOrientation        = 0;
-static uint8_t  mpuPrevOrientation    = 255; // nilai mustahil agar notif pertama muncul
-static unsigned long mpuLastReadMs    = 0;
-static unsigned long mpuLastTiltNotifMs  = 0;
-static unsigned long mpuLastShakeNotifMs = 0;
-static unsigned long mpuLastLogMs     = 0;
-
-#define MPU_SDA_PIN              43
-#define MPU_SCL_PIN              44
-#define MPU_ADDR                 0x68
-#define MPU_READ_INTERVAL_MS     80
-#define MPU_TILT_WARN_DEG        15.0f
-#define MPU_SHAKE_THRESH         3.5f
-#define MPU_TILT_NOTIF_COOLDOWN  3000
-#define MPU_SHAKE_NOTIF_COOLDOWN 1500
-#define MPU_LOG_INTERVAL_MS      5000
-#define MPU_LOG_PATH             "/sdcard/mpu_log.csv"
-
 #include "MjpegClass.h"
 
 #define LGFX_USE_V1
@@ -154,15 +117,6 @@ struct NotifStyle {
   uint16_t    iconFg;
   const char* sym;
 };
-
-// Forward Declarations
-bool ssFetchPrayerTimes(int day, int month, int year);
-bool captureHDRFrame(const char* path, int aecValue);
-void initSSThemes();
-void initSSLayout();
-void recordFrame();
-void stopRecording();
-void startRecording();
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
@@ -298,49 +252,6 @@ static const NotifStyle NOTIF_STYLES[6] = {
 // ─────────────────────────────────────────────────────────────────────────────
 //  App Mode
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-//  SCREENSAVER (FLIP CLOCK) DEFINITIONS
-// ─────────────────────────────────────────────────────────────────────────────
-#define SS_CARD_W    72
-#define SS_LAT_STR    "-0.2217"
-#define SS_LON_STR    "100.6139"
-#define SS_PRAY_METHOD "20"
-#define SS_CARD_H   108
-#define SS_CARD_R     7
-#define SS_CARD_GAP   5
-#define SS_COLON_W   18
-
-struct SSTheme {
-  const char* name;
-  uint8_t     style;
-  uint16_t bg, cardTop, cardBot;
-  uint16_t text, textDim;
-  uint16_t hinge, shine, colon;
-  uint16_t sec, date, accent;
-};
-
-struct SSDigitState { int cur, nxt; bool flipping; float progress; };
-struct SSPrayTime { int hour; int minute; };
-
-static Preferences ssPrefs;
-static SSTheme ssThemes[12];
-static int     ssCurTheme = 0;
-static SSDigitState ssDigits[4];
-static int     ssPrevH = -1, ssPrevM = -1, ssPrevS = -1;
-static bool    ssNtpSynced = false;
-static bool    ssColonVisible = true;
-static SSPrayTime ssPrayTimes[5];
-static const char* ssPrayNames[] = { "SUBUH","DZUHUR","ASHAR","MAGHRIB","ISYA" };
-static bool    ssPrayLoaded = false;
-static int     ssLastPrayDay = -1;
-static uint32_t ssNotifShowUntil = 0;
-static int     ssNotifPrayIdx = -1;
-static uint32_t ssLastRetryMs = 0;
-#define SS_RETRY_INTERVAL 300000
-
-static int ssCardX[4], ssCardY;
-static LGFX_Sprite ssScreen(&lcd);
-static LGFX_Sprite ssCardSpr(&lcd);
 enum AppMode {
   MODE_VIEWFINDER,
   MODE_GALLERY,
@@ -355,26 +266,8 @@ enum AppMode {
   MODE_AI_FEATURE_MENU,
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
-  MODE_SCREENSAVER,
-  MODE_KEY_MANAGER, MODE_MENU_EXPERIMENTAL,
+  MODE_KEY_MANAGER,
 };
-static bool hdrModeEnabled = false;
-static bool eisModeEnabled = false;
-static int  menuExpIdx     = 0;
-static unsigned long hdrFirstTapMs   = 0;
-static bool          hdrWaitingSecondTap = false;
-#define HDR_DOUBLE_TAP_MS 400
-static float eisOffsetX = 0.f;
-static float eisOffsetY = 0.f;
-static float eisGyroBiasX = 0.f;
-static float eisGyroBiasY = 0.f;
-#define EIS_CROP_PERCENT 0.12f
-#define EIS_ALPHA 0.05f
-#define EIS_GYRO_SCALE 8.0f
-#define EIS_CROP_X  ((int)(320 * EIS_CROP_PERCENT / 2))
-#define EIS_CROP_Y  ((int)(240 * EIS_CROP_PERCENT / 2))
-#define EIS_VIEWPORT_W (320 - EIS_CROP_X*2)
-#define EIS_VIEWPORT_H (240 - EIS_CROP_Y*2)
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
 
@@ -583,7 +476,6 @@ inline void tickAllButtons()  { btnBoot.tick();  btnB.tick();  btnC.tick();  btn
 inline void resetAllButtons() { btnBoot.reset(); btnB.reset(); btnC.reset(); btnD.reset(); }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
 //  DYNAMIC ISLAND
 // ─────────────────────────────────────────────────────────────────────────────
 #define ISLAND_SHOW_MS      1000
@@ -622,129 +514,83 @@ static bool          islandDrawnOnce = false;
 static unsigned long islandFreezeUntilMs = 0;
 static bool          islandNoClear   = false;
 
-static LGFX_Sprite   islandBgSnap(&lcd);
-static bool         islandBgCreated  = false;
-static LGFX_Sprite   islandSpr(&lcd);
-static bool         islandSprCreated = false;
-static int          islandSprLastN   = -1;
-
-static void islandCaptureBackground() {
-  if (appMode != MODE_VIEWFINDER) return;
-  int n = min(islandCount, ISLAND_MAX_STACK);
-  int iW, iH, iX;
-  islandCalcDims(n, iW, iH, iX);
-  int capW = iW + 6, capH = iH + 4;
-  int capX = iX - 3, capY = 0;
-  if (islandBgCreated) {
-    if (islandBgSnap.width() != capW || islandBgSnap.height() != capH) {
-      islandBgSnap.deleteSprite(); islandBgCreated = false;
-    }
-  }
-  if (!islandBgCreated) {
-    islandBgSnap.setPsram(true);
-    if (islandBgSnap.createSprite(capW, capH)) islandBgCreated = true;
-  }
-  if (islandBgCreated) {
-    lcd.readRect(capX, capY, capW, capH, (uint16_t*)islandBgSnap.getBuffer());
-    islandLastX = iX; islandLastW = iW; islandLastH = iH; // for erase
-  }
-}
-
 static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
   iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
   iH = ISLAND_PAD_V * 2 + n * ISLAND_H_ROW + (n - 1) * 2;
   iX = ISLAND_CX - iW / 2;
 }
 
-static void islandDrawRow(LGFX_Sprite& sp, int idx, int x, int y, int w, bool isFresh) {
-  if (!islandSprCreated) return;
+static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   if (idx >= islandCount) return;
   NotifEntry& n        = islandStack[idx];
   const NotifStyle& s  = NOTIF_STYLES[(int)n.type];
   uint16_t rowBg = isFresh ? COL_GRAY_D : COL_BLACK;
-  sp.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
+  lcd.fillRect(x - 2, y, w + 4, ISLAND_H_ROW - 1, rowBg);
   int iconY = y + (ISLAND_H_ROW - ISLAND_ICON_SZ) / 2;
-  sp.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
-  sp.setFont(&fonts::Font0); sp.setTextSize(1);
-  sp.setTextColor(s.iconFg);
-  sp.drawString(s.sym, x + 2, iconY + 1);
-  sp.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
+  lcd.fillRect(x, iconY, ISLAND_ICON_SZ, ISLAND_ICON_SZ, s.iconBg);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(s.iconFg);
+  lcd.drawString(s.sym, x + 2, iconY + 1);
+  lcd.setTextColor(isFresh ? COL_GRAY_E : COL_GRAY_7);
   char buf[28];
   strncpy(buf, n.text, sizeof(buf) - 1);
   buf[sizeof(buf) - 1] = '\0';
   int maxW = w - ISLAND_ICON_SZ - 8;
-  while (strlen(buf) > 4 && sp.textWidth(buf) > maxW) {
-    int l = (int)strlen(buf);
+  while (strlen(buf) > 4 && lcd.textWidth(buf) > maxW) {
+    int l = strlen(buf);
     buf[l-1] = '\0';
     if (strlen(buf) > 3) { buf[strlen(buf)-1] = '.'; buf[strlen(buf)-2] = '.'; }
   }
-  sp.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
+  lcd.drawString(buf, x + ISLAND_ICON_SZ + 4, y + 4);
   if (n.type == NOTIF_REC && isFresh) {
     int dotX = x + w - 4;
     int dotY = y + ISLAND_H_ROW / 2;
     bool blink = (millis() / 400) % 2;
-    sp.fillCircle(dotX, dotY, 2, blink ? 0xF800 : COL_GRAY_3);
+    lcd.fillCircle(dotX, dotY, 2, blink ? 0xF800 : COL_GRAY_3);
   }
 }
-
 
 static void islandErase() {
-  esp_task_wdt_reset();
-  if (islandNoClear) return;
+  if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
-  if (islandBgCreated) {
-    islandBgSnap.pushSprite(islandLastX - 3, 0);
-  } else {
-    int eraseX = islandLastX - 3;
-    int eraseY = constrain(islandLastY, 0, DISP_H);
-    int eraseW = islandLastW + 6;
-    int eraseH = constrain(islandLastH + 4, 0, DISP_H - eraseY);
-    if (eraseH > 0 && eraseW > 0) lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
-  }
+  if (islandLastW <= 0 || islandLastH <= 0) return;
+  int eraseX = islandLastX - 3;
+  int eraseY = islandLastY;
+  int eraseW = islandLastW + 6;
+  int eraseH = islandLastH + 4;
+  if (eraseY < 0) { eraseH += eraseY; eraseY = 0; }
+  if (eraseH <= 0) return;
+  if (eraseX < 0) { eraseW += eraseX; eraseX = 0; }
+  if (eraseW <= 0) return;
+  lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
 }
+
 static void islandDraw(int offsetY = 0) {
-  esp_task_wdt_reset();
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
   int iW, iH, iX;
   islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
-
-  int reqW = iW + 6, reqH = iH + 6; if (!islandSprCreated || islandSpr.width() != reqW || islandSpr.height() != reqH) {
-    if (islandSprCreated) islandSpr.deleteSprite();
-    islandSpr.setColorDepth(16);
-    if (!islandSpr.createSprite(reqW, reqH)) {
-      islandSprCreated = false; return;
-    }
-    islandSprCreated = true;
-    islandSprLastN = n;
-  }
-
-  islandSpr.fillSprite(0);
-  islandSpr.fillRoundRect(3, 3, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
-  islandSpr.drawRoundRect(3, 3, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
-  if (iH > 4 && iW > 4)
-    islandSpr.drawRoundRect(4, 4, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
-
-  int rowY = 3 + ISLAND_PAD_V;
-  for (int i = 0; i < n; i++) {
-    islandDrawRow(islandSpr, i, 3 + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
-    if (i < n - 1)
-      islandSpr.drawFastHLine(3 + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
-                              iW - ISLAND_PAD_H * 2, COL_GRAY_3);
-    rowY += ISLAND_H_ROW + 2;
-  }
-
   islandLastX = iX; islandLastY = iY; islandLastW = iW; islandLastH = iH;
-  if (iY + iH > 0) {
-    if(islandSprCreated) islandSpr.pushSprite(iX - 3, max(-iH, iY));
+  if (iY + iH <= 0) return;
+  lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
+  lcd.fillRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_D);
+  lcd.drawRoundRect(iX, iY, iW, iH, ISLAND_RADIUS, COL_GRAY_5);
+  if (iH > 4 && iW > 4)
+    lcd.drawRoundRect(iX + 1, iY + 1, iW - 2, iH - 2, ISLAND_RADIUS - 1, COL_GRAY_3);
+  int rowY = iY + ISLAND_PAD_V;
+  for (int i = 0; i < n; i++) {
+    islandDrawRow(i, iX + ISLAND_PAD_H, rowY, iW - ISLAND_PAD_H * 2, (i == 0));
+    if (i < n - 1)
+      lcd.drawFastHLine(iX + ISLAND_PAD_H, rowY + ISLAND_H_ROW + 1,
+                        iW - ISLAND_PAD_H * 2, COL_GRAY_3);
+    rowY += ISLAND_H_ROW + 2;
   }
   islandDrawnOnce = true;
 }
 
 static void islandHide() {
   islandState = ISLAND_HIDDEN; islandCount = 0;
-  if (islandBgCreated) { islandBgSnap.deleteSprite(); islandBgCreated = false; }
   islandLastW = 0; islandLastH = 0; islandLastY = 0; islandDrawnOnce = false;
 }
 
@@ -758,7 +604,6 @@ void islandPush(NotifType type, const char* text) {
   islandShowAt    = millis();
   int showMs = (type == NOTIF_WARN) ? 2000 : (type == NOTIF_INFO) ? 800 : 1000;
   islandHideAt    = millis() + showMs;
-  islandCaptureBackground();
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
@@ -766,7 +611,6 @@ void islandPush(NotifType type, const char* text) {
 
 void islandTick() {
   unsigned long now = millis();
-  esp_task_wdt_reset();
   switch (islandState) {
     case ISLAND_HIDDEN: break;
     case ISLAND_SLIDING_IN: {
@@ -789,7 +633,7 @@ void islandTick() {
         islandAnimStart = now; islandState = ISLAND_SLIDING_OUT;
       } else {
         if (islandCount > 0 && islandStack[0].type == NOTIF_REC) {
-          islandDraw(0);
+          islandErase(); islandDraw(0);
         }
       }
       break;
@@ -799,12 +643,12 @@ void islandTick() {
       int iW, iH, iX;
       islandCalcDims(nItems, iW, iH, iX);
       if (elapsed >= ISLAND_ANIM_MS) {
-        islandErase(); islandHide();
+        islandHide();
       } else {
         float progress = (float)elapsed / ISLAND_ANIM_MS;
         progress = pow(progress, 3);
         int offsetY = (int)(-iH * progress);
-        islandErase(); islandDraw(offsetY);
+        islandDraw(offsetY);
       }
       break;
     }
@@ -812,7 +656,10 @@ void islandTick() {
 }
 
 void islandForceHide() {
-  islandErase(); islandHide();
+  islandNoClear = false;
+  if (islandState != ISLAND_HIDDEN && islandDrawnOnce) islandErase();
+  islandHide();
+  islandFreezeUntilMs = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -852,8 +699,6 @@ void saveSettings() {
   fprintf(f, "exp_val=%d\n",    expManualVal);
   fprintf(f, "exp_gain=%d\n",   expManualGain);
   fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
-  fprintf(f, "hdr_mode=%d\n", (int)hdrModeEnabled);
-  fprintf(f, "eis_mode=%d\n", (int)eisModeEnabled);
   fclose(f);
 }
 
@@ -869,8 +714,6 @@ void loadSettings() {
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
     else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
     else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat= (v==1)?GFMT_JPG:GFMT_BMP; }
-    else if (sscanf(line, "hdr_mode=%d",   &v) == 1) { hdrModeEnabled     = (bool)v; }
-    else if (sscanf(line, "eis_mode=%d",   &v) == 1) { eisModeEnabled     = (bool)v; }
   }
   fclose(f);
 }
@@ -907,19 +750,6 @@ bool loadWifiConfig() {
   if (strcmp(wifiSSID,"NamaWiFiKamu")==0) return false;
   Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
   return gotSSID && gotPass;
-}
-
-bool startWiFiConnection() {
-  bool wifiOK = (wifiSSID[0] != '\0' && strcmp(wifiSSID, "NamaWiFiKamu") != 0);
-  if (!wifiOK) wifiOK = loadWifiConfig();
-  if (!wifiOK) return false;
-
-  Serial.printf("[WIFI] Connecting to %s...\n", wifiSSID);
-  WiFi.disconnect(true);
-  delay(100);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(wifiSSID, wifiPass);
-  return true;
 }
 
 bool loadGeminiConfig() {
@@ -1903,10 +1733,6 @@ void scanGalleryFiles(){
 //  Gallery draw functions
 // ─────────────────────────────────────────────────────────────────────────────
 void drawGallery(){
-  if (galleryCount < 0) galleryCount = 0;
-  if (galleryCount > GALLERY_MAX_FILES) galleryCount = GALLERY_MAX_FILES;
-  if (galleryCount > 0) gallerySelIdx = constrain(gallerySelIdx, 0, galleryCount - 1);
-  galleryScroll = constrain(galleryScroll, 0, max(0, galleryCount - 1));
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
   lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
@@ -1992,13 +1818,13 @@ bool photoLoadPixelBuf(int idx){
   } else {
     FILE* f=fopen(path,"rb"); if(!f) return false;
     fseek(f,0,SEEK_END);size_t fsize=ftell(f);fseek(f,0,SEEK_SET);
-    uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize); if(!jpgBuf) jpgBuf=(uint8_t*)malloc(fsize);
+    uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize);
     if(!jpgBuf){fclose(f);return false;}
     fread(jpgBuf,1,fsize,f);fclose(f);
     TJpgDec.setJpgScale(1);TJpgDec.setSwapBytes(true);TJpgDec.setCallback(tjpgdecOutput);
     uint16_t iw=0,ih=0; TJpgDec.getJpgSize(&iw,&ih,jpgBuf,fsize);
     if(iw==0||ih==0){free(jpgBuf);return false;}
-    uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t)); if(!buf) buf=(uint16_t*)malloc((size_t)iw*ih*sizeof(uint16_t));
+    uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t));
     if(!buf){free(jpgBuf);return false;}
     memset(buf,0,(size_t)iw*ih*sizeof(uint16_t));
     _decodeTargetBuf=buf;_decodeTargetW=iw;
@@ -2203,28 +2029,22 @@ void photoViewNext(){
 //  Menu LED
 // ─────────────────────────────────────────────────────────────────────────────
 void drawLedMenu(int sel){
-  int mw=200,mh=114,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
+  int mw=200,mh=90,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx,my,mw,mh,10,COL_GRAY_D);
   lcd.drawRoundRect(mx,my,mw,mh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title="SETTINGS";
+  const char* title="LED FLASH";
   lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
   lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
-  for(int i=0;i<3;i++){
+  for(int i=0;i<2;i++){
     int iy=my+24+i*24;
-    bool isChecked=(i==0)?ledFlashEnabled:(i==1)?!ledFlashEnabled:false,isHighlight=(i==sel);
+    bool isChecked=(i==0)?ledFlashEnabled:!ledFlashEnabled,isHighlight=(i==sel);
     lcd.fillRect(mx+8,iy,mw-16,18,isHighlight?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor(isHighlight?COL_WHITE:(isChecked?COL_GRAY_E:COL_GRAY_7));
-    if(i<2){
-      lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
-      if(isChecked){lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);}
-    }else{
-      lcd.drawString(">",mx+13,iy+5);
-    }
-    if(i==0)      lcd.drawString("FLASH ON",mx+24,iy+5);
-    else if(i==1) lcd.drawString("FLASH OFF",mx+24,iy+5);
-    else if(i==2) lcd.drawString("CLOCK / SCREENSAVER",mx+24,iy+5);
+    lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
+    if(isChecked){lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);}
+    lcd.drawString((i==0)?"LED ON   - flash saat capture":"LED OFF  - tanpa flash",mx+24,iy+5);
   }
   lcd.setTextColor(COL_GRAY_3);
   const char* hint="C/D=pilih  BOOT=ok  B=batal";
@@ -2457,7 +2277,6 @@ void startRecording(){
   recVideoCount++;
   char path[48]; snprintf(path,sizeof(path),"/sdcard/video_%04d.mjpeg",recVideoCount);
   recFile=fopen(path,"wb");
-  eisOffsetX=EIS_CROP_X; eisOffsetY=EIS_CROP_Y; eisGyroBiasX=0; eisGyroBiasY=0;
   if(!recFile){recVideoCount--;return;}
   recFrameCount=0;recStartMs=millis();recActive=true;
   char buf[20]; snprintf(buf,sizeof(buf),"REC  #%04d",recVideoCount);
@@ -2466,71 +2285,39 @@ void startRecording(){
 
 void stopRecording(){
   if(!recActive||!recFile) return;
-  fclose(recFile); recFile=nullptr; recActive=false;
-  char buf[20]; snprintf(buf,sizeof(buf),"SAVED #%04d",recVideoCount);
+  fclose(recFile);recFile=nullptr;recActive=false;
+  unsigned long dur=(millis()-recStartMs)/1000;
+  char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
   islandPush(NOTIF_OK,buf);
+  blinkLED(3,100,80);
+  fpsLastTime=millis();fpsFrameCount=0;
 }
 
 void recordFrame(){
   if(!recActive||!recFile) return;
-
   camera_fb_t *fb=esp_camera_fb_get();
   if(!fb){esp_task_wdt_reset();return;}
-
-  if (eisModeEnabled && fb->format == PIXFORMAT_RGB565) {
-    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-    float gx = g.gyro.x; float gy = g.gyro.y;
-    eisGyroBiasX = eisGyroBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
-    eisGyroBiasY = eisGyroBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
-    float gdx = gx - eisGyroBiasX; float gdy = gy - eisGyroBiasY;
-    eisOffsetX = constrain(eisOffsetX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    eisOffsetY = constrain(eisOffsetY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
-
-    uint16_t* src = (uint16_t*)fb->buf;
-    uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2); if(!tmp) tmp=(uint16_t*)malloc(320 * 240 * 2);
-    if (tmp) {
-      int startX = EIS_CROP_X + (int)eisOffsetX;
-      int startY = EIS_CROP_Y + (int)eisOffsetY;
-      for (int y = 0; y < 240; y++) {
-        int sy = startY + (y * EIS_VIEWPORT_H / 240);
-        for (int x = 0; x < 320; x++) {
-          int sx = startX + (x * EIS_VIEWPORT_W / 320);
-          tmp[y * 320 + x] = src[sy * 320 + sx];
-        }
-      }
-      uint8_t* out_jpg = nullptr; size_t out_len = 0;
-      camera_fb_t fakeFb = *fb; fakeFb.buf = (uint8_t*)tmp; fakeFb.width=320; fakeFb.height=240;
-      if (frame2jpg(&fakeFb, 70, &out_jpg, &out_len)) {
-        fwrite(out_jpg, 1, out_len, recFile); recFrameCount++;
-        free(out_jpg);
-      }
-      if (recFrameCount % 3 == 0) {
-        lcd.pushImage(0, 0, 320, 240, tmp);
-        drawRecIndicator(); islandTick();
-      }
-      free(tmp);
-    }
-    esp_camera_fb_return(fb); return;
-  }
-
   uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
   if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
   else{ok=frame2jpg(fb,70,&jpg_buf,&jpg_len);}
   if(ok&&jpg_buf){
-    fwrite(jpg_buf,1,jpg_len,recFile); recFrameCount++;
+    fwrite(jpg_buf,1,jpg_len,recFile);recFrameCount++;
     if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
   }
   if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
     lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
     drawRecIndicator();islandTick();
   }
-  esp_camera_fb_return(fb); esp_task_wdt_reset();
+  esp_camera_fb_return(fb);esp_task_wdt_reset();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  USB MSC
+// ─────────────────────────────────────────────────────────────────────────────
 static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize){
-  uint8_t* u8buf = (uint8_t*)buffer;
   (void)offset;
   if(!sdCard||!sdmmcDriverInit) return -1;
-  return(sdmmc_read_sectors(sdCard,u8buf,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
+  return(sdmmc_read_sectors(sdCard,buffer,lba,bufsize/512)==ESP_OK)?(int32_t)bufsize:-1;
 }
 static int32_t onWrite(uint32_t lba,uint32_t offset,uint8_t* buffer,uint32_t bufsize){
   (void)offset;
@@ -2572,140 +2359,6 @@ void runFaceDetect(camera_fb_t *fb){
         lcd.fillCircle(constrain(res.keypoint[k],0,DISP_W-1),
                        constrain(res.keypoint[k+1],0,DISP_H-1),2,COL_GRAY_C);
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  MPU6050
-// ─────────────────────────────────────────────────────────────────────────────
-
-bool mpuInit() {
-  Wire.begin(MPU_SDA_PIN, MPU_SCL_PIN);
-  if (!mpu.begin(MPU_ADDR, &Wire)) {
-    Serial.println("[MPU] MPU6050 tidak ditemukan!");
-    return false;
-  }
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.println("[MPU] MPU6050 OK");
-  return true;
-}
-
-static uint8_t mpuCalcOrientation(float pitch, float roll) {
-  if (fabsf(roll) < 45.0f && fabsf(pitch) < 45.0f) return 0;
-  if (roll >  45.0f) return 1;
-  if (roll < -45.0f) return 3;
-  if (pitch >  45.0f) return 2;
-  return 0;
-}
-
-
-void mpuTick() {
-  if (!mpuReady) return;
-  unsigned long now = millis();
-  if (now - mpuLastReadMs < MPU_READ_INTERVAL_MS) return;
-  mpuLastReadMs = now;
-
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
-
-  mpuAccX = accel.acceleration.x;
-  mpuAccY = accel.acceleration.y;
-  mpuAccZ = accel.acceleration.z;
-  mpuGyrX = gyro.gyro.x;
-  mpuGyrY = gyro.gyro.y;
-  mpuGyrZ = gyro.gyro.z;
-  mpuTemp = temp.temperature;
-
-  mpuRoll  = atan2f(mpuAccY, mpuAccZ) * 57.2958f;
-  mpuPitch = atan2f(-mpuAccX, sqrtf(mpuAccY*mpuAccY + mpuAccZ*mpuAccZ)) * 57.2958f;
-
-  bool isTilted = (fabsf(mpuRoll) > MPU_TILT_WARN_DEG || fabsf(mpuPitch) > MPU_TILT_WARN_DEG);
-  if (isTilted && !mpuTilted) {
-    mpuTilted = true;
-  } else if (!isTilted && mpuTilted) {
-    mpuTilted = false;
-  }
-
-  // Tilt logic without notification
-  if (mpuTilted && (now - mpuLastTiltNotifMs > MPU_TILT_NOTIF_COOLDOWN)) {
-    mpuLastTiltNotifMs = now;
-  }
-
-  float mag = sqrtf(mpuAccX*mpuAccX + mpuAccY*mpuAccY + mpuAccZ*mpuAccZ);
-  float shakeVal = fabsf(mag - 9.8f);
-
-  if (shakeVal > MPU_SHAKE_THRESH) {
-    mpuShakeDetected = true;
-    if (now - mpuLastShakeNotifMs > MPU_SHAKE_NOTIF_COOLDOWN) {
-      mpuLastShakeNotifMs = now;
-    }
-  } else {
-    mpuShakeDetected = false;
-  }
-
-  mpuOrientation = mpuCalcOrientation(mpuPitch, mpuRoll);
-  if (mpuOrientation != mpuPrevOrientation) {
-    mpuPrevOrientation = mpuOrientation;
-  }
-
-  if (sdReady && (now - mpuLastLogMs > MPU_LOG_INTERVAL_MS)) {
-    mpuLastLogMs = now;
-    FILE* f = fopen(MPU_LOG_PATH, "a");
-    if (f) {
-      fseek(f, 0, SEEK_END);
-      if (ftell(f) == 0) {
-        fprintf(f, "millis,accX,accY,accZ,gyrX,gyrY,gyrZ,roll,pitch,temp,orient\n");
-      }
-      fprintf(f, "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%d\n",
-              now, mpuAccX, mpuAccY, mpuAccZ, mpuGyrX, mpuGyrY, mpuGyrZ, mpuRoll, mpuPitch, mpuTemp, (int)mpuOrientation);
-      fclose(f);
-    }
-    esp_task_wdt_reset();
-  }
-}
-uint16_t* mpuRotateBuffer(const uint16_t* src, int w, int h, uint8_t orient) {
-  if (orient == 0) return nullptr;
-  int dstW = (orient == 1 || orient == 3) ? h : w;
-  int dstH = (orient == 1 || orient == 3) ? w : h;
-  uint16_t* dst = (uint16_t*)ps_malloc((size_t)dstW * dstH * sizeof(uint16_t));
-  if (!dst) dst = (uint16_t*)malloc((size_t)dstW * dstH * sizeof(uint16_t));
-  if (!dst) return nullptr;
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      uint16_t px = src[y * w + x];
-      int dx, dy;
-      switch (orient) {
-        case 1: dx = h - 1 - y; dy = x; break;
-        case 2: dx = w - 1 - x; dy = h - 1 - y; break;
-        case 3: dx = y; dy = w - 1 - x; break;
-        default: dx = x; dy = y;
-      }
-      dst[dy * dstW + dx] = px;
-    }
-    if (y % 20 == 0) esp_task_wdt_reset();
-  }
-  return dst;
-}
-
-void mpuDrawViewfinderIndicator() {
-  if (!mpuReady) return;
-  char buf[16];
-  uint16_t col;
-  if (mpuShakeDetected) {
-    strncpy(buf, "SHAKE!", sizeof(buf));
-    col = COL_AI_WARN;
-  } else if (mpuTilted) {
-    if (fabsf(mpuRoll) >= fabsf(mpuPitch))
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(mpuRoll), mpuRoll > 0 ? "R" : "L");
-    else
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(mpuPitch), mpuPitch > 0 ? "F" : "B");
-    col = COL_AI_WARN;
-  } else {
-    strncpy(buf, "LEVEL", sizeof(buf));
-    col = COL_GRAY_7;
-  }
-  drawPill(DISP_W - 36, DISP_H - 22, buf, COL_PILL_BG, col);
 }
 
 void toggleFaceDetect(){
@@ -2966,17 +2619,13 @@ bool doAICall(int idx, const char* customPrompt) {
   drawAIStatus("CONNECTING","menghubungkan WiFi...");
 
   if(WiFi.status()!=WL_CONNECTED){
-    if(!startWiFiConnection()){
-      drawAIStatus("WiFi Error","periksa wifi.ini");
-      delay(2500); return false;
-    }
+    WiFi.begin(wifiSSID,wifiPass);
     unsigned long t0=millis();
     while(WiFi.status()!=WL_CONNECTED&&millis()-t0<15000){delay(300);esp_task_wdt_reset();}
     if(WiFi.status()!=WL_CONNECTED){
       drawAIStatus("WiFi gagal","periksa wifi.ini");
       delay(2500);return false;
     }
-    configTime(25200, 0, "pool.ntp.org"); struct tm t; if(getLocalTime(&t)){ ssNtpSynced=true; ssDigits[0].cur=t.tm_hour/10; ssDigits[1].cur=t.tm_hour%10; ssDigits[2].cur=t.tm_min/10; ssDigits[3].cur=t.tm_min%10; ssPrevH=t.tm_hour; ssPrevM=t.tm_min; ssPrayLoaded=ssFetchPrayerTimes(t.tm_mday,t.tm_mon+1,t.tm_year+1900); ssLastPrayDay=t.tm_mday; }
   }
 
   char featLabel[24];
@@ -3194,16 +2843,6 @@ void renderViewfinder(){
       drawPill(38,DISP_H-10,shotBuf,COL_PILL_BG,COL_GRAY_8);
       drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
                COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
-      // MPU6050 indicator
-
-
-      if(hdrModeEnabled) drawPill(DISP_W/2, 35, "HDR", COL_PILL_BG, COL_AI_ACCENT);
-      if(eisModeEnabled){
-        char ebuf[12]; snprintf(ebuf,sizeof(ebuf),recActive?"EIS●":"EIS");
-        drawPill(DISP_W/2 - (hdrModeEnabled?45:0), 35, ebuf, COL_PILL_BG, COL_GRAY_C);
-      }
-      mpuDrawViewfinderIndicator();
-
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
       lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
       if(recActive) drawRecIndicator();
@@ -3221,7 +2860,6 @@ void renderViewfinder(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
-
 void captureAndPreview(){
   if(ledFlashEnabled){
     digitalWrite(LED_FLASH,HIGH);delay(150);
@@ -3244,82 +2882,16 @@ void captureAndPreview(){
     bool isGC2145rgb=(detectedSensor==PID_GC2145&&
                       fb->format==PIXFORMAT_RGB565&&
                       fb->width==DISP_W&&fb->height==DISP_H);
-    if(isGC2145rgb && gc2145CaptureFormat==GFMT_BMP){
+    if(isGC2145rgb&&gc2145CaptureFormat==GFMT_BMP){
       char path[48]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.bmp",photoCount);
       char payload[STEGO_BMP_MAX_PAYLOAD];
       stegoMakePayload(payload,sizeof(payload),photoCount);
-
-      // Auto-rotate jika orientasi bukan normal
-      if (mpuReady && mpuOrientation != 0) {
-        uint16_t* rotBuf = mpuRotateBuffer(
-          (const uint16_t*)fb->buf, fb->width, fb->height, mpuOrientation);
-        if (rotBuf) {
-          int rW = (mpuOrientation==1||mpuOrientation==3) ? fb->height : fb->width;
-          int rH = (mpuOrientation==1||mpuOrientation==3) ? fb->width  : fb->height;
-          saved = saveBMP((uint8_t*)rotBuf, rW, rH, path, payload, (int)strlen(payload));
-          free(rotBuf);
-        } else {
-          saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, (int)strlen(payload));
-        }
-      } else {
-        saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, (int)strlen(payload));
-      }
-    }
-    else {
+      saved=saveBMP(fb->buf,fb->width,fb->height,path,payload,(int)strlen(payload));
+    } else {
       uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
-      if(fb->format==PIXFORMAT_RGB565){
-        if(eisModeEnabled){
-          sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-          float gx=g.gyro.x, gy=g.gyro.y;
-          eisGyroBiasX = eisGyroBiasX*(1.0f-EIS_ALPHA) + gx*EIS_ALPHA;
-          eisGyroBiasY = eisGyroBiasY*(1.0f-EIS_ALPHA) + gy*EIS_ALPHA;
-          float gdx=gx-eisGyroBiasX, gdy=gy-eisGyroBiasY;
-          eisOffsetX = constrain(eisOffsetX+gdx*EIS_GYRO_SCALE, 0, EIS_CROP_X*2);
-          eisOffsetY = constrain(eisOffsetY+gdy*EIS_GYRO_SCALE, 0, EIS_CROP_Y*2);
-          uint16_t* src=(uint16_t*)fb->buf;
-          uint16_t* tmp=(uint16_t*)ps_malloc(320*240*2); if(!tmp) tmp=(uint16_t*)malloc(320*240*2);
-          if(tmp){
-            int startX=EIS_CROP_X+(int)eisOffsetX, startY=EIS_CROP_Y+(int)eisOffsetY;
-            for(int y=0;y<240;y++){
-              int sy=startY+(y*EIS_VIEWPORT_H/240);
-              for(int x=0;x<320;x++){
-                int sx=startX+(x*EIS_VIEWPORT_W/320);
-                tmp[y*320+x]=src[sy*320+sx];
-              }
-            }
-            camera_fb_t fakeFb=*fb; fakeFb.buf=(uint8_t*)tmp; fakeFb.width=320; fakeFb.height=240;
-            if(frame2jpg(&fakeFb,85,&jpg_buf,&jpg_len)) ok=true;
-            free(tmp);
-          }
-        } else {
-          ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);
-        }
-      }
+      if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
       else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
       if(ok&&jpg_buf&&jpg_len>0){
-        // Auto-rotate JPG jika orientasi bukan normal
-        if (mpuReady && mpuOrientation != 0 && fb->format == PIXFORMAT_RGB565) {
-          uint16_t* rotBuf = mpuRotateBuffer(
-            (const uint16_t*)fb->buf, fb->width, fb->height, mpuOrientation);
-          if (rotBuf) {
-            int rW = (mpuOrientation==1||mpuOrientation==3) ? fb->height : fb->width;
-            int rH = (mpuOrientation==1||mpuOrientation==3) ? fb->width  : fb->height;
-            uint8_t* rJpg = nullptr; size_t rJpgLen = 0;
-            // buat frame buffer sementara
-            camera_fb_t fakeFb;
-            fakeFb.buf    = (uint8_t*)rotBuf;
-            fakeFb.len    = (size_t)rW * rH * 2;
-            fakeFb.width  = rW;
-            fakeFb.height = rH;
-            fakeFb.format = PIXFORMAT_RGB565;
-            bool rOk = frame2jpg(&fakeFb, 85, &rJpg, &rJpgLen);
-            free(rotBuf);
-            if (rOk && rJpg) {
-              if (jpg_buf && fb->format != PIXFORMAT_JPEG) free(jpg_buf);
-              jpg_buf = rJpg; jpg_len = rJpgLen;
-            }
-          }
-        }
         char payload[STEGO_PAYLOAD_LEN];
         stegoMakePayload(payload,sizeof(payload),photoCount);
         size_t stegoLen=0;
@@ -3629,9 +3201,8 @@ void enterUSBMode(){
   if(!sdReady) return;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   islandForceHide();
-  unmountVFSOnly(); sdReady=false;
-  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
-  esp_camera_deinit(); delay(100);
+  unmountVFSOnly();sdReady=false;
+  WiFi.disconnect(true);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
   blinkLED(3,200,100);resetAllButtons();
@@ -3640,11 +3211,10 @@ void enterUSBMode(){
 void exitUSBMode(){
   usbModeActive=false;msc.mediaPresent(false);esp_task_wdt_reset();
   lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("reinitializing...",(DISP_W-lcd.textWidth("reinitializing..."))/2,DISP_H/2-6);
-  initCamera(); delay(100); applyExpPreset(expPreset);
+  lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
   sdReady=remountVFSOnly();
   if(sdReady){
-    scanPhotoCount();loadSettings();loadGeminiConfig();
+    scanPhotoCount();loadSettings();loadGeminiConfig();applyExpPreset(expPreset);
     lcd.fillRect(0,DISP_H/2-10,DISP_W,20,COL_BLACK);
     char buf2[32]; snprintf(buf2,sizeof(buf2),"sd ok  next #%04d",photoCount+1);
     lcd.setTextColor(COL_GRAY_C);lcd.drawString(buf2,(DISP_W-lcd.textWidth(buf2))/2,DISP_H/2-6);
@@ -3658,156 +3228,10 @@ void exitUSBMode(){
   appMode=MODE_VIEWFINDER;
   fpsLastTime=millis();fpsFrameCount=0;fpsValue=0.0f;
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Experimental Menu
-// ─────────────────────────────────────────────────────────────────────────────
-void drawExperimentalMenu(int sel) {
-  int mw=220, mh=150, mx=(DISP_W-mw)/2, my=(DISP_H-mh)/2;
-  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_E);
-  const char* title = "EXPERIMENTAL MENU";
-  lcd.drawString(title, mx+(mw-lcd.textWidth(title))/2, my+7);
-  lcd.drawFastHLine(mx+10, my+19, mw-20, COL_GRAY_3);
-
-  const char* labels[] = { "HDR Mode", "EIS Video", "LED/Flash Settings" };
-  for(int i=0; i<3; i++) {
-    int iy = my+28+i*30;
-    bool isHighlighted = (i == sel);
-    lcd.fillRect(mx+8, iy, mw-16, 26, isHighlighted ? COL_GRAY_5 : COL_GRAY_D);
-    lcd.setTextColor(isHighlighted ? COL_WHITE : COL_GRAY_7);
-    lcd.drawString(labels[i], mx+14, iy+8);
-
-    if(i < 2) {
-      bool val = (i==0) ? hdrModeEnabled : eisModeEnabled;
-      lcd.setTextColor(isHighlighted ? COL_WHITE : (val ? COL_AI_ACCENT : COL_GRAY_5));
-      const char* st = val ? "[ ON ]" : "[ OFF ]";
-      lcd.drawString(st, mx+mw-lcd.textWidth(st)-14, iy+8);
-    } else {
-      lcd.setTextColor(isHighlighted ? COL_WHITE : COL_GRAY_5);
-      lcd.drawString(">", mx+mw-20, iy+8);
-    }
-  }
-  lcd.setTextColor(COL_GRAY_3);
-  const char* hint = "C/D=pilih  BOOT=ok/toggle  B=back";
-  lcd.drawString(hint, mx+(mw-lcd.textWidth(hint))/2, my+mh-13);
-}
-
-void openExperimentalMenu() {
-  menuExpIdx = 0;
-  drawExperimentalMenu(menuExpIdx);
-  resetAllButtons(); prevMode = appMode; appMode = MODE_MENU_EXPERIMENTAL;
-}
-
-void handleModeMenuExperimental(ButtonEvent evt) {
-  if(!evt.valid) return;
-  if(evt.pin == BTN_BOOT) {
-    if(menuExpIdx == 0) { hdrModeEnabled = !hdrModeEnabled; saveSettings(); drawExperimentalMenu(menuExpIdx); }
-    else if(menuExpIdx == 1) { eisModeEnabled = !eisModeEnabled; saveSettings(); drawExperimentalMenu(menuExpIdx); }
-    else if(menuExpIdx == 2) { openLedMenu(); }
-  }
-  else if(evt.pin == BTN_B) {
-    lcd.fillScreen(COL_BLACK); resetAllButtons(); islandNoClear = true; appMode = MODE_VIEWFINDER;
-  }
-  else if(evt.pin == BTN_C) { menuExpIdx = (menuExpIdx+2)%3; drawExperimentalMenu(menuExpIdx); }
-  else if(evt.pin == BTN_D) { menuExpIdx = (menuExpIdx+1)%3; drawExperimentalMenu(menuExpIdx); }
-}
-
-
-void runHDRFlow() {
-  lcd.fillScreen(COL_BLACK);
-  int cx=DISP_W/2, cy=DISP_H/2;
-  unsigned long start = millis();
-  bool failed = false;
-
-  int origAEC = expManualVal;
-
-  while (millis() - start < 3000) {
-    esp_task_wdt_reset();
-    mpuTick();
-    float gyroMag = sqrt(mpuGyrX*mpuGyrX + mpuGyrY*mpuGyrY + mpuGyrZ*mpuGyrZ);
-    bool stable = (gyroMag < 0.08f);
-
-    if (!stable) { failed = true; break; }
-
-    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_AI_ACCENT);
-    lcd.drawString("HDR CAPTURE", cx-lcd.textWidth("HDR CAPTURE")/2, cy-40);
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    lcd.drawString("tahan kamera diam...", cx-lcd.textWidth("tahan kamera diam...")/2, cy-15);
-
-    char buf[48]; snprintf(buf, sizeof(buf), "roll:%.1f pitch:%.1f", mpuRoll, mpuPitch);
-    lcd.setTextColor(COL_GRAY_C); lcd.drawString(buf, cx-lcd.textWidth(buf)/2, cy+5);
-
-    int barW = 200, barH = 8;
-    lcd.drawRect(cx-barW/2, cy+25, barW, barH, COL_GRAY_3);
-    int prog = (int)(barW * (millis()-start)/3000.0f);
-    lcd.fillRect(cx-barW/2, cy+25, prog, barH, COL_AI_ACCENT);
-
-    lcd.fillCircle(cx, cy+45, 5, stable ? 0x07E0 : 0xF800);
-    delay(30);
-  }
-
-  if (failed) {
-    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_AI_WARN);
-    lcd.drawString("GAGAL - tekan lagi", cx-lcd.textWidth("GAGAL - tekan lagi")/2, cy);
-    delay(1500);
-  } else {
-    photoCount++;
-    char p0[48], p1[48], p2[48];
-    snprintf(p0, sizeof(p0), "/sdcard/photo_%04d_hdr0.jpg", photoCount);
-    snprintf(p1, sizeof(p1), "/sdcard/photo_%04d_hdr1.jpg", photoCount);
-    snprintf(p2, sizeof(p2), "/sdcard/photo_%04d_hdr2.jpg", photoCount);
-
-    captureHDRFrame(p0, 50);
-    captureHDRFrame(p1, origAEC);
-    captureHDRFrame(p2, 800);
-
-    applyExpPreset(expPreset); // restore
-    char msg[32]; snprintf(msg, sizeof(msg), "HDR OK #%04d x3", photoCount);
-    islandPush(NOTIF_OK, msg);
-  }
-  lcd.fillScreen(COL_BLACK);
-  resetAllButtons();
-}
-bool captureHDRFrame(const char* path, int aecValue) {
-  sensor_t *s = esp_camera_sensor_get(); if(!s) return false;
-  s->set_exposure_ctrl(s, 0);
-  s->set_aec_value(s, aecValue);
-  delay(250); esp_task_wdt_reset();
-  for(int i=0; i<3; i++) {
-    camera_fb_t *tfb = esp_camera_fb_get();
-    if(tfb) esp_camera_fb_return(tfb);
-    esp_task_wdt_reset();
-  }
-  camera_fb_t *fb = esp_camera_fb_get();
-  if(!fb) return false;
-
-  uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
-  if(fb->format == PIXFORMAT_RGB565) { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
-  else if(fb->format == PIXFORMAT_JPEG) { jpg_buf = fb->buf; jpg_len = fb->len; ok = true; }
-
-  if(ok && jpg_buf) {
-    char payload[STEGO_PAYLOAD_LEN];
-    stegoMakePayload(payload, sizeof(payload), photoCount);
-    size_t stLen=0; uint8_t* stBuf=stegoEmbedToJpeg(jpg_buf, jpg_len, payload, (int)strlen(payload), &stLen);
-    if(!stBuf) { stBuf=jpg_buf; stLen=jpg_len; }
-    size_t exLen=0; uint8_t* exBuf=exifInjectToJpeg(stBuf, stLen, photoCount, sensorName, &exLen);
-    if(!exBuf) { exBuf=stBuf; exLen=stLen; }
-    FILE* f = fopen(path, "wb");
-    if(f) { fwrite(exBuf, 1, exLen, f); fclose(f); }
-    if(exBuf != stBuf) free(exBuf);
-    if(stBuf != jpg_buf) free(stBuf);
-    if(fb->format != PIXFORMAT_JPEG) free(jpg_buf);
-  }
-  esp_camera_fb_return(fb);
-  return ok;
-}
 void setup(){
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.9-fix5 ===");
@@ -3827,7 +3251,6 @@ void setup(){
 
   setCpuFrequencyMhz(240);
   lcd.init();lcd.setRotation(3);lcd.fillScreen(COL_BLACK);
-  ssPrefs.begin("flipclock", false); ssCurTheme = ssPrefs.getInt("theme", 0); initSSThemes(); initSSLayout(); ssScreen.setColorDepth(16); ssScreen.createSprite(DISP_W, DISP_H); ssCardSpr.setColorDepth(16); ssCardSpr.createSprite(SS_CARD_W, SS_CARD_H); for (int i=0; i<4; i++) ssDigits[i] = {0,0,false,0.f};
 
   static uint16_t touchCalData[8]={3851,3630,673,3277,3965,160,772,136};
   lcd.setTouchCalibrate(touchCalData);
@@ -3863,33 +3286,21 @@ void setup(){
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
   blockingWaitAllRelease(600);
-  Serial.println("[DEBUG] Setup end");
   resetAllButtons();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  MODE HANDLERS
+// ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt){
-  static bool mpuPostBootInitDone = false;
-  if(!mpuPostBootInitDone){
-    renderViewfinder();
-    delay(100);
-    mpuLastTiltNotifMs = millis(); mpuLastShakeNotifMs = millis();
-    mpuReady = mpuInit();
-    if(mpuReady) Serial.println("[MPU] Async OK");
-    mpuPostBootInitDone = true;
-  }
   if(!evt.valid){renderViewfinder();return;}
   if(evt.pin==BTN_BOOT){
     if(evt.isLong){if(sdReady) enterUSBMode();}
-    else {
-      if(hdrModeEnabled){
-        if(!hdrWaitingSecondTap){ hdrWaitingSecondTap=true; hdrFirstTapMs=millis(); }
-        else { if(millis()-hdrFirstTapMs < 400){ hdrWaitingSecondTap=false; captureAndPreview(); } }
-      } else { captureAndPreview(); }
-    }
+    else          {captureAndPreview();}
   }
   else if(evt.pin==BTN_B){
     if(evt.isShort){if(recActive) stopRecording();else startRecording();}
-    else           {openExperimentalMenu();}
+    else           {openLedMenu();}
   }
   else if(evt.pin==BTN_C){
     if(evt.isShort){
@@ -3913,7 +3324,6 @@ void handleModeViewfinder(ButtonEvent evt){
 }
 
 void handleModeGallery(ButtonEvent evt){
-  if(galleryCount>0) gallerySelIdx=constrain(gallerySelIdx,0,galleryCount-1);
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){
     galleryHoldDir=-1;galleryHoldStart=millis();
@@ -4040,6 +3450,7 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
     mjpegLoop=!mjpegLoop;mjpegShowNotif(mjpegLoop?"LOOP ON":"LOOP OFF");lastToggleTime=millis();
   }
   if(evtD.valid&&(millis()-lastToggleTime)>=200){
+    mjpegSpeedIdx=(mjpegSpeedIdx+1)%3;
     char spBuf[12]; snprintf(spBuf,sizeof(spBuf),"%.1f\xd7",(double)mjpegSpeeds[mjpegSpeedIdx]);
     mjpegShowNotif(spBuf);lastToggleTime=millis();
   }
@@ -4049,22 +3460,15 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
 void handleModeMenuLed(ButtonEvent evt){
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
-    if(menuLedSel<2){
-      ledFlashEnabled=(menuLedSel==0);
-      islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
-      saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
-      islandNoClear=true;appMode=MODE_VIEWFINDER;
-    }else{
-      lcd.fillScreen(COL_BLACK);resetAllButtons();appMode=MODE_SCREENSAVER;
-    }
+    ledFlashEnabled=(menuLedSel==0);
+    islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
+    saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
+    islandNoClear=true;appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B){
-    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
-    else           {openExperimentalMenu();}
-  }
-  else if(evt.pin==BTN_C){menuLedSel=(menuLedSel+2)%3;drawLedMenu(menuLedSel);}
-  else if(evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
+  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
+  else if(evt.pin==BTN_C||evt.pin==BTN_D){menuLedSel=(menuLedSel==0)?1:0;drawLedMenu(menuLedSel);}
 }
+
 void handleModeMenuFormat(ButtonEvent evt){
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
@@ -4077,8 +3481,7 @@ void handleModeMenuFormat(ButtonEvent evt){
     appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_B){
-    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
-    else           {openExperimentalMenu();}
+    drawExpMenu(menuExpSel);resetAllButtons();appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_C||evt.pin==BTN_D){menuFormatSel=(menuFormatSel==0)?1:0;drawFormatMenu(menuFormatSel);}
 }
@@ -4095,10 +3498,7 @@ void handleModeMenuExp(ButtonEvent evt){
     lcd.fillScreen(COL_BLACK);resetAllButtons();
     islandNoClear=true;appMode=MODE_VIEWFINDER;
   }
-  else if(evt.pin==BTN_B){
-    if(evt.isShort){if(recActive) stopRecording();else startRecording();}
-    else           {openExperimentalMenu();}
-  }
+  else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+5)%6;drawExpMenu(menuExpSel);}
   else if(evt.pin==BTN_D){
     if(evt.isShort){menuExpSel=(menuExpSel+1)%6;drawExpMenu(menuExpSel);}
@@ -4153,404 +3553,8 @@ void handleModeDialogDelete(ButtonEvent evt){
 // ─────────────────────────────────────────────────────────────────────────────
 //  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
-
-//  SCREENSAVER IMPLEMENTATION
-// ─────────────────────────────────────────────────────────────────────────────
-void initSSThemes() {
-  ssThemes[0] = { "DARK", 0, lcd.color565(12,12,12), lcd.color565(68,68,68), lcd.color565(40,40,40), lcd.color565(240,240,240), lcd.color565(145,145,145), lcd.color565(18,18,18), lcd.color565(95,95,95), lcd.color565(200,200,200), lcd.color565(175,175,175), lcd.color565(88,88,88), lcd.color565(200,200,200) };
-  ssThemes[1] = { "RETRO", 0, lcd.color565(14,7,2), lcd.color565(90,45,5), lcd.color565(55,25,2), lcd.color565(255,165,40), lcd.color565(180,95,20), lcd.color565(20,10,0), lcd.color565(120,60,10), lcd.color565(255,140,20), lcd.color565(220,120,15), lcd.color565(140,70,10), lcd.color565(255,165,40) };
-  ssThemes[2] = { "PAPER", 0, lcd.color565(230,225,215), lcd.color565(200,195,182), lcd.color565(175,170,158), lcd.color565(30,25,18), lcd.color565(95,88,75), lcd.color565(140,135,122), lcd.color565(220,215,205), lcd.color565(60,55,45), lcd.color565(50,45,38), lcd.color565(110,100,85), lcd.color565(30,25,18) };
-  ssThemes[3] = { "BOLD", 1, lcd.color565(0,0,0), lcd.color565(255,255,255), lcd.color565(200,200,200), lcd.color565(0,0,0), lcd.color565(40,40,40), lcd.color565(128,128,128), lcd.color565(255,255,255), lcd.color565(0,0,0), lcd.color565(80,80,80), lcd.color565(160,160,160), lcd.color565(0,0,0) };
-  ssThemes[4] = { "BRICK", 1, lcd.color565(18,5,2), lcd.color565(180,45,15), lcd.color565(130,30,8), lcd.color565(255,230,200), lcd.color565(210,160,110), lcd.color565(90,20,5), lcd.color565(220,80,35), lcd.color565(255,200,150), lcd.color565(230,170,100), lcd.color565(150,60,20), lcd.color565(255,220,160) };
-  ssThemes[5] = { "NEON", 2, lcd.color565(0,0,0), lcd.color565(0,0,0), lcd.color565(0,0,0), lcd.color565(0,255,180), lcd.color565(0,180,120), lcd.color565(0,255,180), lcd.color565(0,100,60), lcd.color565(0,255,180), lcd.color565(0,200,140), lcd.color565(0,180,120), lcd.color565(0,255,180) };
-  ssThemes[6] = { "PLASMA", 2, lcd.color565(2,0,10), lcd.color565(2,0,10), lcd.color565(2,0,10), lcd.color565(255,80,255), lcd.color565(180,40,180), lcd.color565(255,80,255), lcd.color565(120,20,120), lcd.color565(255,80,255), lcd.color565(220,60,220), lcd.color565(160,30,160), lcd.color565(255,80,255) };
-  ssThemes[7] = { "MONO", 3, lcd.color565(18,18,18), lcd.color565(18,18,18), lcd.color565(18,18,18), lcd.color565(220,220,220), lcd.color565(100,100,100), lcd.color565(220,220,220), lcd.color565(60,60,60), lcd.color565(220,220,220), lcd.color565(160,160,160), lcd.color565(80,80,80), lcd.color565(220,220,220) };
-  ssThemes[8] = { "FROST", 3, lcd.color565(230,238,248), lcd.color565(230,238,248), lcd.color565(230,238,248), lcd.color565(20,50,100), lcd.color565(80,120,180), lcd.color565(20,50,100), lcd.color565(180,210,240), lcd.color565(20,50,100), lcd.color565(40,80,140), lcd.color565(90,130,190), lcd.color565(20,50,100) };
-  ssThemes[9] = { "SUNSET", 4, lcd.color565(10,4,14), lcd.color565(160,50,10), lcd.color565(60,10,80), lcd.color565(255,200,120), lcd.color565(200,130,80), lcd.color565(30,5,35), lcd.color565(200,90,40), lcd.color565(255,160,60), lcd.color565(220,130,50), lcd.color565(130,50,100), lcd.color565(255,180,80) };
-  ssThemes[10] = { "OCEAN", 4, lcd.color565(2,8,20), lcd.color565(10,110,140), lcd.color565(5,35,95), lcd.color565(160,245,255), lcd.color565(70,175,215), lcd.color565(4,15,40), lcd.color565(15,140,170), lcd.color565(120,225,245), lcd.color565(90,200,225), lcd.color565(30,90,150), lcd.color565(160,245,255) };
-  ssThemes[11] = { "VINTAGE", 5, lcd.color565(28,22,12), lcd.color565(58,46,26), lcd.color565(42,33,18), lcd.color565(210,185,130), lcd.color565(155,130,80), lcd.color565(75,60,35), lcd.color565(80,65,38), lcd.color565(190,165,110), lcd.color565(170,148,95), lcd.color565(95,78,45), lcd.color565(210,185,130) };
-}
-
-void initSSLayout() {
-  int totalW = 4*SS_CARD_W + 3*SS_CARD_GAP + SS_COLON_W;
-  int startX = (DISP_W - totalW) / 2;
-  ssCardY    = (DISP_H - SS_CARD_H) / 2 - 8;
-  ssCardX[0] = startX;
-  ssCardX[1] = ssCardX[0] + SS_CARD_W + SS_CARD_GAP;
-  ssCardX[2] = ssCardX[1] + SS_CARD_W + SS_CARD_GAP + SS_COLON_W;
-  ssCardX[3] = ssCardX[2] + SS_CARD_W + SS_CARD_GAP;
-}
-
-bool ssFetchPrayerTimes(int day, int month, int year) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  char url[256];
-  snprintf(url, sizeof(url), "http://api.aladhan.com/v1/timings/%02d-%02d-%04d?latitude=%s&longitude=%s&method=%s",
-           day, month, year, SS_LAT_STR, SS_LON_STR, SS_PRAY_METHOD);
-  HTTPClient http;
-  http.begin(url);
-  http.setTimeout(10000);
-  int code = http.GET();
-  if (code != 200) { http.end(); return false; }
-  String payload = http.getString();
-  http.end();
-  StaticJsonDocument<3072> doc;
-  if (deserializeJson(doc, payload)) return false;
-  JsonObject timings = doc["data"]["timings"];
-  auto parseHHMM = [](const char* s, int& h, int& m) {
-    if (!s || strlen(s) < 5) return;
-    char buf[3] = {s[0], s[1], 0}; h = atoi(buf);
-    char buf2[3] = {s[3], s[4], 0}; m = atoi(buf2);
-  };
-  parseHHMM(timings["Fajr"],    ssPrayTimes[0].hour, ssPrayTimes[0].minute);
-  parseHHMM(timings["Dhuhr"],   ssPrayTimes[1].hour, ssPrayTimes[1].minute);
-  parseHHMM(timings["Asr"],     ssPrayTimes[2].hour, ssPrayTimes[2].minute);
-  parseHHMM(timings["Maghrib"], ssPrayTimes[3].hour, ssPrayTimes[3].minute);
-  parseHHMM(timings["Isha"],    ssPrayTimes[4].hour, ssPrayTimes[4].minute);
-  return true;
-}
-
-void ssCheckPrayerNotif(struct tm& t) {
-  for (int i = 0; i < 5; i++) {
-    if (t.tm_hour == ssPrayTimes[i].hour && t.tm_min == ssPrayTimes[i].minute && t.tm_sec == 0) {
-      ssNotifPrayIdx   = i;
-      ssNotifShowUntil = millis() + 30000;
-    }
-  }
-}
-
-void ssDrawHalfCard_classic(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2;
-  SSTheme& t = ssThemes[ssCurTheme];
-  if (isTop) {
-    sp.fillRect(x, y, SS_CARD_W, half, bgCol);
-    sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
-    sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
-    sp.drawFastHLine(x+SS_CARD_R, y+1, SS_CARD_W-SS_CARD_R*2, t.shine);
-  } else {
-    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
-    sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
-    sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
-  }
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard_bold(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
-  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, bgCol); else sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
-  sp.drawRect(x, y, SS_CARD_W, SS_CARD_H, t.hinge); sp.drawRect(x+1, y+1, SS_CARD_W-2, SS_CARD_H-2, t.shine);
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard_neon(LGFX_Sprite& sp, int num, int x, int y, uint16_t glowCol, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
-  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, t.bg); else sp.fillRect(x, y+half, SS_CARD_W, half, t.bg);
-  sp.drawRoundRect(x, y, SS_CARD_W, SS_CARD_H, SS_CARD_R, glowCol);
-  sp.drawRoundRect(x+1, y+1, SS_CARD_W-2, SS_CARD_H-2, SS_CARD_R-1, lcd.color565(min(((glowCol>>11)&0x1F)*2, 31), min(((glowCol>>5)&0x3F)*2, 63), min((glowCol&0x1F)*2, 31)));
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard_minimal(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
-  if (isTop) sp.fillRect(x, y, SS_CARD_W, half, bgCol); else sp.fillRect(x, y+half, SS_CARD_W, half, bgCol);
-  if (isTop) sp.drawFastHLine(x, y+half-1, SS_CARD_W, t.hinge); else sp.drawFastHLine(x, y+SS_CARD_H-1, SS_CARD_W, t.hinge);
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard_split(LGFX_Sprite& sp, int num, int x, int y, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme]; uint16_t bgCol = isTop ? t.cardTop : t.cardBot;
-  if (isTop) {
-    sp.fillRect(x, y, SS_CARD_W, half, bgCol); sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
-  } else {
-    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol); sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
-  }
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard_vintage(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
-  int half = SS_CARD_H / 2; SSTheme& t = ssThemes[ssCurTheme];
-  if (isTop) {
-    sp.fillRect(x, y, SS_CARD_W, half, bgCol); sp.fillRect(x, y, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_R, SS_CARD_R, bgCol);
-  } else {
-    sp.fillRect(x, y+half, SS_CARD_W, half, bgCol); sp.fillRect(x, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg); sp.fillRect(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, SS_CARD_R, t.bg);
-    sp.fillCircle(x+SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol); sp.fillCircle(x+SS_CARD_W-SS_CARD_R, y+SS_CARD_H-SS_CARD_R, SS_CARD_R, bgCol);
-  }
-  int yS = isTop ? y : y+half; int yE = isTop ? y+half : y+SS_CARD_H;
-  for (int ly = yS+2; ly < yE; ly += 4) sp.drawFastHLine(x+2, ly, SS_CARD_W-4, lcd.color565(max(((bgCol>>11)&0x1F)-3, 0), max(((bgCol>>5)&0x3F)-4, 0), max((bgCol&0x1F)-3, 0)));
-  char buf[3]; snprintf(buf, sizeof(buf), "%02d", num);
-  int tx = x + (SS_CARD_W-60)/2, ty = y + (SS_CARD_H-40)/2;
-  if (isTop) sp.setClipRect(x, y, SS_CARD_W, half); else sp.setClipRect(x, y+half, SS_CARD_W, half);
-  sp.setTextColor(txtCol); sp.setTextSize(5); sp.drawString(buf, tx, ty); sp.clearClipRect();
-}
-
-void ssDrawHalfCard(LGFX_Sprite& sp, int num, int x, int y, uint16_t bgCol, uint16_t txtCol, bool isTop) {
-  switch (ssThemes[ssCurTheme].style) {
-    case 1: ssDrawHalfCard_bold(sp,num,x,y,bgCol,txtCol,isTop); break;
-    case 2: ssDrawHalfCard_neon(sp,num,x,y,bgCol,txtCol,isTop); break;
-    case 3: ssDrawHalfCard_minimal(sp,num,x,y,bgCol,txtCol,isTop); break;
-    case 4: ssDrawHalfCard_split(sp,num,x,y,txtCol,isTop); break;
-    case 5: ssDrawHalfCard_vintage(sp,num,x,y,bgCol,txtCol,isTop); break;
-    default: ssDrawHalfCard_classic(sp,num,x,y,bgCol,txtCol,isTop); break;
-  }
-}
-
-void ssDrawStaticCard(LGFX_Sprite& sp, int idx) {
-  int x = ssCardX[idx], y = ssCardY, num = ssDigits[idx].cur;
-  SSTheme& t = ssThemes[ssCurTheme];
-  ssDrawHalfCard(sp, num, x, y, t.cardTop, t.text, true);
-  ssDrawHalfCard(sp, num, x, y, t.cardBot, t.textDim, false);
-  sp.drawFastHLine(x, y+SS_CARD_H/2, SS_CARD_W, t.hinge); sp.drawFastHLine(x, y+SS_CARD_H/2+1, SS_CARD_W, t.hinge);
-  for (int i=0;i<5;i++) { uint8_t v = 4+i*4; sp.drawFastHLine(x+2, y+SS_CARD_H+i, SS_CARD_W-4, lcd.color565(v,v,v)); }
-}
-
-void ssDrawFlipCard(LGFX_Sprite& sp, int idx) {
-  int x = ssCardX[idx], y = ssCardY; float p = ssDigits[idx].progress;
-  int cur = ssDigits[idx].cur, nxt = ssDigits[idx].nxt;
-  int half = SS_CARD_H / 2; float ep = p < 0.5f ? 2.f*p*p : 1.f-2.f*(1.f-p)*(1.f-p);
-  SSTheme& t = ssThemes[ssCurTheme];
-  if (ep < 0.5f) {
-    ssDrawHalfCard(sp, nxt, x, y, t.cardTop, t.text, true);
-    ssDrawHalfCard(sp, cur, x, y, t.cardBot, t.textDim, false);
-    int flipH = (int)(half*(1.f-ep*2.f));
-    if (flipH > 0) {
-      ssCardSpr.fillSprite(t.bg); ssDrawHalfCard(ssCardSpr, cur, 0, 0, t.cardTop, t.text, true);
-      for (int row=0; row<flipH; row++) {
-        int srcRow = (int)((float)row/flipH*half);
-        for (int col=0; col<SS_CARD_W; col++) sp.drawPixel(x+col, y+half-flipH+row, ssCardSpr.readPixel(col,srcRow));
-      }
-    }
-  } else {
-    ssDrawHalfCard(sp, nxt, x, y, t.cardTop, t.text, true);
-    ssDrawHalfCard(sp, cur, x, y, t.cardBot, t.textDim, false);
-    int flipH = (int)(half*(ep-0.5f)*2.f);
-    if (flipH > 0) {
-      ssCardSpr.fillSprite(t.bg); ssDrawHalfCard(ssCardSpr, nxt, 0, 0, t.cardBot, t.textDim, false);
-      for (int row=0; row<flipH; row++) {
-        int srcRow = half+(int)((float)row/flipH*half); if (srcRow>=SS_CARD_H) srcRow=SS_CARD_H-1;
-        for (int col=0; col<SS_CARD_W; col++) sp.drawPixel(x+col, y+half+row, ssCardSpr.readPixel(col,srcRow));
-      }
-    }
-  }
-  sp.drawFastHLine(x, y+SS_CARD_H/2, SS_CARD_W, t.hinge); sp.drawFastHLine(x, y+SS_CARD_H/2+1, SS_CARD_W, t.hinge);
-  for (int i=0;i<5;i++) { uint8_t v=4+i*4; sp.drawFastHLine(x+2, y+SS_CARD_H+i, SS_CARD_W-4, lcd.color565(v,v,v)); }
-}
-
-void ssDrawColon(LGFX_Sprite& sp) {
-  int cx = ssCardX[1] + SS_CARD_W + SS_CARD_GAP/2 + SS_COLON_W/2;
-  int y1 = ssCardY + SS_CARD_H/3; int y2 = ssCardY + SS_CARD_H*2/3;
-  SSTheme& t = ssThemes[ssCurTheme]; uint16_t col = ssColonVisible ? t.colon : t.bg;
-  switch (t.style) {
-    case 1: sp.fillRect(cx-4, y1-4, 8, 8, col); sp.fillRect(cx-4, y2-4, 8, 8, col); break;
-    case 2: sp.drawCircle(cx, y1, 5, col); sp.drawCircle(cx, y2, 5, col); if (ssColonVisible) { sp.fillCircle(cx, y1, 3, col); sp.fillCircle(cx, y2, 3, col); } break;
-    case 3: sp.drawFastVLine(cx, y1-5, 10, col); sp.drawFastVLine(cx, y2-5, 10, col); break;
-    default: sp.fillCircle(cx, y1, 5, col); sp.fillCircle(cx, y2, 5, col); break;
-  }
-}
-
-void ssDrawSeconds(LGFX_Sprite& sp, int sec) {
-  int x = 252, y = 185; SSTheme& t = ssThemes[ssCurTheme];
-  sp.fillRoundRect(x, y, 56, 38, 4, t.bg); sp.drawRoundRect(x, y, 56, 38, 4, t.hinge);
-  sp.setTextColor(t.date); sp.setTextSize(1); sp.setCursor(x+18, y+3); sp.print("SEC");
-  sp.setTextColor(t.sec); sp.setTextSize(2); char buf[4]; snprintf(buf, sizeof(buf), "%02d", sec);
-  sp.setCursor(x+10, y+14); sp.print(buf); int fill = map(sec, 0, 59, 0, 48);
-  sp.drawFastHLine(x+4, y+35, 48, t.hinge); sp.drawFastHLine(x+4, y+35, fill, t.accent);
-}
-
-void ssDrawDate(LGFX_Sprite& sp, struct tm& t) {
-  const char* days[] = {"MINGGU","SENIN","SELASA","RABU","KAMIS","JUMAT","SABTU"};
-  const char* months[] = {"JAN","FEB","MAR","APR","MEI","JUN","JUL","AGU","SEP","OKT","NOV","DES"};
-  char buf[32]; SSTheme& theme = ssThemes[ssCurTheme];
-  snprintf(buf, sizeof(buf), "%s, %02d %s %04d", days[t.tm_wday], t.tm_mday, months[t.tm_mon], t.tm_year+1900);
-  sp.setTextColor(theme.date); sp.setTextSize(1); sp.setCursor((DISP_W-strlen(buf)*6)/2, ssCardY+SS_CARD_H+14); sp.print(buf);
-}
-
-void ssDrawPrayNotif(LGFX_Sprite& sp) {
-  if (millis() > ssNotifShowUntil || ssNotifPrayIdx < 0) return;
-  SSTheme& t = ssThemes[ssCurTheme];
-  uint32_t remaining = ssNotifShowUntil - millis(); int barFill = map(remaining, 0, 30000, 0, 280);
-  int nx = 16, ny = ssCardY - 38; sp.fillRoundRect(nx, ny, 288, 32, 5, t.accent);
-  uint16_t innerCol = lcd.color565(min(((t.accent>>11)&0x1F)+4, 31), min(((t.accent>>5)&0x3F)+5, 63), min((t.accent&0x1F)+4, 31));
-  sp.fillRoundRect(nx+1, ny+1, 286, 30, 4, innerCol); sp.fillCircle(nx+14, ny+16, 4, t.bg); sp.fillCircle(nx+14, ny+16, 2, t.accent);
-  char buf[40]; snprintf(buf, sizeof(buf), "Waktu %s  %02d:%02d WIB", ssPrayNames[ssNotifPrayIdx], ssPrayTimes[ssNotifPrayIdx].hour, ssPrayTimes[ssNotifPrayIdx].minute);
-  sp.setTextColor(t.bg); sp.setTextSize(1); int tw = strlen(buf)*6; sp.setCursor(nx + (288-tw)/2, ny+12); sp.print(buf);
-  sp.drawFastHLine(nx+4, ny+30, 280, t.bg); sp.drawFastHLine(nx+4, ny+30, barFill, t.colon);
-}
-
-void ssDrawThemeLabel(LGFX_Sprite& sp) {
-  SSTheme& t = ssThemes[ssCurTheme]; sp.setTextColor(t.date); sp.setTextSize(1);
-  sp.setCursor(312 - strlen(t.name)*6, 8); sp.print(t.name);
-}
-
-void ssDrawPraySchedule(LGFX_Sprite& sp) {
-  if (!ssPrayLoaded) return;
-  int nowMin = -1; struct tm t; getLocalTime(&t); nowMin = t.tm_hour*60 + t.tm_min;
-  int nextIdx = -1; for (int i = 0; i < 5; i++) { int pm = ssPrayTimes[i].hour*60 + ssPrayTimes[i].minute; if (pm > nowMin) { nextIdx = i; break; } }
-  if (nextIdx < 0) nextIdx = 0;
-  char buf[24]; snprintf(buf, sizeof(buf), "%s %02d:%02d", ssPrayNames[nextIdx], ssPrayTimes[nextIdx].hour, ssPrayTimes[nextIdx].minute);
-  SSTheme& theme = ssThemes[ssCurTheme]; sp.setTextColor(theme.date); sp.setTextSize(1); sp.setCursor(8, 226); sp.print(buf);
-}
-
-void ssTriggerFlip(int idx, int newVal) {
-  if (!ssDigits[idx].flipping && ssDigits[idx].cur != newVal) {
-    ssDigits[idx].nxt = newVal; ssDigits[idx].flipping = true; ssDigits[idx].progress = 0.f;
-  }
-}
-
-void drawScreensaverFrame(struct tm& t) {
-  SSTheme& theme = ssThemes[ssCurTheme];
-  ssScreen.fillScreen(theme.bg);
-  if (theme.style == 2) { for (int y=0; y<DISP_H; y+=4) ssScreen.drawFastHLine(0, y, DISP_W, lcd.color565(3,3,3)); }
-  else { for (int x=10; x<DISP_W; x+=20) for (int y=10; y<DISP_H; y+=20) ssScreen.drawPixel(x, y, lcd.color565(min(((theme.bg>>11)&0x1F)+2,31), min(((theme.bg>>5)&0x3F)+3,63), min((theme.bg&0x1F)+2,31))); }
-  ssScreen.setTextColor(theme.date); ssScreen.setTextSize(1); ssScreen.setCursor(8, 8); ssScreen.print("FLIP CLOCK");
-  ssDrawThemeLabel(ssScreen); ssScreen.drawFastHLine(0, 20, DISP_W, theme.hinge);
-  ssScreen.setTextColor(ssNtpSynced ? theme.accent : theme.date); ssScreen.setCursor(270, 226); ssScreen.print(ssNtpSynced ? "NTP" : "---");
-  ssDrawPraySchedule(ssScreen); ssDrawColon(ssScreen);
-  for (int i=0; i<4; i++) { if (ssDigits[i].flipping) ssDrawFlipCard(ssScreen, i); else ssDrawStaticCard(ssScreen, i); }
-  ssDrawSeconds(ssScreen, t.tm_sec); ssDrawDate(ssScreen, t); ssDrawPrayNotif(ssScreen);
-  ssScreen.pushSprite(0, 0);
-}
-
-void handleModeScreensaver(ButtonEvent evtBoot, ButtonEvent evtB, ButtonEvent evtC, ButtonEvent evtD) {
-  // 1. Prioritize Exit
-  if (evtB.valid) {
-    lcd.fillScreen(COL_BLACK);
-    islandNoClear = true;
-    resetAllButtons();
-    appMode = MODE_VIEWFINDER;
-    return;
-  }
-
-  // 2. NTP Sync Attempt (wifi.ini)
-  if (!ssNtpSynced) {
-    static bool attempted = false;
-    if (!attempted) {
-      attempted = true;
-      lcd.fillScreen(COL_BLACK);
-      lcd.setFont(&fonts::Font0);
-      lcd.setTextColor(COL_GRAY_7);
-      lcd.drawString("Connecting WiFi...", 85, 100);
-
-      if (!startWiFiConnection()) {
-        lcd.setTextColor(COL_AI_ACCENT);
-        lcd.drawString("periksa wifi.ini", 85, 120);
-        delay(2000);
-        return;
-      }
-      lcd.drawString(wifiSSID, 85, 120);
-
-      unsigned long start = millis();
-      while(WiFi.status() != WL_CONNECTED && millis()-start < 10000) {
-        delay(100); esp_task_wdt_reset(); tickAllButtons();
-        ButtonEvent abortEvt = {};
-        if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
-      }
-
-      if (WiFi.status() == WL_CONNECTED) {
-        lcd.fillScreen(COL_BLACK);
-        lcd.drawString("Syncing Time...", 85, 110);
-        configTime(25200, 0, "pool.ntp.org");
-        start = millis();
-        struct tm t_sync;
-        while(!getLocalTime(&t_sync) && millis()-start < 10000) {
-          delay(100); esp_task_wdt_reset(); tickAllButtons();
-          ButtonEvent abortEvt = {};
-          if (btnB.pollEvent(abortEvt)) { appMode = MODE_VIEWFINDER; return; }
-        }
-        if (getLocalTime(&t_sync)) {
-          ssNtpSynced = true;
-          ssDigits[0].cur = t_sync.tm_hour/10; ssDigits[1].cur = t_sync.tm_hour%10;
-          ssDigits[2].cur = t_sync.tm_min/10;  ssDigits[3].cur = t_sync.tm_min%10;
-          ssPrevH = t_sync.tm_hour; ssPrevM = t_sync.tm_min;
-          ssPrayLoaded = ssFetchPrayerTimes(t_sync.tm_mday, t_sync.tm_mon+1, t_sync.tm_year+1900);
-          ssLastPrayDay = t_sync.tm_mday;
-        }
-      }
-    }
-  }
-
-  // 3. Handle Other Inputs
-  if (evtBoot.valid && evtBoot.isShort) {
-    ssCurTheme = (ssCurTheme + 1) % 12; ssPrefs.putInt("theme", ssCurTheme);
-  }
-
-  // 4. Update Clock State
-  struct tm t;
-  if (!getLocalTime(&t)) {
-    if (!ssNtpSynced) {
-      lcd.fillScreen(COL_BLACK);
-      lcd.setTextColor(COL_GRAY_5);
-      lcd.drawString("WiFi/NTP Failed", 95, 100);
-      lcd.drawString("Press B to exit", 100, 120);
-      return;
-    }
-    return;
-  }
-
-  if (ssPrayLoaded && t.tm_mday != ssLastPrayDay) {
-    ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900);
-    if (ssPrayLoaded) ssLastPrayDay = t.tm_mday;
-  }
-  if (!ssPrayLoaded && (millis()-ssLastRetryMs) > SS_RETRY_INTERVAL) {
-    ssLastRetryMs = millis();
-    ssPrayLoaded = ssFetchPrayerTimes(t.tm_mday, t.tm_mon+1, t.tm_year+1900);
-    if (ssPrayLoaded) ssLastPrayDay = t.tm_mday;
-  }
-
-  if (t.tm_sec != ssPrevS) { ssColonVisible = !ssColonVisible; ssCheckPrayerNotif(t); ssPrevS = t.tm_sec; }
-  if (t.tm_hour != ssPrevH) { ssTriggerFlip(0, t.tm_hour/10); ssTriggerFlip(1, t.tm_hour%10); ssPrevH = t.tm_hour; }
-  if (t.tm_min != ssPrevM) { ssTriggerFlip(2, t.tm_min/10); ssTriggerFlip(3, t.tm_min%10); ssPrevM = t.tm_min; }
-
-  for (int i=0; i<4; i++) {
-    if (ssDigits[i].flipping) {
-      ssDigits[i].progress += 0.07f;
-      if (ssDigits[i].progress >= 1.f) {
-        ssDigits[i].cur = ssDigits[i].nxt;
-        ssDigits[i].flipping = false;
-        ssDigits[i].progress = 0.f;
-      }
-    }
-  }
-
-  // 5. Render Frame
-  drawScreensaverFrame(t);
-}
 void loop(){
   esp_task_wdt_reset();
-  if(hdrWaitingSecondTap && millis()-hdrFirstTapMs >= HDR_DOUBLE_TAP_MS){
-    hdrWaitingSecondTap = false;
-    if(appMode==MODE_VIEWFINDER) runHDRFlow();
-  }
-  if(usbModeActive){
-    tickAllButtons();
-    ButtonEvent evtBoot={};
-    btnBoot.pollEvent(evtBoot);
-    if(evtBoot.valid) exitUSBMode();
-    return;
-  }
-  // ── MPU6050 tick ──
-  mpuTick();
-
   tickAllButtons();
 
   ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
@@ -4568,7 +3572,9 @@ void loop(){
   if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
+  if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
+
   switch(appMode){
     case MODE_VIEWFINDER:      handleModeViewfinder(singleEvt);                break;
     case MODE_GALLERY:         handleModeGallery(singleEvt);                   break;
@@ -4583,21 +3589,16 @@ void loop(){
     case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
-    case MODE_SCREENSAVER:     handleModeScreensaver(evtBoot,evtB,evtC,evtD); break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
-    case MODE_MENU_EXPERIMENTAL: handleModeMenuExperimental(singleEvt); break;
   }
 
-  if(
+  if(appMode!=MODE_VIEWFINDER      &&
      appMode!=MODE_JUMP_INPUT       &&
      appMode!=MODE_AI_DESCRIBE      &&
      appMode!=MODE_AI_NO_CONFIG     &&
      appMode!=MODE_AI_FEATURE_MENU  &&
-     appMode!=MODE_SCREENSAVER     &&
      appMode!=MODE_KEY_MANAGER){
     islandNoClear=false;
     islandTick();
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
