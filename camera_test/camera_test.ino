@@ -30,6 +30,7 @@
  *  [JUMP]        Jump-to-number di Gallery (BOOT long-press)
  *  [STEGO]       Steganografi JPEG & BMP
  *  [EXIF]        Inject EXIF ke JPEG
+ *  [FACE]        Human face detection
  * ═══════════════════════════════════════════════════════════════
  *
  * TOMBOL LAYOUT (final v5.9-fix5):
@@ -41,7 +42,7 @@
  *    B long      = LED flash menu
  *    C short     = buka Gallery
  *    C long      = AI Feature Menu (capture dari viewfinder)
-    D short     = Features Menu
+ *    D short     = toggle Face Detect
  *    D long      = Exposure menu (+ format di dalamnya)
  *
  *  GALLERY:
@@ -81,10 +82,8 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-#define sensor_t adafruit_sensor_t
-#include <Adafruit_Sensor.h>
-#include <Adafruit_MPU6050.h>
-#undef sensor_t
+#include "human_face_detect_msr01.hpp"
+#include "human_face_detect_mnp01.hpp"
 
 #include "driver/sdmmc_host.h"
 #include "sdmmc_cmd.h"
@@ -105,11 +104,12 @@
 //  EARLY TYPE DECLARATIONS
 // ─────────────────────────────────────────────────────────────────────────────
 enum NotifType : uint8_t {
-  NOTIF_OK = 0,
-  NOTIF_FLASH,
-  NOTIF_REC,
-  NOTIF_WARN,
-  NOTIF_INFO
+  NOTIF_OK    = 0,
+  NOTIF_FLASH = 1,
+  NOTIF_REC   = 2,
+  NOTIF_FACE  = 3,
+  NOTIF_WARN  = 4,
+  NOTIF_INFO  = 5,
 };
 
 struct NotifStyle {
@@ -240,11 +240,12 @@ static LGFX lcd;
 // ─────────────────────────────────────────────────────────────────────────────
 //  NOTIF_STYLES
 // ─────────────────────────────────────────────────────────────────────────────
-static const NotifStyle NOTIF_STYLES[5] = {
+static const NotifStyle NOTIF_STYLES[6] = {
   { 0x0540, 0xFFFF, "+" },
   { 0x4400, 0xFFE0, "*" },
   { 0x5000, 0xF800, "o" },
-    { 0x4200, 0xFD20, "!" },
+  { 0x0011, 0x07FF, "@" },
+  { 0x4200, 0xFD20, "!" },
   { 0x2104, COL_GRAY_C, "i"},
 };
 
@@ -266,7 +267,6 @@ enum AppMode {
   MODE_AI_DESCRIBE,
   MODE_AI_NO_CONFIG,
   MODE_KEY_MANAGER,
-  MODE_FEATURES,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 AppMode prevMode = MODE_VIEWFINDER;
@@ -406,49 +406,6 @@ char  photoViewPath[48]               = {};
 int   photoViewIndex                  = 0;
 unsigned long photoViewCaptionUntilMs = 0;
 bool          photoViewCaptionVisible = false;
-
-// [PORTED v6.1] MPU6050 & EIS & HDR globals
-#define PIN_MPU_SDA 43
-#define PIN_MPU_SCL 44
-#define MPU_I2C_ADDR 0x68
-#define MPU_READ_MS 80
-#define MPU_TILT_DEG 15.0f
-#define MPU_SHAKE_THRESH 3.5f
-#define MPU_LOG_MS 5000
-
-#define EIS_CROP_PCT 0.12f
-#define EIS_ALPHA 0.05f
-#define EIS_GYRO_SCALE 8.0f
-#define EIS_CROP_X ((int)(DISP_W * EIS_CROP_PCT / 2))
-#define EIS_CROP_Y ((int)(DISP_H * EIS_CROP_PCT / 2))
-#define EIS_VP_W (DISP_W - EIS_CROP_X * 2)
-#define EIS_VP_H (DISP_H - EIS_CROP_Y * 2)
-
-#define HDR_DOUBLE_TAP_MS 400
-#define HDR_STABLE_THRESH 0.08f
-#define HDR_WAIT_MS 3000
-
-static Adafruit_MPU6050 mpu;
-static bool g_mpuOk = false;
-static float g_accX=0, g_accY=0, g_accZ=0;
-static float g_gyrX=0, g_gyrY=0, g_gyrZ=0;
-static float g_roll=0.0f, g_pitch=0.0f;
-static bool g_shake=false, g_tilted=false;
-static uint8_t g_orientation=0;
-static uint32_t g_mpuLastMs=0, g_mpuLogMs=0;
-
-static float g_eisOffX=0.0f, g_eisOffY=0.0f;
-static float g_eisBiasX=0.0f, g_eisBiasY=0.0f;
-
-static bool g_hdrWaiting=false;
-static uint32_t g_hdrFirstMs=0;
-
-static bool eisEnabled = false;
-static bool hdrEnabled = false;
-static bool autoRotateEnabled = false;
-static bool mpuLogEnabled = false;
-static bool hudEnabled = false;
-static int menuFeatSel = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE
@@ -594,7 +551,6 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
 }
 
 static void islandErase() {
-  esp_task_wdt_reset();
   if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
   if (islandLastW <= 0 || islandLastH <= 0) return;
@@ -610,7 +566,6 @@ static void islandErase() {
 }
 
 static void islandDraw(int offsetY = 0) {
-  esp_task_wdt_reset();
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
   int iW, iH, iX;
@@ -655,7 +610,6 @@ void islandPush(NotifType type, const char* text) {
 }
 
 void islandTick() {
-  esp_task_wdt_reset();
   unsigned long now = millis();
   switch (islandState) {
     case ISLAND_HIDDEN: break;
@@ -745,11 +699,6 @@ void saveSettings() {
   fprintf(f, "exp_val=%d\n",    expManualVal);
   fprintf(f, "exp_gain=%d\n",   expManualGain);
   fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
-  fprintf(f, "eis=%d\n", (int)eisEnabled);
-  fprintf(f, "hdr=%d\n", (int)hdrEnabled);
-  fprintf(f, "autorotate=%d\n", (int)autoRotateEnabled);
-  fprintf(f, "mpulog=%d\n", (int)mpuLogEnabled);
-  fprintf(f, "hud=%d\n", (int)hudEnabled);
   fclose(f);
 }
 
@@ -765,11 +714,6 @@ void loadSettings() {
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
     else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
     else if (sscanf(line, "gc2145_fmt=%d", &v) == 1) { gc2145CaptureFormat= (v==1)?GFMT_JPG:GFMT_BMP; }
-    else if (sscanf(line, "eis=%d", &v) == 1) { eisEnabled = (bool)v; }
-    else if (sscanf(line, "hdr=%d", &v) == 1) { hdrEnabled = (bool)v; }
-    else if (sscanf(line, "autorotate=%d", &v) == 1) { autoRotateEnabled = (bool)v; }
-    else if (sscanf(line, "mpulog=%d", &v) == 1) { mpuLogEnabled = (bool)v; }
-    else if (sscanf(line, "hud=%d", &v) == 1) { hudEnabled = (bool)v; }
   }
   fclose(f);
 }
@@ -906,53 +850,6 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE MENU — DRAW
 // ─────────────────────────────────────────────────────────────────────────────
-
-// [PORTED v6.1] Features Menu
-void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 150, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_E);
-  const char* title = "FEATURES";
-  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
-  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[5] = {
-    "EIS  Electronic Stab", "HDR  Triple Exposure",
-    "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
-  };
-  bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 5; i++) {
-    int iy = my + 24 + i * 22; bool hl = (i == sel);
-    lcd.fillRect(mx + 8, iy, mw - 16, 18, (i % 2 == 0) ? COL_GRAY_D : 0x0841); // COL_GRAY_1 = 0x0841
-    if (hl) lcd.fillRect(mx, iy, 2, 18, COL_WHITE);
-    lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
-    lcd.drawString(rowLabels[i], mx + 12, iy + 5);
-    lcd.setTextColor(*rowVals[i] ? 0x07E0 : 0x528A); // COL_ACCENT = 0x07E0, COL_GRAY_5 = 0x528A
-    lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 22, iy + 5);
-  }
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("C/D=nav  BOOT=toggle  B=save+back",
-                 mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle  B=save+back")) / 2, my + mh - 12);
-}
-
-void handleModeFeatures(ButtonEvent evt) {
-  if (!evt.valid) return;
-  bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
-
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 5; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 4) % 5; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_BOOT && evt.isShort) {
-    *feats[menuFeatSel] = !(*feats[menuFeatSel]);
-    char buf[32]; snprintf(buf, sizeof(buf), "%s %s", labs[menuFeatSel], *feats[menuFeatSel] ? "ON" : "OFF");
-    islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
-  }
-  else if (evt.pin == BTN_B) {
-    saveSettings(); islandPush(NOTIF_OK, "SETTINGS SAVED");
-    lcd.fillScreen(COL_BLACK); resetAllButtons(); islandNoClear = true; appMode = MODE_VIEWFINDER;
-  }
-}
 void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.fillScreen(COL_BLACK);
 
@@ -1047,9 +944,9 @@ void openAIFeatureMenu(bool fromViewfinder) {
   appMode = MODE_AI_FEATURE_MENU;
 }
 
-
 bool captureForAI(char* outPath, int outPathLen) {
   snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
+
   if (ledFlashEnabled) {
     digitalWrite(LED_FLASH, HIGH); delay(150);
     for (int i = 0; i < 2; i++) {
@@ -1058,38 +955,30 @@ bool captureForAI(char* outPath, int outPathLen) {
       esp_task_wdt_reset();
     }
   }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) return false;
+
   uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_RGB565) {
-    if (eisEnabled) {
-      uint16_t* src = (uint16_t*)fb->buf;
-      uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-      if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
-      if (tmp) {
-        int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
-        for (int y = 0; y < DISP_H; y++) {
-          int srY = sy + (y * EIS_VP_H / DISP_H);
-          for (int x = 0; x < DISP_W; x++) {
-            int srX = sx + (x * EIS_VP_W / DISP_W);
-            tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
-          }
-        }
-        camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-        ok = frame2jpg(&fk, 85, &jpg_buf, &jpg_len); free(tmp);
-      }
-    } else { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
-  } else if (fb->format == PIXFORMAT_JPEG) {
+  if (fb->format == PIXFORMAT_JPEG) {
     jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
+  } else {
+    ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len);
   }
+
   bool saved = false;
   if (ok && jpg_buf && jpg_len > 0) {
     FILE* f = fopen(outPath, "wb");
-    if (f) { size_t w = fwrite(jpg_buf, 1, jpg_len, f); fclose(f); saved = (w == jpg_len); }
+    if (f) {
+      size_t w = fwrite(jpg_buf, 1, jpg_len, f);
+      fclose(f);
+      saved = (w == jpg_len);
+    }
     if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
   }
-  esp_camera_fb_return(fb); esp_task_wdt_reset();
+  esp_camera_fb_return(fb);
+  esp_task_wdt_reset();
   return saved;
 }
 
@@ -1584,6 +1473,8 @@ int           recFrameCount = 0;
 int           recVideoCount = 0;
 unsigned long recStartMs    = 0;
 
+bool faceDetectMode  = false;
+int  faceDetectCount = 0;
 
 const char* expPresetNames[6] = { "AUTO", "GRAY", "MOON", "NIGHT", "NIGHT-BW", "MANUAL" };
 
@@ -2380,18 +2271,16 @@ void drawRecIndicator(){
   lcd.setTextColor(COL_GRAY_5); lcd.drawString(fBuf,18,14);
 }
 
-
-void startRecording() {
-  if (!sdReady || recActive) return;
+void startRecording(){
+  if(!sdReady) return;
+  if(faceDetectMode){faceDetectMode=false;faceDetectCount=0;}
   recVideoCount++;
-  char path[48]; snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
-  recFile = fopen(path, "wb");
-  if (!recFile) { recVideoCount--; return; }
-  g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
-  g_eisBiasX = 0; g_eisBiasY = 0;
-  recFrameCount = 0; recStartMs = millis(); recActive = true;
-  char buf[20]; snprintf(buf, sizeof(buf), "REC #%04d", recVideoCount);
-  islandPush(NOTIF_REC, buf);
+  char path[48]; snprintf(path,sizeof(path),"/sdcard/video_%04d.mjpeg",recVideoCount);
+  recFile=fopen(path,"wb");
+  if(!recFile){recVideoCount--;return;}
+  recFrameCount=0;recStartMs=millis();recActive=true;
+  char buf[20]; snprintf(buf,sizeof(buf),"REC  #%04d",recVideoCount);
+  islandPush(NOTIF_REC,buf);
 }
 
 void stopRecording(){
@@ -2404,49 +2293,22 @@ void stopRecording(){
   fpsLastTime=millis();fpsFrameCount=0;
 }
 
-
-void recordFrame() {
-  if (!recActive || !recFile) return;
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) { esp_task_wdt_reset(); return; }
-  if (eisEnabled && fb->format == PIXFORMAT_RGB565) {
-    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-    float gx = g.gyro.x, gy = g.gyro.y;
-    g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
-    g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
-    float gdx = gx - g_eisBiasX, gdy = gy - g_eisBiasY;
-    g_eisOffX = constrain(g_eisOffX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    g_eisOffY = constrain(g_eisOffY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
-    uint16_t* src = (uint16_t*)fb->buf;
-    uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-    if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
-    if (tmp) {
-      int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
-      for (int y = 0; y < DISP_H; y++) {
-        int srY = sy + (y * EIS_VP_H / DISP_H);
-        for (int x = 0; x < DISP_W; x++) {
-          int srX = sx + (x * EIS_VP_W / DISP_W);
-          tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
-        }
-      }
-      uint8_t* out = nullptr; size_t oLen = 0;
-      camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-      if (frame2jpg(&fk, 70, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
-      if (recFrameCount % 3 == 0) lcd.pushImage(0, 0, DISP_W, DISP_H, tmp);
-      free(tmp);
-    }
-    esp_camera_fb_return(fb); return;
+void recordFrame(){
+  if(!recActive||!recFile) return;
+  camera_fb_t *fb=esp_camera_fb_get();
+  if(!fb){esp_task_wdt_reset();return;}
+  uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
+  if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
+  else{ok=frame2jpg(fb,70,&jpg_buf,&jpg_len);}
+  if(ok&&jpg_buf){
+    fwrite(jpg_buf,1,jpg_len,recFile);recFrameCount++;
+    if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
   }
-  uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else ok = frame2jpg(fb, 70, &jpg, &jLen);
-  if (ok && jpg) {
-    fwrite(jpg, 1, jLen, recFile); recFrameCount++;
-    if (fb->format != PIXFORMAT_JPEG) free(jpg);
+  if(recFrameCount%3==0&&fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
+    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+    drawRecIndicator();islandTick();
   }
-  if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W)
-    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-  esp_camera_fb_return(fb); esp_task_wdt_reset();
+  esp_camera_fb_return(fb);esp_task_wdt_reset();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2464,7 +2326,7 @@ static int32_t onWrite(uint32_t lba,uint32_t offset,uint8_t* buffer,uint32_t buf
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  FPS
+//  FPS + Face detect
 // ─────────────────────────────────────────────────────────────────────────────
 void updateFPS(){
   fpsFrameCount++;
@@ -2476,86 +2338,37 @@ void updateFPS(){
   }
 }
 
+void runFaceDetect(camera_fb_t *fb){
+  if(!fb||fb->format!=PIXFORMAT_RGB565) return;
+  HumanFaceDetectMSR01 msr(0.1f,0.5f,10,0.2f);
+  HumanFaceDetectMNP01 mnp(0.5f,0.3f,5);
+  auto &candidates=msr.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3});
+  auto &results   =mnp.infer((uint16_t*)fb->buf,{(int)fb->height,(int)fb->width,3},candidates);
+  faceDetectCount=results.size();
+  for(auto &res:results){
+    int x1=constrain(res.box[0],0,DISP_W-1),y1=constrain(res.box[1],0,DISP_H-1);
+    int x2=constrain(res.box[2],0,DISP_W-1),y2=constrain(res.box[3],0,DISP_H-1);
+    int bw=x2-x1,bh=y2-y1;if(bw<4||bh<4) continue;
+    int CL=min(12,min(bw,bh)/3);
+    lcd.drawFastHLine(x1,y1,CL,COL_WHITE);lcd.drawFastVLine(x1,y1,CL,COL_WHITE);
+    lcd.drawFastHLine(x2-CL,y1,CL,COL_WHITE);lcd.drawFastVLine(x2,y1,CL,COL_WHITE);
+    lcd.drawFastHLine(x1,y2,CL,COL_WHITE);lcd.drawFastVLine(x1,y2-CL,CL,COL_WHITE);
+    lcd.drawFastHLine(x2-CL,y2,CL,COL_WHITE);lcd.drawFastVLine(x2,y2-CL,CL,COL_WHITE);
+    if(res.keypoint.size()>=10)
+      for(int k=0;k<10;k+=2)
+        lcd.fillCircle(constrain(res.keypoint[k],0,DISP_W-1),
+                       constrain(res.keypoint[k+1],0,DISP_H-1),2,COL_GRAY_C);
+  }
+}
+
+void toggleFaceDetect(){
+  faceDetectMode=!faceDetectMode;faceDetectCount=0;
+  islandPush(NOTIF_FACE,faceDetectMode?"FACE DETECT  ON":"FACE DETECT  OFF");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Exposure
 // ─────────────────────────────────────────────────────────────────────────────
-
-// [PORTED v6.1] MPU6050 Support Functions
-bool mpuInit() {
-  Wire.begin(PIN_MPU_SDA, PIN_MPU_SCL);
-  if (!mpu.begin(MPU_I2C_ADDR, &Wire)) return false;
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  return true;
-}
-
-static uint8_t mpuCalcOrientation(float pitch, float roll) {
-  if (fabsf(roll) < 45.0f && fabsf(pitch) < 45.0f) return 0;
-  if (roll > 45.0f) return 1;
-  if (roll < -45.0f) return 3;
-  if (pitch > 45.0f) return 2;
-  return 0;
-}
-
-void mpuTick() {
-  if (!g_mpuOk) return;
-  uint32_t now = millis();
-  if (now - g_mpuLastMs < MPU_READ_MS) return;
-  g_mpuLastMs = now;
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
-  g_accX = accel.acceleration.x;
-  g_accY = accel.acceleration.y;
-  g_accZ = accel.acceleration.z;
-  g_gyrX = gyro.gyro.x;
-  g_gyrY = gyro.gyro.y;
-  g_gyrZ = gyro.gyro.z;
-  g_roll = atan2f(g_accY, g_accZ) * 57.2958f;
-  g_pitch = atan2f(-g_accX, sqrtf(g_accY * g_accY + g_accZ * g_accZ)) * 57.2958f;
-  g_tilted = (fabsf(g_roll) > MPU_TILT_DEG || fabsf(g_pitch) > MPU_TILT_DEG);
-  float mag = sqrtf(g_accX * g_accX + g_accY * g_accY + g_accZ * g_accZ);
-  g_shake = (fabsf(mag - 9.8f) > MPU_SHAKE_THRESH);
-  g_orientation = mpuCalcOrientation(g_pitch, g_roll);
-  if (autoRotateEnabled) {
-    if (g_roll > 45.0f) lcd.setRotation(2);
-    else if (g_roll < -45.0f) lcd.setRotation(0);
-    else lcd.setRotation(3); // DISP_ROTATION is 3 in v5.9
-  }
-  if (eisEnabled) {
-    float gdx = g_gyrX - g_eisBiasX, gdy = g_gyrY - g_eisBiasY;
-    g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + g_gyrX * EIS_ALPHA;
-    g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + g_gyrY * EIS_ALPHA;
-    g_eisOffX = constrain(g_eisOffX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    g_eisOffY = constrain(g_eisOffY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
-  }
-  if (sdReady && (now - g_mpuLogMs) >= MPU_LOG_MS && mpuLogEnabled) {
-    g_mpuLogMs = now;
-    FILE* lf = fopen("/sdcard/mpu_log.csv", "a");
-    if (lf) {
-      if (ftell(lf) == 0) fprintf(lf, "millis,roll,pitch,gyrX,gyrY,gyrZ,orient\n");
-      fprintf(lf, "%lu,%.2f,%.2f,%.3f,%.3f,%.3f,%d\n",
-              (unsigned long)now, g_roll, g_pitch, g_gyrX, g_gyrY, g_gyrZ, (int)g_orientation);
-      fclose(lf);
-    }
-    esp_task_wdt_reset();
-  }
-}
-
-void mpuDrawIndicator() {
-  if (!g_mpuOk) return;
-  char buf[16]; uint16_t col;
-  if (g_shake) { strncpy(buf, "SHAKE!", sizeof(buf)); col=0xFD20; } // COL_WARN
-  else if (g_tilted) {
-    if (fabsf(g_roll) >= fabsf(g_pitch))
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_roll), g_roll > 0 ? "R" : "L");
-    else
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_pitch), g_pitch > 0 ? "F" : "B");
-    col=0xFD20; // COL_WARN
-  } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; } // COL_GRAY_7
-  drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
-}
 void applyExpPreset(uint8_t preset){
   sensor_t *s=esp_camera_sensor_get(); if(!s) return;
   expPreset=preset;
@@ -3005,14 +2818,19 @@ void renderViewfinder(){
   if(!frozen){
     if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W&&fb->height==DISP_H){
       lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
-      uint16_t bktCol=recActive?0xF800:(COL_GRAY_E);
+      uint16_t bktCol=recActive?0xF800:(faceDetectMode?COL_WHITE:COL_GRAY_E);
       drawCornerBrackets(bktCol);
+      if(faceDetectMode) runFaceDetect(fb);
       char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
       drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
       char sensorPill[20];
       snprintf(sensorPill,sizeof(sensorPill),"%s%s",sensorName,ledFlashEnabled?" *":"");
       drawPill(DISP_W-42,10,sensorPill,COL_PILL_BG,COL_GRAY_A);
-      if(expPreset>0){
+      if(faceDetectMode){
+        char faceBuf[12];
+        snprintf(faceBuf,sizeof(faceBuf),faceDetectCount>0?"FACE  %d":"FACE  --",faceDetectCount);
+        drawPill(DISP_W/2,10,faceBuf,COL_PILL_BG,COL_GRAY_C);
+      } else if(expPreset>0){
         char expBuf[12];
         if(expPreset==5) snprintf(expBuf,sizeof(expBuf),"M %d",expManualVal);
         else             snprintf(expBuf,sizeof(expBuf),"%s",expPresetNames[expPreset]);
@@ -3026,11 +2844,8 @@ void renderViewfinder(){
       drawPill(DISP_W-36,DISP_H-10,sdReady?"SD  OK":"SD  --",
                COL_PILL_BG,sdReady?COL_GRAY_8:COL_GRAY_5);
       lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
-      if(hudEnabled) lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
+      lcd.drawString("Clong=AI",DISP_W/2-20,DISP_H-10);
       if(recActive) drawRecIndicator();
-      if(hdrEnabled) drawPill(DISP_W/2, 35, "HDR", COL_PILL_BG, 0x07E0);
-      if(eisEnabled) { char eb[12]; snprintf(eb, sizeof(eb), recActive ? "EIS●" : "EIS"); drawPill(DISP_W/2 - (hdrEnabled ? 45 : 0), 35, eb, COL_PILL_BG, 0xCE59); }
-      mpuDrawIndicator();
       updateFPS();
     } else {
       lcd.fillScreen(COL_BLACK);
@@ -3045,144 +2860,66 @@ void renderViewfinder(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
-
-// [PORTED v6.1] HDR Triple Capture
-bool captureHDRFrame(const char* path, int aecVal) {
-  sensor_t* s = esp_camera_sensor_get(); if (!s) return false;
-  s->set_exposure_ctrl(s, 0); s->set_aec_value(s, aecVal);
-  delay(250); esp_task_wdt_reset();
-  for (int i = 0; i < 3; i++) { camera_fb_t* t = esp_camera_fb_get(); if (t) esp_camera_fb_return(t); esp_task_wdt_reset(); }
-  camera_fb_t* fb = esp_camera_fb_get(); if (!fb) return false;
-  uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_RGB565) ok = frame2jpg(fb, 85, &jpg, &jLen);
-  else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  if (ok && jpg) {
-    char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
-    size_t sLen = 0;
-    uint8_t* sBuf = stegoEmbedToJpeg(jpg, jLen, payload, (int)strlen(payload), &sLen);
-    if (!sBuf) { sBuf = jpg; sLen = jLen; }
-    size_t fLen = 0;
-    uint8_t* fBuf = exifInjectToJpeg(sBuf, sLen, photoCount, sensorName, &fLen);
-    if (!fBuf) { fBuf = sBuf; fLen = sLen; }
-    FILE* f = fopen(path, "wb");
-    if (f) { fwrite(fBuf, 1, fLen, f); fclose(f); }
-    if (fBuf != sBuf) free(fBuf);
-    if (sBuf != jpg) free(sBuf);
-    if (fb->format != PIXFORMAT_JPEG) free(jpg);
-  }
-  esp_camera_fb_return(fb); return ok;
-}
-
-void runHDRFlow() {
-  lcd.fillScreen(COL_BLACK);
-  int cx = DISP_W / 2, cy = DISP_H / 2;
-  uint32_t start = millis(); bool failed = false;
-  int origVal = expManualVal;
-  while (millis() - start < HDR_WAIT_MS) {
-    esp_task_wdt_reset(); // [PORTED v6.1] MPU tick
-  mpuTick();
-    float gmag = sqrtf(g_gyrX * g_gyrX + g_gyrY * g_gyrY + g_gyrZ * g_gyrZ);
-    if (gmag > HDR_STABLE_THRESH) { failed = true; break; }
-    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(0x07E0); // COL_ACCENT
-    lcd.drawString("HDR CAPTURE", cx - lcd.textWidth("HDR CAPTURE") / 2, cy - 40);
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(0x528A); // COL_GRAY_5
-    lcd.drawString("tahan kamera diam...", cx - lcd.textWidth("tahan kamera diam...") / 2, cy - 15);
-    int barW = 200;
-    lcd.drawRect(cx - barW / 2, cy + 25, barW, 8, 0x3186); // COL_GRAY_3
-    int prog = (int)(barW * (millis() - start) / (float)HDR_WAIT_MS);
-    lcd.fillRect(cx - barW / 2, cy + 25, prog, 8, 0x07E0); // COL_ACCENT
-    delay(30);
-  }
-  if (failed) {
-    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(0xFD20); // COL_WARN
-    lcd.drawString("GAGAL - tekan lagi", cx - lcd.textWidth("GAGAL - tekan lagi") / 2, cy);
-    delay(1500);
-  } else {
-    photoCount++;
-    char p0[48], p1[48], p2[48];
-    snprintf(p0, sizeof(p0), "/sdcard/photo_%04d_hdr0.jpg", photoCount);
-    snprintf(p1, sizeof(p1), "/sdcard/photo_%04d_hdr1.jpg", photoCount);
-    snprintf(p2, sizeof(p2), "/sdcard/photo_%04d_hdr2.jpg", photoCount);
-    captureHDRFrame(p0, 50); captureHDRFrame(p1, origVal); captureHDRFrame(p2, 800);
-    applyExpPreset(expPreset);
-    char msg[32]; snprintf(msg, sizeof(msg), "HDR OK #%04d x3", photoCount);
-    islandPush(NOTIF_OK, msg);
-  }
-  lcd.fillScreen(COL_BLACK);
-  blockingWaitAllRelease(300);
-}
-
-void captureAndPreview() {
-  if (ledFlashEnabled) {
-    digitalWrite(LED_FLASH, HIGH); delay(150);
-    for (int i = 0; i < 2; i++) {
-      camera_fb_t *tfb = esp_camera_fb_get();
-      if (tfb) esp_camera_fb_return(tfb); esp_task_wdt_reset();
+void captureAndPreview(){
+  if(ledFlashEnabled){
+    digitalWrite(LED_FLASH,HIGH);delay(150);
+    for(int i=0;i<2;i++){
+      camera_fb_t *tfb=esp_camera_fb_get();
+      if(tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
     }
   }
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
-  if (!fb) { blinkLED(5, 50, 50); return; }
-  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W)
-    lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
-  drawCornerBrackets(COL_GRAY_E);
-  bool saved = false;
-  if (sdReady) {
+  camera_fb_t *fb=esp_camera_fb_get();
+  if(ledFlashEnabled) digitalWrite(LED_FLASH,LOW);
+  if(!fb){blinkLED(5,50,50);return;}
+  if(fb->format==PIXFORMAT_RGB565&&fb->width==DISP_W){
+    lcd.pushImage(0,0,DISP_W,DISP_H,(uint16_t*)fb->buf);
+    drawCornerBrackets(COL_GRAY_E);
+  }
+  bool saved=false;
+  if(sdReady){
     photoCount++;
-    bool isGCrgb = (detectedSensor == PID_GC2145 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H);
-    if (isGCrgb && gc2145CaptureFormat == GFMT_BMP) {
-      char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
-      char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
-      saved = saveBMP(fb->buf, fb->width, fb->height, path, payload, (int)strlen(payload));
+    bool isGC2145rgb=(detectedSensor==PID_GC2145&&
+                      fb->format==PIXFORMAT_RGB565&&
+                      fb->width==DISP_W&&fb->height==DISP_H);
+    if(isGC2145rgb&&gc2145CaptureFormat==GFMT_BMP){
+      char path[48]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.bmp",photoCount);
+      char payload[STEGO_BMP_MAX_PAYLOAD];
+      stegoMakePayload(payload,sizeof(payload),photoCount);
+      saved=saveBMP(fb->buf,fb->width,fb->height,path,payload,(int)strlen(payload));
     } else {
-      uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-      if (fb->format == PIXFORMAT_RGB565) {
-        if (eisEnabled) {
-          uint16_t* src = (uint16_t*)fb->buf;
-          uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-          if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
-          if (tmp) {
-            int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
-            for (int y = 0; y < DISP_H; y++) {
-              int srY = sy + (y * EIS_VP_H / DISP_H);
-              for (int x = 0; x < DISP_W; x++) {
-                int srX = sx + (x * EIS_VP_W / DISP_W);
-                tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
-              }
-            }
-            camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-            ok = frame2jpg(&fk, 85, &jpg, &jLen); free(tmp);
-          }
-        } else { ok = frame2jpg(fb, 85, &jpg, &jLen); }
-      } else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-      if (ok && jpg && jLen > 0) {
-        char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
-        size_t sLen = 0;
-        uint8_t* sBuf = stegoEmbedToJpeg(jpg, jLen, payload, (int)strlen(payload), &sLen);
-        if (!sBuf) { sBuf = jpg; sLen = jLen; }
-        size_t fLen = 0;
-        uint8_t* fBuf = exifInjectToJpeg(sBuf, sLen, photoCount, sensorName, &fLen);
-        if (!fBuf) { fBuf = sBuf; fLen = sLen; }
-        char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
-        FILE* f = fopen(path, "wb");
-        if (f) { size_t w = fwrite(fBuf, 1, fLen, f); fclose(f); saved = (w == fLen); }
-        if (fBuf != sBuf) free(fBuf);
-        if (sBuf != jpg) free(sBuf);
-        if (fb->format != PIXFORMAT_JPEG) free(jpg);
+      uint8_t *jpg_buf=nullptr;size_t jpg_len=0;bool ok=false;
+      if(fb->format==PIXFORMAT_RGB565){ok=frame2jpg(fb,85,&jpg_buf,&jpg_len);}
+      else if(fb->format==PIXFORMAT_JPEG){jpg_buf=fb->buf;jpg_len=fb->len;ok=true;}
+      if(ok&&jpg_buf&&jpg_len>0){
+        char payload[STEGO_PAYLOAD_LEN];
+        stegoMakePayload(payload,sizeof(payload),photoCount);
+        size_t stegoLen=0;
+        uint8_t* stegoBuf=stegoEmbedToJpeg(jpg_buf,jpg_len,payload,(int)strlen(payload),&stegoLen);
+        if(!stegoBuf){stegoBuf=jpg_buf;stegoLen=jpg_len;}
+        size_t finalLen=0;
+        uint8_t* finalBuf=exifInjectToJpeg(stegoBuf,stegoLen,photoCount,sensorName,&finalLen);
+        if(!finalBuf){finalBuf=stegoBuf;finalLen=stegoLen;}
+        char path[40]; snprintf(path,sizeof(path),"/sdcard/photo_%04d.jpg",photoCount);
+        FILE* f=fopen(path,"wb");
+        if(f){size_t w=fwrite(finalBuf,1,finalLen,f);fclose(f);saved=(w==finalLen);}
+        if(finalBuf!=stegoBuf) free(finalBuf);
+        if(stegoBuf!=jpg_buf)  free(stegoBuf);
+        if(fb->format!=PIXFORMAT_JPEG) free(jpg_buf);
       }
     }
-    if (!saved) photoCount--;
+    if(!saved) photoCount--;
   }
   esp_camera_fb_return(fb);
-  if (saved) {
-    char msg[28];
-    bool isBmp = (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP);
-    snprintf(msg, sizeof(msg), "SAVED %s #%04d", isBmp ? "BMP" : "JPG", photoCount);
-    islandPush(NOTIF_OK, msg); blinkLED(2, 150, 80);
+  if(saved){
+    char notifText[28];
+    bool isBmpSave=(detectedSensor==PID_GC2145&&gc2145CaptureFormat==GFMT_BMP);
+    snprintf(notifText,sizeof(notifText),"SAVED %s #%04d",isBmpSave?"BMP":"JPG",photoCount);
+    islandPush(NOTIF_OK,notifText); blinkLED(2,150,80);
   } else {
-    islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD"); blinkLED(5, 50, 50);
+    islandPush(NOTIF_WARN,sdReady?"WRITE ERR":"NO SD CARD"); blinkLED(5,50,50);
   }
-  fpsLastTime = millis(); fpsFrameCount = 0;
+  fpsLastTime=millis();fpsFrameCount=0;
   resetAllButtons();
 }
 
@@ -3532,8 +3269,6 @@ void setup(){
   msc.mediaPresent(false);USB.begin();
 
   bool camOK=initCamera();
-  // [PORTED v6.1] MPU init
-  g_mpuOk=mpuInit(); esp_task_wdt_reset();
   bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
   uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
 
@@ -3583,7 +3318,7 @@ void handleModeViewfinder(ButtonEvent evt){
     }
   }
   else if(evt.pin==BTN_D){
-    if(evt.isShort){ /* Handled later */ }
+    if(evt.isShort){toggleFaceDetect();}
     else           {openExpMenu();}
   }
 }
@@ -3820,12 +3555,6 @@ void handleModeDialogDelete(ButtonEvent evt){
 // ─────────────────────────────────────────────────────────────────────────────
 void loop(){
   esp_task_wdt_reset();
-
-  if (g_hdrWaiting && (millis() - g_hdrFirstMs >= HDR_DOUBLE_TAP_MS)) {
-    g_hdrWaiting = false;
-    if (appMode == MODE_VIEWFINDER) runHDRFlow();
-  }
-
   tickAllButtons();
 
   ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
@@ -3843,8 +3572,6 @@ void loop(){
   if(appMode==MODE_PHOTO_VIEW&&photoViewCaptionVisible&&millis()>photoViewCaptionUntilMs)
     photoViewClearCaption();
 
-  // [PORTED v6.1] MPU tick
-  mpuTick();
   if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
 
@@ -3859,21 +3586,19 @@ void loop(){
     case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
     case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
     case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
-    case MODE_FEATURES:        handleModeFeatures(singleEvt);                  break;
     case MODE_AI_FEATURE_MENU: handleModeAIFeatureMenu(evtBoot,evtB,evtC,evtD);break;
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
-  if (appMode != MODE_VIEWFINDER     &&
-      appMode != MODE_JUMP_INPUT     &&
-      appMode != MODE_AI_DESCRIBE    &&
-      appMode != MODE_AI_NO_CONFIG   &&
-      appMode != MODE_AI_FEATURE_MENU &&
-      appMode != MODE_KEY_MANAGER    &&
-      appMode != MODE_FEATURES) {
-    islandNoClear = false;
+  if(appMode!=MODE_VIEWFINDER      &&
+     appMode!=MODE_JUMP_INPUT       &&
+     appMode!=MODE_AI_DESCRIBE      &&
+     appMode!=MODE_AI_NO_CONFIG     &&
+     appMode!=MODE_AI_FEATURE_MENU  &&
+     appMode!=MODE_KEY_MANAGER){
+    islandNoClear=false;
     islandTick();
   }
 }
