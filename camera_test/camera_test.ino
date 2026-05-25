@@ -633,6 +633,7 @@ static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
 }
 
 static void islandDrawRow(LGFX_Sprite& sp, int idx, int x, int y, int w, bool isFresh) {
+  if (!islandSprCreated) return;
   if (idx >= islandCount) return;
   NotifEntry& n        = islandStack[idx];
   const NotifStyle& s  = NOTIF_STYLES[(int)n.type];
@@ -663,13 +664,14 @@ static void islandDrawRow(LGFX_Sprite& sp, int idx, int x, int y, int w, bool is
 }
 
 static void islandErase() {
+  esp_task_wdt_reset();
   if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
   if (islandLastW <= 0 || islandLastH <= 0) return;
   int eraseX = islandLastX - 3;
-  int eraseY = max(0, islandLastY);
+  int eraseY = constrain(islandLastY, 0, DISP_H);
   int eraseW = islandLastW + 6;
-  int eraseH = islandLastH + 4;
+  int eraseH = constrain(islandLastH + 4, 0, DISP_H - eraseY);
   if (eraseY + eraseH > DISP_H) eraseH = DISP_H - eraseY;
   if (eraseX + eraseW > DISP_W) eraseW = DISP_W - eraseX;
   if (eraseH <= 0 || eraseW <= 0) return;
@@ -683,10 +685,10 @@ static void islandDraw(int offsetY = 0) {
   islandCalcDims(n, iW, iH, iX);
   int iY = offsetY;
 
-  if (islandSprLastN != n || !islandSprCreated) {
+  int reqW = iW + 6, reqH = iH + 6; if (!islandSprCreated || islandSpr.width() != reqW || islandSpr.height() != reqH) {
     if (islandSprCreated) islandSpr.deleteSprite();
     islandSpr.setColorDepth(16);
-    if (!islandSpr.createSprite(iW + 6, iH + 6)) {
+    if (!islandSpr.createSprite(reqW, reqH)) {
       islandSprCreated = false; return;
     }
     islandSprCreated = true;
@@ -710,7 +712,7 @@ static void islandDraw(int offsetY = 0) {
 
   islandLastX = iX; islandLastY = iY; islandLastW = iW; islandLastH = iH;
   if (iY + iH > 0) {
-    islandSpr.pushSprite(iX - 3, iY);
+    if(islandSprCreated) islandSpr.pushSprite(iX - 3, max(-iH, iY));
   }
   islandDrawnOnce = true;
 }
@@ -1874,6 +1876,10 @@ void scanGalleryFiles(){
 //  Gallery draw functions
 // ─────────────────────────────────────────────────────────────────────────────
 void drawGallery(){
+  if (galleryCount < 0) galleryCount = 0;
+  if (galleryCount > GALLERY_MAX_FILES) galleryCount = GALLERY_MAX_FILES;
+  if (galleryCount > 0) gallerySelIdx = constrain(gallerySelIdx, 0, galleryCount - 1);
+  galleryScroll = constrain(galleryScroll, 0, max(0, galleryCount - 1));
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
   lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
@@ -1959,13 +1965,13 @@ bool photoLoadPixelBuf(int idx){
   } else {
     FILE* f=fopen(path,"rb"); if(!f) return false;
     fseek(f,0,SEEK_END);size_t fsize=ftell(f);fseek(f,0,SEEK_SET);
-    uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize);
+    uint8_t* jpgBuf=(uint8_t*)ps_malloc(fsize); if(!jpgBuf) jpgBuf=(uint8_t*)malloc(fsize);
     if(!jpgBuf){fclose(f);return false;}
     fread(jpgBuf,1,fsize,f);fclose(f);
     TJpgDec.setJpgScale(1);TJpgDec.setSwapBytes(true);TJpgDec.setCallback(tjpgdecOutput);
     uint16_t iw=0,ih=0; TJpgDec.getJpgSize(&iw,&ih,jpgBuf,fsize);
     if(iw==0||ih==0){free(jpgBuf);return false;}
-    uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t));
+    uint16_t* buf=(uint16_t*)ps_malloc((size_t)iw*ih*sizeof(uint16_t)); if(!buf) buf=(uint16_t*)malloc((size_t)iw*ih*sizeof(uint16_t));
     if(!buf){free(jpgBuf);return false;}
     memset(buf,0,(size_t)iw*ih*sizeof(uint16_t));
     _decodeTargetBuf=buf;_decodeTargetW=iw;
@@ -2454,7 +2460,7 @@ void recordFrame(){
     eisOffsetY = constrain(eisOffsetY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
 
     uint16_t* src = (uint16_t*)fb->buf;
-    uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2);
+    uint16_t* tmp = (uint16_t*)ps_malloc(320 * 240 * 2); if(!tmp) tmp=(uint16_t*)malloc(320 * 240 * 2);
     if (tmp) {
       int startX = EIS_CROP_X + (int)eisOffsetX;
       int startY = EIS_CROP_Y + (int)eisOffsetY;
@@ -3188,12 +3194,8 @@ void renderViewfinder(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  captureAndPreview
 // ─────────────────────────────────────────────────────────────────────────────
-void captureAndPreview() {
-  captureAndPreview_internal();
-}
 
-void captureAndPreview_internal(){
-  // renamed existing capture to internal
+void captureAndPreview(){
   if(ledFlashEnabled){
     digitalWrite(LED_FLASH,HIGH);delay(150);
     for(int i=0;i<2;i++){
@@ -3248,7 +3250,7 @@ void captureAndPreview_internal(){
           eisOffsetX = constrain(eisOffsetX+gdx*EIS_GYRO_SCALE, 0, EIS_CROP_X*2);
           eisOffsetY = constrain(eisOffsetY+gdy*EIS_GYRO_SCALE, 0, EIS_CROP_Y*2);
           uint16_t* src=(uint16_t*)fb->buf;
-          uint16_t* tmp=(uint16_t*)ps_malloc(320*240*2);
+          uint16_t* tmp=(uint16_t*)ps_malloc(320*240*2); if(!tmp) tmp=(uint16_t*)malloc(320*240*2);
           if(tmp){
             int startX=EIS_CROP_X+(int)eisOffsetX, startY=EIS_CROP_Y+(int)eisOffsetY;
             for(int y=0;y<240;y++){
@@ -3884,6 +3886,7 @@ void handleModeViewfinder(ButtonEvent evt){
 }
 
 void handleModeGallery(ButtonEvent evt){
+  if(galleryCount>0) gallerySelIdx=constrain(gallerySelIdx,0,galleryCount-1);
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){
     galleryHoldDir=-1;galleryHoldStart=millis();
@@ -4032,8 +4035,6 @@ void handleModeMenuLed(ButtonEvent evt){
     if(evt.isShort){if(recActive) stopRecording();else startRecording();}
     else           {openExperimentalMenu();}
   }
-  /* removed old B handler */
-  else if(false){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuLedSel=(menuLedSel+2)%3;drawLedMenu(menuLedSel);}
   else if(evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
 }
@@ -4051,10 +4052,6 @@ void handleModeMenuFormat(ButtonEvent evt){
   else if(evt.pin==BTN_B){
     if(evt.isShort){if(recActive) stopRecording();else startRecording();}
     else           {openExperimentalMenu();}
-  }
-  /* removed old B handler */
-  else if(false){
-    drawExpMenu(menuExpSel);resetAllButtons();appMode=MODE_MENU_EXP;
   }
   else if(evt.pin==BTN_C||evt.pin==BTN_D){menuFormatSel=(menuFormatSel==0)?1:0;drawFormatMenu(menuFormatSel);}
 }
@@ -4075,8 +4072,6 @@ void handleModeMenuExp(ButtonEvent evt){
     if(evt.isShort){if(recActive) stopRecording();else startRecording();}
     else           {openExperimentalMenu();}
   }
-  /* removed old B handler */
-  else if(false){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
   else if(evt.pin==BTN_C){menuExpSel=(menuExpSel+5)%6;drawExpMenu(menuExpSel);}
   else if(evt.pin==BTN_D){
     if(evt.isShort){menuExpSel=(menuExpSel+1)%6;drawExpMenu(menuExpSel);}
