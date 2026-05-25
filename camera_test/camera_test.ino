@@ -580,6 +580,7 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   buf[sizeof(buf) - 1] = '\0';
   int maxW = w - ISLAND_ICON_SZ - 8;
   while (strlen(buf) > 4 && lcd.textWidth(buf) > maxW) {
+    esp_task_wdt_reset();
     int l = strlen(buf);
     buf[l-1] = '\0';
     if (strlen(buf) > 3) { buf[strlen(buf)-1] = '.'; buf[strlen(buf)-2] = '.'; }
@@ -615,7 +616,7 @@ static void islandDraw(int offsetY = 0) {
   if (n == 0) return;
   int iW, iH, iX;
   islandCalcDims(n, iW, iH, iX);
-  int iY = offsetY;
+  int iY = max(-100, offsetY);
   islandLastX = iX; islandLastY = iY; islandLastW = iW; islandLastH = iH;
   if (iY + iH <= 0) return;
   lcd.fillRoundRect(iX - 1, iY + 1, iW + 2, iH + 2, ISLAND_RADIUS + 1, COL_GRAY_2);
@@ -1068,7 +1069,7 @@ bool captureForAI(char* outPath, int outPathLen) {
       uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
       if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
       if (tmp) {
-        int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
+        int sx = (int)g_eisOffX, sy = (int)g_eisOffY;
         for (int y = 0; y < DISP_H; y++) {
           int srY = sy + (y * EIS_VP_H / DISP_H);
           for (int x = 0; x < DISP_W; x++) {
@@ -2421,7 +2422,7 @@ void recordFrame() {
     uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
     if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
     if (tmp) {
-      int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
+      int sx = (int)g_eisOffX, sy = (int)g_eisOffY;
       for (int y = 0; y < DISP_H; y++) {
         int srY = sy + (y * EIS_VP_H / DISP_H);
         for (int x = 0; x < DISP_W; x++) {
@@ -3142,7 +3143,7 @@ void captureAndPreview() {
           uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
           if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
           if (tmp) {
-            int sx = EIS_CROP_X + (int)g_eisOffX, sy = EIS_CROP_Y + (int)g_eisOffY;
+            int sx = (int)g_eisOffX, sy = (int)g_eisOffY;
             for (int y = 0; y < DISP_H; y++) {
               int srY = sy + (y * EIS_VP_H / DISP_H);
               for (int x = 0; x < DISP_W; x++) {
@@ -3534,6 +3535,7 @@ void setup(){
   bool camOK=initCamera();
   // [PORTED v6.1] MPU init
   g_mpuOk=mpuInit(); esp_task_wdt_reset();
+  g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
   bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
   uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
 
@@ -3866,14 +3868,15 @@ void loop(){
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
-  if (appMode != MODE_VIEWFINDER     &&
-      appMode != MODE_JUMP_INPUT     &&
-      appMode != MODE_AI_DESCRIBE    &&
-      appMode != MODE_AI_NO_CONFIG   &&
+    if (appMode != MODE_VIEWFINDER      &&
+      appMode != MODE_JUMP_INPUT      &&
+      appMode != MODE_AI_DESCRIBE     &&
+      appMode != MODE_AI_NO_CONFIG    &&
       appMode != MODE_AI_FEATURE_MENU &&
-      appMode != MODE_KEY_MANAGER    &&
+      appMode != MODE_KEY_MANAGER     &&
       appMode != MODE_FEATURES) {
     islandNoClear = false;
     islandTick();
   }
+
 }
