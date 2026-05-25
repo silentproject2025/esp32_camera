@@ -594,6 +594,7 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
 }
 
 static void islandErase() {
+  esp_task_wdt_reset();
   if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
   if (islandLastW <= 0 || islandLastH <= 0) return;
@@ -609,6 +610,7 @@ static void islandErase() {
 }
 
 static void islandDraw(int offsetY = 0) {
+  esp_task_wdt_reset();
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
   int iW, iH, iX;
@@ -653,6 +655,7 @@ void islandPush(NotifType type, const char* text) {
 }
 
 void islandTick() {
+  esp_task_wdt_reset();
   unsigned long now = millis();
   switch (islandState) {
     case ISLAND_HIDDEN: break;
@@ -3818,10 +3821,9 @@ void handleModeDialogDelete(ButtonEvent evt){
 void loop(){
   esp_task_wdt_reset();
 
-  // [PORTED v6.1] HDR double-tap timeout
-  if (g_hdrWaiting && millis()-g_hdrFirstMs>=HDR_DOUBLE_TAP_MS) {
-    g_hdrWaiting=false;
-    if (appMode==MODE_VIEWFINDER) runHDRFlow();
+  if (g_hdrWaiting && (millis() - g_hdrFirstMs >= HDR_DOUBLE_TAP_MS)) {
+    g_hdrWaiting = false;
+    if (appMode == MODE_VIEWFINDER) runHDRFlow();
   }
 
   tickAllButtons();
@@ -3864,13 +3866,14 @@ void loop(){
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
 
-  if(appMode!=MODE_VIEWFINDER      &&
-     appMode!=MODE_JUMP_INPUT       &&
-     appMode!=MODE_AI_DESCRIBE      &&
-     appMode!=MODE_AI_NO_CONFIG     &&
-     appMode!=MODE_AI_FEATURE_MENU  &&
-     appMode!=MODE_KEY_MANAGER){
-     islandNoClear=false;
+  if (appMode != MODE_VIEWFINDER     &&
+      appMode != MODE_JUMP_INPUT     &&
+      appMode != MODE_AI_DESCRIBE    &&
+      appMode != MODE_AI_NO_CONFIG   &&
+      appMode != MODE_AI_FEATURE_MENU &&
+      appMode != MODE_KEY_MANAGER    &&
+      appMode != MODE_FEATURES) {
+    islandNoClear = false;
     islandTick();
   }
 }
