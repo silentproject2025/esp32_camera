@@ -622,9 +622,33 @@ static bool          islandDrawnOnce = false;
 static unsigned long islandFreezeUntilMs = 0;
 static bool          islandNoClear   = false;
 
+static LGFX_Sprite   islandBgSnap(&lcd);
+static bool         islandBgCreated  = false;
 static LGFX_Sprite   islandSpr(&lcd);
 static bool         islandSprCreated = false;
 static int          islandSprLastN   = -1;
+
+static void islandCaptureBackground() {
+  if (appMode != MODE_VIEWFINDER) return;
+  int n = min(islandCount, ISLAND_MAX_STACK);
+  int iW, iH, iX;
+  islandCalcDims(n, iW, iH, iX);
+  int capW = iW + 6, capH = iH + 4;
+  int capX = iX - 3, capY = 0;
+  if (islandBgCreated) {
+    if (islandBgSnap.width() != capW || islandBgSnap.height() != capH) {
+      islandBgSnap.deleteSprite(); islandBgCreated = false;
+    }
+  }
+  if (!islandBgCreated) {
+    islandBgSnap.setPsram(true);
+    if (islandBgSnap.createSprite(capW, capH)) islandBgCreated = true;
+  }
+  if (islandBgCreated) {
+    lcd.readRect(capX, capY, capW, capH, (uint16_t*)islandBgSnap.getBuffer());
+    islandLastX = iX; islandLastW = iW; islandLastH = iH; // for erase
+  }
+}
 
 static void islandCalcDims(int n, int& iW, int& iH, int& iX) {
   iW = (n > 1) ? ISLAND_W_STACK : ISLAND_W_SINGLE;
@@ -663,22 +687,23 @@ static void islandDrawRow(LGFX_Sprite& sp, int idx, int x, int y, int w, bool is
   }
 }
 
+
 static void islandErase() {
   esp_task_wdt_reset();
-  if (islandNoClear)    return;
+  if (islandNoClear) return;
   if (!islandDrawnOnce) return;
-  if (islandLastW <= 0 || islandLastH <= 0) return;
-  int eraseX = islandLastX - 3;
-  int eraseY = constrain(islandLastY, 0, DISP_H);
-  int eraseW = islandLastW + 6;
-  int eraseH = constrain(islandLastH + 4, 0, DISP_H - eraseY);
-  if (eraseY + eraseH > DISP_H) eraseH = DISP_H - eraseY;
-  if (eraseX + eraseW > DISP_W) eraseW = DISP_W - eraseX;
-  if (eraseH <= 0 || eraseW <= 0) return;
-  lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
+  if (islandBgCreated) {
+    islandBgSnap.pushSprite(islandLastX - 3, 0);
+  } else {
+    int eraseX = islandLastX - 3;
+    int eraseY = constrain(islandLastY, 0, DISP_H);
+    int eraseW = islandLastW + 6;
+    int eraseH = constrain(islandLastH + 4, 0, DISP_H - eraseY);
+    if (eraseH > 0 && eraseW > 0) lcd.fillRect(eraseX, eraseY, eraseW, eraseH, COL_BLACK);
+  }
 }
-
 static void islandDraw(int offsetY = 0) {
+  esp_task_wdt_reset();
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
   int iW, iH, iX;
@@ -719,6 +744,7 @@ static void islandDraw(int offsetY = 0) {
 
 static void islandHide() {
   islandState = ISLAND_HIDDEN; islandCount = 0;
+  if (islandBgCreated) { islandBgSnap.deleteSprite(); islandBgCreated = false; }
   islandLastW = 0; islandLastH = 0; islandLastY = 0; islandDrawnOnce = false;
 }
 
@@ -732,6 +758,7 @@ void islandPush(NotifType type, const char* text) {
   islandShowAt    = millis();
   int showMs = (type == NOTIF_WARN) ? 2000 : (type == NOTIF_INFO) ? 800 : 1000;
   islandHideAt    = millis() + showMs;
+  islandCaptureBackground();
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
