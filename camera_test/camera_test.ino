@@ -1188,10 +1188,10 @@ bool captureForAI(char* outPath, int outPathLen) {
           }
         }
         camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-        int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+        int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
         ok = frame2jpg(&fk, captureQ, &jpg_buf, &jpg_len); free(tmp);
       }
-    } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+    } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
     ok = frame2jpg(fb, captureQ, &jpg_buf, &jpg_len); }
   } else if (fb->format == PIXFORMAT_JPEG) {
     jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
@@ -2541,7 +2541,7 @@ void recordFrame() {
       }
       uint8_t* out = nullptr; size_t oLen = 0;
       camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
       if (frame2jpg(&fk, recQ, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
       if (recFrameCount % 3 == 0) {
         int dw = min((int)DISP_W, (int)lcd.width());
@@ -2554,7 +2554,7 @@ void recordFrame() {
   }
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
   if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
   ok = frame2jpg(fb, recQ, &jpg, &jLen); }
   if (ok && jpg) {
     fwrite(jpg, 1, jLen, recFile); recFrameCount++;
@@ -2669,9 +2669,9 @@ void mpuTick() {
   g_tiltY = kalmanY.update(rawTiltY, g_gyroY * RAD_TO_DEG, dt);
 
   // Keep gyro lines unchanged (radians for EIS consistency)
-  g_gyroX = g_ev.gyro.x;
-  g_gyroY = g_ev.gyro.y;
-  g_gyroZ = g_ev.gyro.z;
+  g_gyroX = g_ev.gyro.x - g_gyroCalX;
+  g_gyroY = g_ev.gyro.y - g_gyroCalY;
+  g_gyroZ = g_ev.gyro.z - g_gyroCalZ;
 
   g_tilted = (fabsf(g_tiltX) > MPU_TILT_DEG || fabsf(g_tiltY) > MPU_TILT_DEG);
 
@@ -3235,7 +3235,7 @@ bool captureHDRFrame(const char* path, int aecVal) {
   camera_fb_t* fb = esp_camera_fb_get(); if (!fb) return false;
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
   if (fb->format == PIXFORMAT_RGB565) {
-    int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+    int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
     ok = frame2jpg(fb, captureQ, &jpg, &jLen);
   }
   else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
@@ -3337,10 +3337,10 @@ void captureAndPreview() {
               }
             }
             camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-            int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+            int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
             ok = frame2jpg(&fk, captureQ, &jpg, &jLen); free(tmp);
           }
-        } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+        } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
         ok = frame2jpg(fb, captureQ, &jpg, &jLen); }
       } else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
       if (ok && jpg && jLen > 0) {
@@ -3749,16 +3749,8 @@ void setup(){
     if (g_mpuCalLoaded) {
       Serial.printf("[MPU] Skip gyro calibration, using SD: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
     } else {
-      Serial.println("[MPU] No SD gyro data, auto-calibrating...");
-      float sx=0, sy=0, sz=0;
-      for(int i=0; i<200; i++) {
-        sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-        sx += g.gyro.x; sy += g.gyro.y; sz += g.gyro.z;
-        if(i % 50 == 0) esp_task_wdt_reset();
-        delay(5);
-      }
-      g_gyroCalX = sx / 200.0f; g_gyroCalY = sy / 200.0f; g_gyroCalZ = sz / 200.0f;
-      Serial.printf("[MPU] Gyro auto-calib: %.4f, %.4f, %.4f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+      g_gyroCalX = 0.0f; g_gyroCalY = 0.0f; g_gyroCalZ = 0.0f;
+      Serial.println("[MPU] No cal file found. Gyro bias set to 0. Use CALIBRATE menu.");
     }
   } esp_task_wdt_reset();
   Serial.printf("[MPU] %s\n", g_mpuOk ? "OK" : "FAIL");
@@ -3780,6 +3772,7 @@ void setup(){
   fpsLastTime=millis();fpsFrameCount=0;
   blinkLED(3,120,120);
   blockingWaitAllRelease(600);
+  Serial.println("[BOOT] Fixes applied: gyro-cal, no-autokal, hd-quality-map");
   resetAllButtons();
 }
 
