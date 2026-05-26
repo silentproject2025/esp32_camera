@@ -1,65 +1,96 @@
 name: Build ESP32
+
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
-      - name: Cache Arduino CLI
+
+      - name: Cache Arduino packages
         uses: actions/cache@v4
         with:
           path: |
             ~/.arduino15/packages
             ~/.arduino15/cache
-            ~/Arduino/libraries
-          key: ${{ runner.os }}-arduino-${{ hashFiles('**/*.ino') }}
+          key: ${{ runner.os }}-arduino-esp32-2.0.17-v5-${{ hashFiles('**/*.ino') }}
           restore-keys: |
+            ${{ runner.os }}-arduino-esp32-2.0.17-v5-
             ${{ runner.os }}-arduino-
+
       - name: Install ESP32 Platform
         run: |
-          arduino-cli core update-index --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
-          arduino-cli core install esp32:esp32@2.0.17 --additional-urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+
+      - name: Clean Old Libraries and Cache
+        run: |
+          rm -rf ~/Arduino/libraries
+          rm -rf ~/.arduino15/cache
+          echo "Cleaned."
+
       - name: Install Libraries
         run: |
-          arduino-cli lib install LovyanGFX
+          arduino-cli lib install "LovyanGFX"
           arduino-cli lib install "TJpg_Decoder"
           arduino-cli lib install "JPEGDEC"
           arduino-cli lib install "ArduinoJson"
+          arduino-cli lib install "Adafruit Unified Sensor"
+          arduino-cli lib install "Adafruit MPU6050"
+
       - name: Install esptool
-        run: pip install esptool
-      - name: Debug Board Info
-        run: |
-          arduino-cli board details -b esp32:esp32:esp32s3
+        run: pip install esptool pyserial
+
+      - name: Create output dir
+        run: mkdir -p ./output
+
       - name: Compile Sketch
         run: |
-          arduino-cli compile --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
-            --build-property "build.extra_flags=-DBOARD_HAS_PSRAM" \
-            --output-dir ./output camera_test/camera_test.ino
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
+            --build-property "build.extra_flags=-DBOARD_HAS_PSRAM -DBitOrder=uint8_t" \
+            --output-dir ./output \
+            --verbose \
+            camera_test/camera_test.ino
+
       - name: Merge Binaries
         run: |
-          BOOTLOADER=$(ls ./output/*.bootloader.bin)
-          PARTITIONS=$(ls ./output/*.partitions.bin)
-          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin)
-          APP=$(ls ./output/camera_test.ino.bin)
+          BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
+          PARTITIONS=$(ls ./output/*.partitions.bin 2>/dev/null | head -1)
+          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/ \
+            -name "boot_app0.bin" 2>/dev/null | head -1)
+          APP=$(ls ./output/camera_test.ino.bin 2>/dev/null | head -1)
+
+          echo "Bootloader : $BOOTLOADER"
+          echo "Partitions : $PARTITIONS"
+          echo "boot_app0  : $BOOTAPP0"
+          echo "App        : $APP"
+
           esptool.py --chip esp32s3 merge_bin \
             -o ./output/merged-firmware.bin \
             --flash_mode dio \
             --flash_size 16MB \
-            0x0000 $BOOTLOADER \
-            0x8000 $PARTITIONS \
-            0xe000 $BOOTAPP0 \
-            0x10000 $APP
-      - name: List Output Files
-        run: ls -R ./output
-      - name: Upload Artifact
+            0x0000 "$BOOTLOADER" \
+            0x8000 "$PARTITIONS" \
+            0xe000 "$BOOTAPP0" \
+            0x10000 "$APP"
+
+      - name: Upload Firmware
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: esp32-bin
-          path: ./output/*.bin
+          name: esp32-firmware-${{ github.sha }}
+          path: |
+            ./output/merged-firmware.bin
+            ./output/*.bin
+          retention-days: 30
