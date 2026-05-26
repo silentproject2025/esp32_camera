@@ -433,10 +433,13 @@ bool          photoViewCaptionVisible = false;
 static Adafruit_MPU6050 mpu;
 static bool g_mpuOk = false;
 static float g_accX=0, g_accY=0, g_accZ=0;
-static float g_gyrX=0, g_gyrY=0, g_gyrZ=0;
-static float g_gyrCalX = 0.0f, g_gyrCalY = 0.0f, g_gyrCalZ = 0.0f;
+static float g_gyroX=0, g_gyroY=0, g_gyroZ=0;
+static float g_gyroCalX = 0.0f, g_gyroCalY = 0.0f, g_gyroCalZ = 0.0f;
 static bool g_mpuCalLoaded = false;
-static float g_roll=0.0f, g_pitch=0.0f;
+static float g_accOffX = 0.0f;
+static float g_accOffY = 0.0f;
+static float g_accOffZ = 0.0f;
+static float g_tiltX=0.0f, g_tiltY=0.0f;
 static bool g_shake=false, g_tilted=false;
 static uint8_t g_orientation=0;
 static uint32_t g_mpuLastMs=0, g_mpuLogMs=0;
@@ -793,13 +796,13 @@ void loadMPUCalibration() {
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     float v = 0;
-    if (sscanf(line, "calX=%f", &v) == 1)      { g_gyrCalX = v; }
-    else if (sscanf(line, "calY=%f", &v) == 1) { g_gyrCalY = v; }
-    else if (sscanf(line, "calZ=%f", &v) == 1) { g_gyrCalZ = v; }
+    if (sscanf(line, "calX=%f", &v) == 1)      { g_gyroCalX = v; }
+    else if (sscanf(line, "calY=%f", &v) == 1) { g_gyroCalY = v; }
+    else if (sscanf(line, "calZ=%f", &v) == 1) { g_gyroCalZ = v; }
   }
   fclose(f);
   g_mpuCalLoaded = true;
-  Serial.printf("[MPU] Cal loaded: X=%.5f Y=%.5f Z=%.5f\n", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+  Serial.printf("[MPU] Cal loaded: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
 }
 
 void runMPUCalibration() {
@@ -828,11 +831,11 @@ void runMPUCalibration() {
     if (i % 50 == 0) esp_task_wdt_reset();
     delay(5);
   }
-  g_gyrCalX = sx / 500.0f; g_gyrCalY = sy / 500.0f; g_gyrCalZ = sz / 500.0f;
+  g_gyroCalX = sx / 500.0f; g_gyroCalY = sy / 500.0f; g_gyroCalZ = sz / 500.0f;
 
   lcd.fillRect(0, 110, DISP_W, 40, COL_BLACK);
   lcd.setTextColor(COL_GRAY_C);
-  char res[64]; snprintf(res, sizeof(res), "X:%.5f Y:%.5f Z:%.5f", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+  char res[64]; snprintf(res, sizeof(res), "X:%.5f Y:%.5f Z:%.5f", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
   lcd.drawString(res, (DISP_W - lcd.textWidth(res)) / 2, 110);
   for (int j = 0; j < 20; j++) { delay(100); esp_task_wdt_reset(); }
 
@@ -840,7 +843,7 @@ void runMPUCalibration() {
     FILE* f = fopen("/sdcard/mpu_cal.ini", "w");
     if (f) {
       fprintf(f, "# MPU6050 Calibration - Sanzxcam\n");
-      fprintf(f, "calX=%.5f\ncalY=%.5f\ncalZ=%.5f\n", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+      fprintf(f, "calX=%.5f\ncalY=%.5f\ncalZ=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
       fclose(f);
       g_mpuCalLoaded = true;
       islandPush(NOTIF_OK, "Kalibrasi tersimpan");
@@ -2572,32 +2575,6 @@ void updateFPS(){
 //  Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool mpuInit() {
-  Wire.begin(PIN_MPU_SDA, PIN_MPU_SCL);
-  if (!mpu.begin(MPU_I2C_ADDR, &Wire)) return false;
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-  if (g_mpuCalLoaded) {
-    Serial.printf("[MPU] Skip kalibrasi, pakai data SD: X=%.5f Y=%.5f Z=%.5f\n",
-                  g_gyrCalX, g_gyrCalY, g_gyrCalZ);
-    return true;
-  }
-
-  Serial.println("[MPU] Tidak ada data SD, kalibrasi otomatis...");
-  float sx=0,sy=0,sz=0;
-  for(int i=0;i<200;i++){
-    sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
-    sx+=g.gyro.x; sy+=g.gyro.y; sz+=g.gyro.z;
-    if(i%50==0) esp_task_wdt_reset();
-    delay(5);
-  }
-  g_gyrCalX=sx/200.0f; g_gyrCalY=sy/200.0f; g_gyrCalZ=sz/200.0f;
-  Serial.printf("[MPU] Calib otomatis: %.4f, %.4f, %.4f\n",g_gyrCalX,g_gyrCalY,g_gyrCalZ);
-  return true;
-}
-
 static uint8_t mpuCalcOrientation(float pitch, float roll) {
   if (fabsf(roll) < 45.0f && fabsf(pitch) < 45.0f) return 0;
   if (roll > 45.0f) return 1;
@@ -2612,39 +2589,50 @@ void mpuTick() {
   uint32_t now = millis();
   if (now - g_mpuLastMs < MPU_READ_MS) return;
   g_mpuLastMs = now;
-  sensors_event_t accel, gyro, temp;
-  mpu.getEvent(&accel, &gyro, &temp);
-  g_accX = accel.acceleration.x;
-  g_accY = accel.acceleration.y;
-  g_accZ = accel.acceleration.z;
-  g_gyrX = gyro.gyro.x;
-  g_gyrY = gyro.gyro.y;
-  g_gyrZ = gyro.gyro.z;
-  float gx = g_gyrX - g_gyrCalX; float gy = g_gyrY - g_gyrCalY;
-  if(fabsf(gx)<0.008f) gx=0; if(fabsf(gy)<0.008f) gy=0;
-  float aRoll = atan2f(g_accY, g_accZ) * 57.2958f;
-  float aPitch = atan2f(-g_accX, sqrtf(g_accY * g_accY + g_accZ * g_accZ)) * 57.2958f;
-  g_roll = 0.90f * (g_roll + gx * 57.2958f * 0.08f) + 0.10f * aRoll;
-  g_pitch = 0.90f * (g_pitch + gy * 57.2958f * 0.08f) + 0.10f * aPitch;
-  g_tilted = (fabsf(g_roll) > MPU_TILT_DEG || fabsf(g_pitch) > MPU_TILT_DEG);
+
+  sensors_event_t a, g_ev, t;
+  mpu.getEvent(&a, &g_ev, &t);
+
+  g_accX = a.acceleration.x;
+  g_accY = a.acceleration.y;
+  g_accZ = a.acceleration.z;
+
+  // Pure accelerometer + offset correction
+  float ax = a.acceleration.x - g_accOffX;
+  float ay = a.acceleration.y - g_accOffY;
+  float az = a.acceleration.z - g_accOffZ;
+
+  g_tiltX = atan2f(ay, az) * RAD_TO_DEG;
+  g_tiltY = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+
+  // Keep gyro lines unchanged (radians for EIS consistency)
+  g_gyroX = g_ev.gyro.x;
+  g_gyroY = g_ev.gyro.y;
+  g_gyroZ = g_ev.gyro.z;
+
+  g_tilted = (fabsf(g_tiltX) > MPU_TILT_DEG || fabsf(g_tiltY) > MPU_TILT_DEG);
+
   float mag = sqrtf(g_accX * g_accX + g_accY * g_accY + g_accZ * g_accZ);
   static float magFiltered = 9.8f;
   magFiltered = 0.85f * magFiltered + 0.15f * mag;
   g_shake = (fabsf(magFiltered - 9.8f) > 4.5f);
-  g_orientation = mpuCalcOrientation(g_pitch, g_roll);
+
+  g_orientation = mpuCalcOrientation(g_tiltY, g_tiltX);
+
   if (autoRotateEnabled && appMode == MODE_VIEWFINDER) {
     uint8_t r = 3;
-    if (g_roll > 45.0f) r = 2;
-    else if (g_roll < -45.0f) r = 0;
+    if (g_tiltX > 45.0f) r = 2;
+    else if (g_tiltX < -45.0f) r = 0;
     if (lcd.getRotation() != r) lcd.setRotation(r);
   }
+
   if (eisEnabled) {
-    float gmag = sqrtf(g_gyrX * g_gyrX + g_gyrY * g_gyrY);
+    float gmag = sqrtf(g_gyroX * g_gyroX + g_gyroY * g_gyroY);
     if (gmag < 0.05f) {
-      g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + g_gyrX * EIS_ALPHA;
-      g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + g_gyrY * EIS_ALPHA;
+      g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + g_gyroX * EIS_ALPHA;
+      g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + g_gyroY * EIS_ALPHA;
     }
-    float gdx = g_gyrX - g_eisBiasX, gdy = g_gyrY - g_eisBiasY;
+    float gdx = g_gyroX - g_eisBiasX, gdy = g_gyroY - g_eisBiasY;
     float tx = g_eisOffX + (gdx * 0.08f * 306.0f);
     float ty = g_eisOffY + (gdy * 0.08f * 306.0f);
     tx = tx * (1.0f - EIS_ALPHA) + (float)EIS_CROP_X * EIS_ALPHA;
@@ -2654,13 +2642,14 @@ void mpuTick() {
     g_eisOffX = g_eisOffX * 0.85f + tx * 0.15f;
     g_eisOffY = g_eisOffY * 0.85f + ty * 0.15f;
   }
+
   if (sdReady && (now - g_mpuLogMs) >= MPU_LOG_MS && mpuLogEnabled) {
     g_mpuLogMs = now;
     FILE* lf = fopen("/sdcard/mpu_log.csv", "a");
     if (lf) {
-      if (ftell(lf) == 0) fprintf(lf, "millis,roll,pitch,gyrX,gyrY,gyrZ,orient\n");
+      if (ftell(lf) == 0) fprintf(lf, "millis,tiltX,tiltY,gyroX,gyroY,gyroZ,orient\n");
       fprintf(lf, "%lu,%.2f,%.2f,%.3f,%.3f,%.3f,%d\n",
-              (unsigned long)now, g_roll, g_pitch, g_gyrX, g_gyrY, g_gyrZ, (int)g_orientation);
+              (unsigned long)now, g_tiltX, g_tiltY, g_gyroX, g_gyroY, g_gyroZ, (int)g_orientation);
       fclose(lf);
     }
     esp_task_wdt_reset();
@@ -2672,10 +2661,10 @@ void mpuDrawIndicator() {
   char buf[16]; uint16_t col;
   if (g_shake) { strncpy(buf, "SHAKE!", sizeof(buf)); col=0xFD20; } // COL_WARN
   else if (g_tilted) {
-    if (fabsf(g_roll) >= fabsf(g_pitch))
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_roll), g_roll > 0 ? "R" : "L");
+    if (fabsf(g_tiltX) >= fabsf(g_tiltY))
+      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_tiltX), g_tiltX > 0 ? "R" : "L");
     else
-      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_pitch), g_pitch > 0 ? "F" : "B");
+      snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_tiltY), g_tiltY > 0 ? "F" : "B");
     col=0xFD20; // COL_WARN
   } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; } // COL_GRAY_7
   drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
@@ -3205,7 +3194,7 @@ void runHDRFlow() {
   while (millis() - start < HDR_WAIT_MS) {
     esp_task_wdt_reset(); // [PORTED v6.1] MPU tick
   mpuTick();
-    float gmag = sqrtf(g_gyrX * g_gyrX + g_gyrY * g_gyrY + g_gyrZ * g_gyrZ);
+    float gmag = sqrtf(g_gyroX * g_gyroX + g_gyroY * g_gyroY + g_gyroZ * g_gyroZ);
     if (gmag > HDR_STABLE_THRESH) { failed = true; break; }
     lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(0x07E0); // COL_ACCENT
     lcd.drawString("HDR CAPTURE", cx - lcd.textWidth("HDR CAPTURE") / 2, cy - 40);
@@ -3664,7 +3653,42 @@ void setup(){
 
   bool camOK=initCamera();
   // [PORTED v6.1] MPU init
-  g_mpuOk=mpuInit(); esp_task_wdt_reset();
+  Wire.begin(PIN_MPU_SDA, PIN_MPU_SCL);
+  g_mpuOk = mpu.begin(MPU_I2C_ADDR, &Wire);
+  if (g_mpuOk) {
+    mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    // Calibrate accelerometer offset
+    float ox = 0, oy = 0, oz = 0;
+    for (int i = 0; i < 300; i++) {
+      sensors_event_t a, g, t;
+      mpu.getEvent(&a, &g, &t);
+      ox += a.acceleration.x;
+      oy += a.acceleration.y;
+      oz += a.acceleration.z;
+      delay(5);
+    }
+    g_accOffX = ox / 300.0f;
+    g_accOffY = oy / 300.0f;
+    g_accOffZ = (oz / 300.0f) - 9.81f;
+
+    if (g_mpuCalLoaded) {
+      Serial.printf("[MPU] Skip gyro calibration, using SD: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+    } else {
+      Serial.println("[MPU] No SD gyro data, auto-calibrating...");
+      float sx=0, sy=0, sz=0;
+      for(int i=0; i<200; i++) {
+        sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+        sx += g.gyro.x; sy += g.gyro.y; sz += g.gyro.z;
+        if(i % 50 == 0) esp_task_wdt_reset();
+        delay(5);
+      }
+      g_gyroCalX = sx / 200.0f; g_gyroCalY = sy / 200.0f; g_gyroCalZ = sz / 200.0f;
+      Serial.printf("[MPU] Gyro auto-calib: %.4f, %.4f, %.4f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+    }
+  } esp_task_wdt_reset();
   Serial.printf("[MPU] %s\n", g_mpuOk ? "OK" : "FAIL");
   g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
   bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
