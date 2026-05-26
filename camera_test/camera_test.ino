@@ -2421,13 +2421,6 @@ void recordFrame() {
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { esp_task_wdt_reset(); return; }
   if (eisEnabled && fb->format == PIXFORMAT_RGB565) {
-    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
-    float gx = g.gyro.x, gy = g.gyro.y;
-    g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + gx * EIS_ALPHA;
-    g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + gy * EIS_ALPHA;
-    float gdx = gx - g_eisBiasX, gdy = gy - g_eisBiasY;
-    g_eisOffX = constrain(g_eisOffX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    g_eisOffY = constrain(g_eisOffY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
     uint16_t* src = (uint16_t*)fb->buf;
     uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
     if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
@@ -2547,11 +2540,20 @@ void mpuTick() {
     if (lcd.getRotation() != r) lcd.setRotation(r);
   }
   if (eisEnabled) {
+    float gmag = sqrtf(g_gyrX * g_gyrX + g_gyrY * g_gyrY);
+    if (gmag < 0.05f) {
+      g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + g_gyrX * EIS_ALPHA;
+      g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + g_gyrY * EIS_ALPHA;
+    }
     float gdx = g_gyrX - g_eisBiasX, gdy = g_gyrY - g_eisBiasY;
-    g_eisBiasX = g_eisBiasX * (1.0f - EIS_ALPHA) + g_gyrX * EIS_ALPHA;
-    g_eisBiasY = g_eisBiasY * (1.0f - EIS_ALPHA) + g_gyrY * EIS_ALPHA;
-    g_eisOffX = constrain(g_eisOffX + gdx * EIS_GYRO_SCALE, 0, EIS_CROP_X * 2);
-    g_eisOffY = constrain(g_eisOffY + gdy * EIS_GYRO_SCALE, 0, EIS_CROP_Y * 2);
+    float tx = g_eisOffX + (gdx * 0.08f * 306.0f);
+    float ty = g_eisOffY + (gdy * 0.08f * 306.0f);
+    tx = tx * (1.0f - EIS_ALPHA) + (float)EIS_CROP_X * EIS_ALPHA;
+    ty = ty * (1.0f - EIS_ALPHA) + (float)EIS_CROP_Y * EIS_ALPHA;
+    tx = constrain(tx, 0.0f, (float)EIS_CROP_X * 2.0f);
+    ty = constrain(ty, 0.0f, (float)EIS_CROP_Y * 2.0f);
+    g_eisOffX = g_eisOffX * 0.85f + tx * 0.15f;
+    g_eisOffY = g_eisOffY * 0.85f + ty * 0.15f;
   }
   if (sdReady && (now - g_mpuLogMs) >= MPU_LOG_MS && mpuLogEnabled) {
     g_mpuLogMs = now;
