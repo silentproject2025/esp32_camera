@@ -2531,8 +2531,11 @@ void mpuTick() {
   g_gyrX = gyro.gyro.x;
   g_gyrY = gyro.gyro.y;
   g_gyrZ = gyro.gyro.z;
-  g_roll = atan2f(g_accY, g_accZ) * 57.2958f;
-  g_pitch = atan2f(-g_accX, sqrtf(g_accY * g_accY + g_accZ * g_accZ)) * 57.2958f;
+  // Complementary Filter: alpha=0.96 (gyro), dt=0.08s. Fuses gyro integration with accel tilt.
+  float aRoll = atan2f(g_accY, g_accZ) * 57.2958f;
+  float aPitch = atan2f(-g_accX, sqrtf(g_accY * g_accY + g_accZ * g_accZ)) * 57.2958f;
+  g_roll = 0.96f * (g_roll + g_gyrX * 57.2958f * 0.08f) + 0.04f * aRoll;
+  g_pitch = 0.96f * (g_pitch + g_gyrY * 57.2958f * 0.08f) + 0.04f * aPitch;
   g_tilted = (fabsf(g_roll) > MPU_TILT_DEG || fabsf(g_pitch) > MPU_TILT_DEG);
   float mag = sqrtf(g_accX * g_accX + g_accY * g_accY + g_accZ * g_accZ);
   g_shake = (fabsf(mag - 9.8f) > MPU_SHAKE_THRESH);
