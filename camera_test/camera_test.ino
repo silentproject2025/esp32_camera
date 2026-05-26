@@ -435,6 +435,7 @@ static bool g_mpuOk = false;
 static float g_accX=0, g_accY=0, g_accZ=0;
 static float g_gyrX=0, g_gyrY=0, g_gyrZ=0;
 static float g_gyrCalX = 0.0f, g_gyrCalY = 0.0f, g_gyrCalZ = 0.0f;
+static bool g_mpuCalLoaded = false;
 static float g_roll=0.0f, g_pitch=0.0f;
 static bool g_shake=false, g_tilted=false;
 static uint8_t g_orientation=0;
@@ -782,6 +783,73 @@ void loadSettings() {
   fclose(f);
 }
 
+void loadMPUCalibration() {
+  FILE* f = fopen("/sdcard/mpu_cal.ini", "r");
+  if (!f) {
+    g_mpuCalLoaded = false;
+    return;
+  }
+  char line[64];
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    float v = 0;
+    if (sscanf(line, "calX=%f", &v) == 1)      { g_gyrCalX = v; }
+    else if (sscanf(line, "calY=%f", &v) == 1) { g_gyrCalY = v; }
+    else if (sscanf(line, "calZ=%f", &v) == 1) { g_gyrCalZ = v; }
+  }
+  fclose(f);
+  g_mpuCalLoaded = true;
+  Serial.printf("[MPU] Cal loaded: X=%.5f Y=%.5f Z=%.5f\n", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+}
+
+void runMPUCalibration() {
+  lcd.fillScreen(COL_BLACK);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_7);
+  const char* msg = "letakkan kamera datar & diam";
+  lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, 80);
+
+  for (int i = 5; i >= 1; i--) {
+    lcd.fillRect(0, 110, DISP_W, 40, COL_BLACK);
+    lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextSize(2); lcd.setTextColor(COL_WHITE);
+    char buf[8]; snprintf(buf, sizeof(buf), "%d", i);
+    lcd.drawString(buf, (DISP_W - lcd.textWidth(buf)) / 2, 110);
+    for (int j = 0; j < 10; j++) { delay(100); esp_task_wdt_reset(); }
+  }
+
+  lcd.fillRect(0, 80, DISP_W, 80, COL_BLACK);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_5);
+  const char* calMsg = "mengkalibrasi...";
+  lcd.drawString(calMsg, (DISP_W - lcd.textWidth(calMsg)) / 2, 110);
+
+  float sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < 500; i++) {
+    sensors_event_t a, g, t; mpu.getEvent(&a, &g, &t);
+    sx += g.gyro.x; sy += g.gyro.y; sz += g.gyro.z;
+    if (i % 50 == 0) esp_task_wdt_reset();
+    delay(5);
+  }
+  g_gyrCalX = sx / 500.0f; g_gyrCalY = sy / 500.0f; g_gyrCalZ = sz / 500.0f;
+
+  lcd.fillRect(0, 110, DISP_W, 40, COL_BLACK);
+  lcd.setTextColor(COL_GRAY_C);
+  char res[64]; snprintf(res, sizeof(res), "X:%.5f Y:%.5f Z:%.5f", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+  lcd.drawString(res, (DISP_W - lcd.textWidth(res)) / 2, 110);
+  for (int j = 0; j < 20; j++) { delay(100); esp_task_wdt_reset(); }
+
+  if (sdReady) {
+    FILE* f = fopen("/sdcard/mpu_cal.ini", "w");
+    if (f) {
+      fprintf(f, "# MPU6050 Calibration - Sanzxcam\n");
+      fprintf(f, "calX=%.5f\ncalY=%.5f\ncalZ=%.5f\n", g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+      fclose(f);
+      g_mpuCalLoaded = true;
+      islandPush(NOTIF_OK, "Kalibrasi tersimpan");
+    }
+  } else {
+    islandPush(NOTIF_WARN, "Tersimpan di RAM saja");
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  WIFI & GEMINI CONFIG LOADER
 // ─────────────────────────────────────────────────────────────────────────────
@@ -917,7 +985,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 160, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 182, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -925,23 +993,30 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[5] = {
+  static const char* const rowLabels[6] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
+    "CALIBRATE MPU  recalibrate"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 6; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
     lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
     lcd.drawString(rowLabels[i], mx + 12, iy + 5);
-    lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
-    lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
+
+    if (i < 5) {
+      lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
+      lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
+    } else {
+      lcd.setTextColor(g_mpuCalLoaded ? COL_AI_ACCENT : COL_GRAY_3);
+      lcd.drawString(g_mpuCalLoaded ? "CAL" : "---", mx + mw - 30, iy + 5);
+    }
   }
   lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("C/D=nav  BOOT=toggle  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle  B=back")) / 2, my + mh - 14);
+  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 14);
 }
 
 void handleModeFeatures(ButtonEvent evt) {
@@ -949,12 +1024,16 @@ void handleModeFeatures(ButtonEvent evt) {
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 5; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 4) % 5; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 6; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 5) % 6; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
-    *feats[menuFeatSel] = !(*feats[menuFeatSel]);
-    char buf[32]; snprintf(buf, sizeof(buf), "%s %s", labs[menuFeatSel], *feats[menuFeatSel] ? "ON" : "OFF");
-    islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
+    if (menuFeatSel < 5) {
+      *feats[menuFeatSel] = !(*feats[menuFeatSel]);
+      char buf[32]; snprintf(buf, sizeof(buf), "%s %s", labs[menuFeatSel], *feats[menuFeatSel] ? "ON" : "OFF");
+      islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
+    } else {
+      runMPUCalibration(); drawFeaturesMenu(menuFeatSel);
+    }
   }
   else if (evt.pin == BTN_B) {
     saveSettings(); islandPush(NOTIF_OK, "SETTINGS SAVED");
@@ -3564,7 +3643,7 @@ void setup(){
   sdReady=mountSDFull();
   if(sdReady){
     scanPhotoCount();scanVideoCount();
-    loadSettings();loadWifiConfig();loadGeminiConfig();
+    loadSettings();loadMPUCalibration();loadWifiConfig();loadGeminiConfig();
   }
 
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
