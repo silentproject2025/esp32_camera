@@ -3733,18 +3733,9 @@ void setup(){
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 
     // Calibrate accelerometer offset
-    float ox = 0, oy = 0, oz = 0;
-    for (int i = 0; i < 300; i++) {
-      sensors_event_t a, g, t;
-      mpu.getEvent(&a, &g, &t);
-      ox += a.acceleration.x;
-      oy += a.acceleration.y;
-      oz += a.acceleration.z;
-      delay(5);
-    }
-    g_accOffX = ox / 300.0f;
-    g_accOffY = oy / 300.0f;
-    g_accOffZ = (oz / 300.0f) - 9.81f;
+    g_accOffX = 0.0f;
+    g_accOffY = 0.0f;
+    g_accOffZ = 0.0f;
 
     if (g_mpuCalLoaded) {
       Serial.printf("[MPU] Skip gyro calibration, using SD: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
