@@ -2578,7 +2578,14 @@ bool mpuInit() {
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  Serial.println("[MPU] Calibrating... Keep still!");
+
+  if (g_mpuCalLoaded) {
+    Serial.printf("[MPU] Skip kalibrasi, pakai data SD: X=%.5f Y=%.5f Z=%.5f\n",
+                  g_gyrCalX, g_gyrCalY, g_gyrCalZ);
+    return true;
+  }
+
+  Serial.println("[MPU] Tidak ada data SD, kalibrasi otomatis...");
   float sx=0,sy=0,sz=0;
   for(int i=0;i<200;i++){
     sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
@@ -2587,7 +2594,7 @@ bool mpuInit() {
     delay(5);
   }
   g_gyrCalX=sx/200.0f; g_gyrCalY=sy/200.0f; g_gyrCalZ=sz/200.0f;
-  Serial.printf("[MPU] Calib: %.4f, %.4f, %.4f\n",g_gyrCalX,g_gyrCalY,g_gyrCalZ);
+  Serial.printf("[MPU] Calib otomatis: %.4f, %.4f, %.4f\n",g_gyrCalX,g_gyrCalY,g_gyrCalZ);
   return true;
 }
 
@@ -3642,8 +3649,12 @@ void setup(){
 
   sdReady=mountSDFull();
   if(sdReady){
-    scanPhotoCount();scanVideoCount();
-    loadSettings();loadMPUCalibration();loadWifiConfig();loadGeminiConfig();
+    scanPhotoCount();
+    scanVideoCount();
+    loadSettings();
+    loadMPUCalibration();
+    loadWifiConfig();
+    loadGeminiConfig();
   }
 
   msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
