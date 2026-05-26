@@ -434,6 +434,7 @@ static Adafruit_MPU6050 mpu;
 static bool g_mpuOk = false;
 static float g_accX=0, g_accY=0, g_accZ=0;
 static float g_gyrX=0, g_gyrY=0, g_gyrZ=0;
+static float g_gyrCalX = 0.0f, g_gyrCalY = 0.0f, g_gyrCalZ = 0.0f;
 static float g_roll=0.0f, g_pitch=0.0f;
 static bool g_shake=false, g_tilted=false;
 static uint8_t g_orientation=0;
@@ -2492,13 +2493,22 @@ void updateFPS(){
 //  Exposure
 // ─────────────────────────────────────────────────────────────────────────────
 
-// [PORTED v6.1] MPU6050 Support Functions
 bool mpuInit() {
   Wire.begin(PIN_MPU_SDA, PIN_MPU_SCL);
   if (!mpu.begin(MPU_I2C_ADDR, &Wire)) return false;
   mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  Serial.println("[MPU] Calibrating... Keep still!");
+  float sx=0,sy=0,sz=0;
+  for(int i=0;i<200;i++){
+    sensors_event_t a,g,t; mpu.getEvent(&a,&g,&t);
+    sx+=g.gyro.x; sy+=g.gyro.y; sz+=g.gyro.z;
+    if(i%50==0) esp_task_wdt_reset();
+    delay(5);
+  }
+  g_gyrCalX=sx/200.0f; g_gyrCalY=sy/200.0f; g_gyrCalZ=sz/200.0f;
+  Serial.printf("[MPU] Calib: %.4f, %.4f, %.4f\n",g_gyrCalX,g_gyrCalY,g_gyrCalZ);
   return true;
 }
 
@@ -2524,14 +2534,17 @@ void mpuTick() {
   g_gyrX = gyro.gyro.x;
   g_gyrY = gyro.gyro.y;
   g_gyrZ = gyro.gyro.z;
-  // Complementary Filter: alpha=0.96 (gyro), dt=0.08s. Fuses gyro integration with accel tilt.
+  float gx = g_gyrX - g_gyrCalX; float gy = g_gyrY - g_gyrCalY;
+  if(fabsf(gx)<0.008f) gx=0; if(fabsf(gy)<0.008f) gy=0;
   float aRoll = atan2f(g_accY, g_accZ) * 57.2958f;
   float aPitch = atan2f(-g_accX, sqrtf(g_accY * g_accY + g_accZ * g_accZ)) * 57.2958f;
-  g_roll = 0.96f * (g_roll + g_gyrX * 57.2958f * 0.08f) + 0.04f * aRoll;
-  g_pitch = 0.96f * (g_pitch + g_gyrY * 57.2958f * 0.08f) + 0.04f * aPitch;
+  g_roll = 0.90f * (g_roll + gx * 57.2958f * 0.08f) + 0.10f * aRoll;
+  g_pitch = 0.90f * (g_pitch + gy * 57.2958f * 0.08f) + 0.10f * aPitch;
   g_tilted = (fabsf(g_roll) > MPU_TILT_DEG || fabsf(g_pitch) > MPU_TILT_DEG);
   float mag = sqrtf(g_accX * g_accX + g_accY * g_accY + g_accZ * g_accZ);
-  g_shake = (fabsf(mag - 9.8f) > MPU_SHAKE_THRESH);
+  static float magFiltered = 9.8f;
+  magFiltered = 0.85f * magFiltered + 0.15f * mag;
+  g_shake = (fabsf(magFiltered - 9.8f) > 4.5f);
   g_orientation = mpuCalcOrientation(g_pitch, g_roll);
   if (autoRotateEnabled && appMode == MODE_VIEWFINDER) {
     uint8_t r = 3;
