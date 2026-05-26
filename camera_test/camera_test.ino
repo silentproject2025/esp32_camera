@@ -456,6 +456,8 @@ static bool autoRotateEnabled = true;
 static bool mpuLogEnabled = false;
 static bool hudEnabled = true;
 static int menuFeatSel = 0;
+static bool hdCaptureEnabled = false;
+static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE
@@ -762,6 +764,8 @@ void saveSettings() {
   fprintf(f, "autorotate=%d\n", (int)autoRotateEnabled);
   fprintf(f, "mpulog=%d\n", (int)mpuLogEnabled);
   fprintf(f, "hud=%d\n", (int)hudEnabled);
+  fprintf(f, "hd_capture=%d\n", (int)hdCaptureEnabled);
+  fprintf(f, "hd_quality=%d\n", (int)hdCaptureQuality);
   fclose(f);
 }
 
@@ -782,6 +786,8 @@ void loadSettings() {
     else if (sscanf(line, "autorotate=%d", &v) == 1) { autoRotateEnabled = (bool)v; }
     else if (sscanf(line, "mpulog=%d", &v) == 1) { mpuLogEnabled = (bool)v; }
     else if (sscanf(line, "hud=%d", &v) == 1) { hudEnabled = (bool)v; }
+    else if (sscanf(line, "hd_capture=%d", &v) == 1) { hdCaptureEnabled = (bool)v; }
+    else if (sscanf(line, "hd_quality=%d", &v) == 1) { hdCaptureQuality = (uint8_t)constrain(v, 1, 10); }
   }
   fclose(f);
 }
@@ -988,7 +994,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 182, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 226, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -996,13 +1002,14 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[6] = {
+  static const char* const rowLabels[8] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
-    "CALIBRATE MPU  recalibrate"
+    "CALIBRATE MPU  recalibrate",
+    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 6; i++) {
+  for (int i = 0; i < 8; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
@@ -1012,9 +1019,16 @@ void drawFeaturesMenu(int sel) {
     if (i < 5) {
       lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
       lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
-    } else {
+    } else if (i == 5) {
       lcd.setTextColor(g_mpuCalLoaded ? COL_AI_ACCENT : COL_GRAY_3);
       lcd.drawString(g_mpuCalLoaded ? "CAL" : "---", mx + mw - 30, iy + 5);
+    } else if (i == 6) {
+      lcd.setTextColor(hdCaptureEnabled ? 0x07E0 : COL_GRAY_3);
+      lcd.drawString(hdCaptureEnabled ? "ON" : "OFF", mx + mw - 30, iy + 5);
+    } else if (i == 7) {
+      lcd.setTextColor(COL_WHITE);
+      char qBuf[8]; snprintf(qBuf, sizeof(qBuf), "%d", hdCaptureQuality);
+      lcd.drawString(qBuf, mx + mw - 30, iy + 5);
     }
   }
   lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
@@ -1027,15 +1041,22 @@ void handleModeFeatures(ButtonEvent evt) {
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 6; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 5) % 6; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 8; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 7) % 8; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
       char buf[32]; snprintf(buf, sizeof(buf), "%s %s", labs[menuFeatSel], *feats[menuFeatSel] ? "ON" : "OFF");
       islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
-    } else {
+    } else if (menuFeatSel == 5) {
       runMPUCalibration(); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 6) {
+      hdCaptureEnabled = !hdCaptureEnabled;
+      islandPush(NOTIF_INFO, hdCaptureEnabled ? "HD CAPTURE ON" : "HD CAPTURE OFF"); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 7) {
+      hdCaptureQuality = (hdCaptureQuality == 4) ? 6 : 4;
+      char qBuf[32]; snprintf(qBuf, sizeof(qBuf), "HD QUALITY: %d", hdCaptureQuality);
+      islandPush(NOTIF_INFO, qBuf); drawFeaturesMenu(menuFeatSel);
     }
   }
   else if (evt.pin == BTN_B) {
@@ -1167,9 +1188,11 @@ bool captureForAI(char* outPath, int outPathLen) {
           }
         }
         camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-        ok = frame2jpg(&fk, 85, &jpg_buf, &jpg_len); free(tmp);
+        int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+        ok = frame2jpg(&fk, captureQ, &jpg_buf, &jpg_len); free(tmp);
       }
-    } else { ok = frame2jpg(fb, 85, &jpg_buf, &jpg_len); }
+    } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+    ok = frame2jpg(fb, captureQ, &jpg_buf, &jpg_len); }
   } else if (fb->format == PIXFORMAT_JPEG) {
     jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
   }
@@ -2518,7 +2541,8 @@ void recordFrame() {
       }
       uint8_t* out = nullptr; size_t oLen = 0;
       camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-      if (frame2jpg(&fk, 70, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
+      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+      if (frame2jpg(&fk, recQ, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
       if (recFrameCount % 3 == 0) {
         int dw = min((int)DISP_W, (int)lcd.width());
         int dh = min((int)DISP_H, (int)lcd.height());
@@ -2530,7 +2554,8 @@ void recordFrame() {
   }
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
   if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else ok = frame2jpg(fb, 70, &jpg, &jLen);
+  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+  ok = frame2jpg(fb, recQ, &jpg, &jLen); }
   if (ok && jpg) {
     fwrite(jpg, 1, jLen, recFile); recFrameCount++;
     if (fb->format != PIXFORMAT_JPEG) free(jpg);
@@ -3167,7 +3192,10 @@ bool captureHDRFrame(const char* path, int aecVal) {
   for (int i = 0; i < 3; i++) { camera_fb_t* t = esp_camera_fb_get(); if (t) esp_camera_fb_return(t); esp_task_wdt_reset(); }
   camera_fb_t* fb = esp_camera_fb_get(); if (!fb) return false;
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_RGB565) ok = frame2jpg(fb, 85, &jpg, &jLen);
+  if (fb->format == PIXFORMAT_RGB565) {
+    int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+    ok = frame2jpg(fb, captureQ, &jpg, &jLen);
+  }
   else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
   if (ok && jpg) {
     char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
@@ -3267,9 +3295,11 @@ void captureAndPreview() {
               }
             }
             camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-            ok = frame2jpg(&fk, 85, &jpg, &jLen); free(tmp);
+            int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+            ok = frame2jpg(&fk, captureQ, &jpg, &jLen); free(tmp);
           }
-        } else { ok = frame2jpg(fb, 85, &jpg, &jLen); }
+        } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+        ok = frame2jpg(fb, captureQ, &jpg, &jLen); }
       } else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
       if (ok && jpg && jLen > 0) {
         char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
