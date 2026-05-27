@@ -122,6 +122,14 @@ struct NotifStyle {
 // ─────────────────────────────────────────────────────────────────────────────
 //  LGFX Config
 // ─────────────────────────────────────────────────────────────────────────────
+struct ButtonEvent {
+  uint8_t  pin;
+  uint32_t dur;
+  bool     isLong;
+  bool     isShort;
+  bool     valid;
+};
+
 class LGFX : public lgfx::LGFX_Device {
   lgfx::Panel_ILI9341  _panel_instance;
   lgfx::Bus_SPI        _bus_instance;
@@ -432,6 +440,20 @@ bool          photoViewCaptionVisible = false;
 
 static Adafruit_MPU6050 mpu;
 static bool g_mpuOk = false;
+static uint8_t mpuDlpfIndex = 4; // default 21Hz
+static const char* DLPF_LABELS[7] = {"260Hz","184Hz","94Hz","44Hz","21Hz","10Hz","5Hz"};
+static const mpu6050_bandwidth_t DLPF_VALUES[7] = {
+  MPU6050_BAND_260_HZ, MPU6050_BAND_184_HZ, MPU6050_BAND_94_HZ,
+  MPU6050_BAND_44_HZ,  MPU6050_BAND_21_HZ,  MPU6050_BAND_10_HZ,
+  MPU6050_BAND_5_HZ
+};
+
+void applyDLPF() {
+  if (g_mpuOk) {
+    mpu.setFilterBandwidth(DLPF_VALUES[mpuDlpfIndex]);
+  }
+}
+
 static float g_accX=0, g_accY=0, g_accZ=0;
 static float g_gyroX=0, g_gyroY=0, g_gyroZ=0;
 static float g_gyroCalX = 0.0f, g_gyroCalY = 0.0f, g_gyroCalZ = 0.0f;
@@ -468,14 +490,6 @@ static bool kmDirty   = false;
 // ─────────────────────────────────────────────────────────────────────────────
 //  BUTTON MANAGER
 // ─────────────────────────────────────────────────────────────────────────────
-struct ButtonEvent {
-  uint8_t  pin;
-  uint32_t dur;
-  bool     isLong;
-  bool     isShort;
-  bool     valid;
-};
-
 class ButtonManager {
 public:
   enum class State { IDLE, PRESSED };
@@ -766,6 +780,7 @@ void saveSettings() {
   fprintf(f, "hud=%d\n", (int)hudEnabled);
   fprintf(f, "hd_capture=%d\n", (int)hdCaptureEnabled);
   fprintf(f, "hd_quality=%d\n", (int)hdCaptureQuality);
+  fprintf(f, "dlpf=%d\n", (int)mpuDlpfIndex);
   fclose(f);
 }
 
@@ -788,8 +803,10 @@ void loadSettings() {
     else if (sscanf(line, "hud=%d", &v) == 1) { hudEnabled = (bool)v; }
     else if (sscanf(line, "hd_capture=%d", &v) == 1) { hdCaptureEnabled = (bool)v; }
     else if (sscanf(line, "hd_quality=%d", &v) == 1) { hdCaptureQuality = (uint8_t)constrain(v, 1, 10); }
+    else if (sscanf(line, "dlpf=%d", &v) == 1) { mpuDlpfIndex = (uint8_t)constrain(v, 0, 6); }
   }
   fclose(f);
+  if (g_mpuOk) applyDLPF();
 }
 
 void loadMPUCalibration() {
@@ -994,7 +1011,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 226, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 248, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -1002,14 +1019,15 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[8] = {
+  static const char* const rowLabels[9] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
     "CALIBRATE MPU  recalibrate",
-    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus"
+    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
+    "DLPF  filter bandwidth"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 9; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
@@ -1029,6 +1047,9 @@ void drawFeaturesMenu(int sel) {
       lcd.setTextColor(COL_WHITE);
       char qBuf[8]; snprintf(qBuf, sizeof(qBuf), "%d", hdCaptureQuality);
       lcd.drawString(qBuf, mx + mw - 30, iy + 5);
+    } else if (i == 8) {
+      lcd.setTextColor(COL_WHITE);
+      lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
     }
   }
   lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
@@ -1041,8 +1062,8 @@ void handleModeFeatures(ButtonEvent evt) {
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 8; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 7) % 8; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 9; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 8) % 9; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1057,6 +1078,11 @@ void handleModeFeatures(ButtonEvent evt) {
       hdCaptureQuality = (hdCaptureQuality == 4) ? 6 : 4;
       char qBuf[32]; snprintf(qBuf, sizeof(qBuf), "HD QUALITY: %d", hdCaptureQuality);
       islandPush(NOTIF_INFO, qBuf); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 8) {
+      mpuDlpfIndex = (mpuDlpfIndex + 1) % 7;
+      applyDLPF();
+      char buf[32]; snprintf(buf, sizeof(buf), "DLPF: %s", DLPF_LABELS[mpuDlpfIndex]);
+      islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
     }
   }
   else if (evt.pin == BTN_B) {
@@ -3730,7 +3756,7 @@ void setup(){
   if (g_mpuOk) {
     mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    applyDLPF();
 
     // Calibrate accelerometer offset
     g_accOffX = 0.0f;
