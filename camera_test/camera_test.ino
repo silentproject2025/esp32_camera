@@ -462,6 +462,8 @@ static float g_accOffX = 0.0f;
 static float g_accOffY = 0.0f;
 static float g_accOffZ = 0.0f;
 static float g_tiltX=0.0f, g_tiltY=0.0f;
+static float mpuKalmanRmeas = 0.10f;
+static float mpuTiltDeadzone = 2.0f;
 static bool g_shake=false, g_tilted=false;
 static uint8_t g_orientation=0;
 static uint32_t g_mpuLastMs=0, g_mpuLogMs=0;
@@ -781,6 +783,8 @@ void saveSettings() {
   fprintf(f, "hd_capture=%d\n", (int)hdCaptureEnabled);
   fprintf(f, "hd_quality=%d\n", (int)hdCaptureQuality);
   fprintf(f, "dlpf=%d\n", (int)mpuDlpfIndex);
+  fprintf(f, "kalman_r=%.3f\n", mpuKalmanRmeas);
+  fprintf(f, "tilt_dz=%.1f\n",  mpuTiltDeadzone);
   fclose(f);
 }
 
@@ -804,6 +808,9 @@ void loadSettings() {
     else if (sscanf(line, "hd_capture=%d", &v) == 1) { hdCaptureEnabled = (bool)v; }
     else if (sscanf(line, "hd_quality=%d", &v) == 1) { hdCaptureQuality = (uint8_t)constrain(v, 1, 10); }
     else if (sscanf(line, "dlpf=%d", &v) == 1) { mpuDlpfIndex = (uint8_t)constrain(v, 0, 6); }
+    float fv = 0;
+    if      (sscanf(line, "kalman_r=%f", &fv) == 1) { mpuKalmanRmeas = constrain(fv, 0.01f, 1.0f); }
+    else if (sscanf(line, "tilt_dz=%f", &fv) == 1) { mpuTiltDeadzone = constrain(fv, 0.0f, 10.0f); }
   }
   fclose(f);
   if (g_mpuOk) applyDLPF();
@@ -1011,7 +1018,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 248, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 292, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -1019,15 +1026,16 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[9] = {
+  static const char* const rowLabels[11] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
     "CALIBRATE MPU  recalibrate",
     "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
+    "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
     "DLPF  filter bandwidth"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 9; i++) {
+  for (int i = 0; i < 11; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
@@ -1049,6 +1057,14 @@ void drawFeaturesMenu(int sel) {
       lcd.drawString(qBuf, mx + mw - 30, iy + 5);
     } else if (i == 8) {
       lcd.setTextColor(COL_WHITE);
+      char rBuf[8]; snprintf(rBuf, sizeof(rBuf), "%.2f", mpuKalmanRmeas);
+      lcd.drawString(rBuf, mx + mw - 45, iy + 5);
+    } else if (i == 9) {
+      lcd.setTextColor(COL_WHITE);
+      char dBuf[8]; snprintf(dBuf, sizeof(dBuf), "%.1f", mpuTiltDeadzone);
+      lcd.drawString(dBuf, mx + mw - 45, iy + 5);
+    } else if (i == 10) {
+      lcd.setTextColor(COL_WHITE);
       lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
     }
   }
@@ -1062,8 +1078,8 @@ void handleModeFeatures(ButtonEvent evt) {
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 9; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 8) % 9; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 11; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 10) % 11; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1079,6 +1095,22 @@ void handleModeFeatures(ButtonEvent evt) {
       char qBuf[32]; snprintf(qBuf, sizeof(qBuf), "HD QUALITY: %d", hdCaptureQuality);
       islandPush(NOTIF_INFO, qBuf); drawFeaturesMenu(menuFeatSel);
     } else if (menuFeatSel == 8) {
+      if      (mpuKalmanRmeas < 0.04f) mpuKalmanRmeas = 0.05f;
+      else if (mpuKalmanRmeas < 0.06f) mpuKalmanRmeas = 0.10f;
+      else if (mpuKalmanRmeas < 0.15f) mpuKalmanRmeas = 0.20f;
+      else if (mpuKalmanRmeas < 0.40f) mpuKalmanRmeas = 0.50f;
+      else                             mpuKalmanRmeas = 0.03f;
+      char buf[32]; snprintf(buf, sizeof(buf), "KALMAN-R: %.2f", mpuKalmanRmeas);
+      islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 9) {
+      if      (mpuTiltDeadzone < 0.5f) mpuTiltDeadzone = 1.0f;
+      else if (mpuTiltDeadzone < 1.5f) mpuTiltDeadzone = 2.0f;
+      else if (mpuTiltDeadzone < 2.5f) mpuTiltDeadzone = 3.0f;
+      else if (mpuTiltDeadzone < 4.5f) mpuTiltDeadzone = 5.0f;
+      else                             mpuTiltDeadzone = 0.0f;
+      char buf[32]; snprintf(buf, sizeof(buf), "TILT-DZ: %.1f deg", mpuTiltDeadzone);
+      islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 10) {
       mpuDlpfIndex = (mpuDlpfIndex + 1) % 7;
       applyDLPF();
       char buf[32]; snprintf(buf, sizeof(buf), "DLPF: %s", DLPF_LABELS[mpuDlpfIndex]);
@@ -2640,7 +2672,6 @@ struct KalmanAngle {
   float P[2][2] = {{1,0},{0,1}};
   float Q_angle = 0.001f;
   float Q_bias  = 0.003f;
-  float R_meas  = 0.03f;
 
   float update(float newAngle, float newRate, float dt) {
     float rate = newRate - bias;
@@ -2649,7 +2680,7 @@ struct KalmanAngle {
     P[0][1] -= dt * P[1][1];
     P[1][0] -= dt * P[1][1];
     P[1][1] += Q_bias * dt;
-    float S = P[0][0] + R_meas;
+    float S = P[0][0] + mpuKalmanRmeas;
     float K[2] = { P[0][0] / S, P[1][0] / S };
     float y = newAngle - angle;
     angle += K[0] * y;
@@ -2752,8 +2783,9 @@ void mpuTick() {
 void mpuDrawIndicator() {
   if (!g_mpuOk) return;
   char buf[16]; uint16_t col;
+  bool showTilt = g_tilted && (fabsf(g_tiltX) > mpuTiltDeadzone || fabsf(g_tiltY) > mpuTiltDeadzone);
   if (g_shake) { strncpy(buf, "SHAKE!", sizeof(buf)); col=0xFD20; } // COL_WARN
-  else if (g_tilted) {
+  else if (showTilt) {
     if (fabsf(g_tiltX) >= fabsf(g_tiltY))
       snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_tiltX), g_tiltX > 0 ? "R" : "L");
     else
