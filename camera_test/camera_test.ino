@@ -1134,7 +1134,9 @@ void handleModeFeatures(ButtonEvent evt) {
       applyDLPF();
       char buf[32]; snprintf(buf, sizeof(buf), "DLPF: %s", DLPF_LABELS[mpuDlpfIndex]);
       islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
-// UI UPDATE v6.0
+    }
+  }
+}
 void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
@@ -1190,17 +1192,6 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     }
     lcd.drawString(preview, 4, footerY + 4);
   }
-  lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
-  lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("C=naik", 4, DISP_H - 14);
-  lcd.drawString("D=turun", 60, DISP_H - 14);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("BOOT=jalankan", 120, DISP_H - 14);
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("B=batal", DISP_W - 46, DISP_H - 14);
-}
   lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
   lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
@@ -2042,7 +2033,7 @@ void drawGalleryGrid() {
       char path[64]; snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
       bool ok = false;
       struct stat st; if (stat(path, &st) == 0 && st.st_size < 200 * 1024) {
-        if (TJpgDec.drawSdSquare(x + 18, y + 13, path, 8)) ok = true;
+        if (TJpgDec.setJpgScale(8), TJpgDec.drawSdJpg(x + 18, y + 13, path) == JDR_OK) ok = true;
       }
       if (!ok) {
         lcd.setTextColor(COL_GRAY_7);
@@ -2155,10 +2146,8 @@ void galleryStep(int delta){
   else if(gallerySelIdx>=galleryScroll+pageSize){galleryScroll=(gallerySelIdx / pageSize) * pageSize;needRedraw=true;}
   if(needRedraw) { if(galleryGridMode) drawGalleryGrid(); else drawGallery(); }
   else { if(galleryGridMode) drawGalleryGrid(); else galleryUpdateHighlight(oldSel,gallerySelIdx); }
+}
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Photo pixel buffer
-// ─────────────────────────────────────────────────────────────────────────────
 bool photoLoadPixelBuf(int idx){
   if(idx<0||idx>=galleryCount||gIsVideo(idx)) return false;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
@@ -3412,10 +3401,6 @@ void renderViewfinder(){
       lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
       lcd.drawString("format not rgb565",10,110);
     }
-    esp_camera_fb_return(fb);
-  }
-  islandTick();
-}
     esp_camera_fb_return(fb);
   }
   islandTick();
