@@ -98,7 +98,7 @@
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
 
-#include <FastLED.h>
+#include <Adafruit_NeoPixel.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
@@ -282,7 +282,7 @@ enum AppMode {
   MODE_FEATURES,
 };
 AppMode appMode  = MODE_VIEWFINDER;
-CRGB leds[NEO_NUM];
+Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
 enum NeoMode { NEO_MODE_OFF, NEO_MODE_SOLID, NEO_MODE_BREATH, NEO_MODE_PULSE, NEO_MODE_SPIN };
 NeoMode g_neoMode = NEO_MODE_OFF;
 uint8_t g_neoR=0, g_neoG=0, g_neoB=0;
@@ -3771,23 +3771,23 @@ void exitUSBMode(){
 
 
 void neoSetup() {
-  FastLED.addLeds<WS2812B, NEO_PIN, GRB>(leds, NEO_NUM);
-  FastLED.setBrightness(80);
-  for(int i=0; i<NEO_NUM; i++) leds[i] = CRGB::Black;
-  FastLED.show();
+  strip.begin();
+  strip.setBrightness(80);
+  for(int i=0; i<NEO_NUM; i++) strip.setPixelColor(i, 0, 0, 0);
+  strip.show();
 }
 void neoSolid(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_SOLID; g_neoR = r; g_neoG = g; g_neoB = b;
-  leds[0] = CRGB(r, g, b); FastLED.show();
+  strip.setPixelColor(0, r, g, b); strip.show();
 }
 void neoOff() {
-  g_neoMode = NEO_MODE_OFF; leds[0] = CRGB::Black; FastLED.show();
+  g_neoMode = NEO_MODE_OFF; strip.setPixelColor(0, 0, 0, 0); strip.show();
 }
 void neoBurst(uint8_t r, uint8_t g, uint8_t b, int times) {
   g_neoMode = NEO_MODE_OFF;
   for (int i = 0; i < times; i++) {
-    leds[0] = CRGB(r, g, b); FastLED.show(); delay(150);
-    leds[0] = CRGB::Black;   FastLED.show(); if(i<times-1) delay(100);
+    strip.setPixelColor(0, r, g, b); strip.show(); delay(150);
+    strip.setPixelColor(0, 0, 0, 0); strip.show(); if(i<times-1) delay(100);
     esp_task_wdt_reset();
   }
 }
@@ -3805,36 +3805,39 @@ void neoFade(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t
   uint32_t start = millis();
   while (millis() - start < durationMs) {
     float p = (float)(millis() - start) / (float)durationMs;
-    leds[0] = CRGB(r1+(r2-r1)*p, g1+(g2-g1)*p, b1+(b2-b1)*p);
-    FastLED.show(); esp_task_wdt_reset(); delay(10);
+    strip.setPixelColor(0, r1+(r2-r1)*p, g1+(g2-g1)*p, b1+(b2-b1)*p);
+    strip.show(); esp_task_wdt_reset(); delay(10);
   }
-  leds[0] = CRGB(r2, g2, b2); FastLED.show();
+  strip.setPixelColor(0, r2, g2, b2); strip.show();
 }
 void neoRainbow() {
   g_neoMode = NEO_MODE_OFF;
   for (int i=0; i<255; i++) {
-    leds[0] = CHSV(i, 255, 255); FastLED.show(); delay(5); esp_task_wdt_reset();
+    uint32_t c = strip.ColorHSV((uint16_t)i * 257, 255, 255);
+    strip.setPixelColor(0, strip.gamma32(c));
+    strip.show(); delay(5); esp_task_wdt_reset();
   }
 }
 void neoTick() {
   uint32_t now = millis();
   if (recActive) {
-    if ((now / 1000) % 2 == 0) { leds[0] = CRGB(180, 0, 0); }
-    else { leds[0] = CRGB(60, 0, 0); }
-    FastLED.show(); return;
+    if ((now / 1000) % 2 == 0) { strip.setPixelColor(0, 180, 0, 0); }
+    else { strip.setPixelColor(0, 60, 0, 0); }
+    strip.show(); return;
   }
   if (g_neoMode == NEO_MODE_OFF || g_neoMode == NEO_MODE_SOLID) return;
   if (g_neoMode == NEO_MODE_BREATH) {
     float v = (exp(sin(now/1500.0*PI)) - 0.36787944) * 0.42545906;
-    leds[0] = CRGB(g_neoR*v, g_neoG*v, g_neoB*v); FastLED.show();
+    strip.setPixelColor(0, g_neoR*v, g_neoG*v, g_neoB*v); strip.show();
   } else if (g_neoMode == NEO_MODE_PULSE) {
     float v = (sin(now/1000.0*PI) + 1.0) / 2.0;
-    leds[0] = CRGB(g_neoR*v, g_neoG*v, g_neoB*v); FastLED.show();
+    strip.setPixelColor(0, g_neoR*v, g_neoG*v, g_neoB*v); strip.show();
   } else if (g_neoMode == NEO_MODE_SPIN) {
     if (now - g_neoLastMs > 100) {
       g_neoLastMs = now; g_neoState = !g_neoState;
-      leds[0] = g_neoState ? CRGB(g_neoR, g_neoG, g_neoB) : CRGB::Black;
-      FastLED.show();
+      if (g_neoState) strip.setPixelColor(0, g_neoR, g_neoG, g_neoB);
+      else strip.setPixelColor(0, 0, 0, 0);
+      strip.show();
     }
   }
 }
