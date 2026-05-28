@@ -59,7 +59,6 @@ jobs:
             --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
             --build-property "build.extra_flags=-DESP32 -DBOARD_HAS_PSRAM" \
             --output-dir ./output \
-            --verbose \
             camera_test/camera_test.ino
 
       - name: Merge Binaries
