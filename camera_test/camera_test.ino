@@ -98,6 +98,7 @@
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
 
+#include <FastLED.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
@@ -198,7 +199,9 @@ static LGFX lcd;
 #define SD_MMC_CLK_PIN 39
 #define SD_MMC_D0_PIN  40
 
-#define LED_PIN        48
+//#define LED_PIN        48
+#define NEO_PIN        48
+#define NEO_NUM         1
 #define LED_FLASH       2
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -279,6 +282,12 @@ enum AppMode {
   MODE_FEATURES,
 };
 AppMode appMode  = MODE_VIEWFINDER;
+CRGB leds[NEO_NUM];
+enum NeoMode { NEO_MODE_OFF, NEO_MODE_SOLID, NEO_MODE_BREATH, NEO_MODE_PULSE, NEO_MODE_SPIN };
+NeoMode g_neoMode = NEO_MODE_OFF;
+uint8_t g_neoR=0, g_neoG=0, g_neoB=0;
+uint32_t g_neoLastMs=0;
+bool g_neoState=false;
 AppMode prevMode = MODE_VIEWFINDER;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -453,7 +462,6 @@ void applyDLPF() {
     mpu.setFilterBandwidth(DLPF_VALUES[mpuDlpfIndex]);
   }
 }
-
 static float g_accX=0, g_accY=0, g_accZ=0;
 static float g_gyroX=0, g_gyroY=0, g_gyroZ=0;
 static float g_gyroCalX = 0.0f, g_gyroCalY = 0.0f, g_gyroCalZ = 0.0f;
@@ -681,6 +689,7 @@ void islandPush(NotifType type, const char* text) {
   islandAnimStart = millis();
   islandState     = ISLAND_SLIDING_IN;
   islandFreezeUntilMs = millis() + ISLAND_FREEZE_MS;
+  if (type == NOTIF_WARN) neoBurst(200, 80, 0, 2);
 }
 
 void islandTick() {
@@ -766,6 +775,7 @@ int      photoCount    = 0;
 #define SETTINGS_PATH "/sdcard/settings.ini"
 
 void saveSettings() {
+  if (sdReady) neoBurst(0, 180, 0, 2);
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) return;
@@ -837,6 +847,7 @@ void loadMPUCalibration() {
 
 void runMPUCalibration() {
   lcd.fillScreen(COL_BLACK);
+  neoRainbow();
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_7);
   const char* msg = "letakkan kamera datar & diam";
   lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, 80);
@@ -1214,6 +1225,7 @@ void openAIFeatureMenu(bool fromViewfinder) {
   drawAIFeatureMenu((int)aiSelectedFeature, fromViewfinder);
   resetAllButtons();
   appMode = MODE_AI_FEATURE_MENU;
+  neoBurst(0, 200, 200, 2);
 }
 
 
@@ -1230,6 +1242,7 @@ bool captureForAI(char* outPath, int outPathLen) {
   camera_fb_t *fb = esp_camera_fb_get();
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
   if (!fb) return false;
+  neoBurst(0, 80, 255, 1);
   uint8_t *jpg_buf = nullptr; size_t jpg_len = 0; bool ok = false;
   if (fb->format == PIXFORMAT_RGB565) {
     if (eisEnabled) {
@@ -1750,6 +1763,7 @@ uint16_t  photoBufW     = 0;
 uint16_t  photoBufH     = 0;
 
 bool          recActive     = false;
+
 FILE*         recFile       = nullptr;
 int           recFrameCount = 0;
 int           recVideoCount = 0;
@@ -1882,14 +1896,6 @@ static void blockingWaitAllRelease(uint32_t timeoutMs=500){
     delay(10); esp_task_wdt_reset();
   }
   delay(50);
-}
-
-void blinkLED(int n,int on_ms=100,int off_ms=100){
-  for(int i=0;i<n;i++){
-    digitalWrite(LED_PIN,HIGH);delay(on_ms);
-    digitalWrite(LED_PIN,LOW);if(i<n-1)delay(off_ms);
-    esp_task_wdt_reset();
-  }
 }
 
 void drawCornerBrackets(uint16_t col=COL_WHITE){
@@ -2254,6 +2260,7 @@ void openDeleteDialog(){
   drawDeleteDialog(galleryFiles[photoViewIndex]);
   deleteDialogOpenMs=millis();
   resetAllButtons(); appMode=MODE_DIALOG_DELETE;
+  neoFade(180,0,0, 0,0,0, 8000);
 }
 
 void photoViewDeleteCurrent(){
@@ -2264,6 +2271,7 @@ void photoViewDeleteCurrent(){
   scanGalleryFiles();scanPhotoCount();
   gallerySelIdx=0;
   resetAllButtons(); appMode=MODE_GALLERY; drawGallery();
+  neoBurst(120, 0, 180, 1); neoOff();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2558,6 +2566,8 @@ void drawRecIndicator(){
 
 void startRecording() {
   if (!sdReady || recActive) return;
+  neoSolid(180, 0, 0);
+  if (!sdReady || recActive) return;
   recVideoCount++;
   char path[48]; snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
   recFile = fopen(path, "wb");
@@ -2575,7 +2585,7 @@ void stopRecording(){
   unsigned long dur=(millis()-recStartMs)/1000;
   char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
   islandPush(NOTIF_OK,buf);
-  blinkLED(3,100,80);
+  neoBurst(0, 180, 0, 3); neoOff();
   fpsLastTime=millis();fpsFrameCount=0;
 }
 
@@ -2740,6 +2750,7 @@ void mpuTick() {
   if (rawShake) shakeCount = min(shakeCount + 1, 5);
   else          shakeCount = max(shakeCount - 1, 0);
   g_shake = (shakeCount >= 3);
+  if (g_shake) neoSpin(200, 60, 0);
 
   g_orientation = mpuCalcOrientation(g_tiltY, g_tiltX);
 
@@ -2784,14 +2795,16 @@ void mpuDrawIndicator() {
   if (!g_mpuOk) return;
   char buf[16]; uint16_t col;
   bool showTilt = g_tilted && (fabsf(g_tiltX) > mpuTiltDeadzone || fabsf(g_tiltY) > mpuTiltDeadzone);
-  if (g_shake) { strncpy(buf, "SHAKE!", sizeof(buf)); col=0xFD20; } // COL_WARN
+  if (g_shake) { strncpy(buf, "SHAKE!", sizeof(buf)); col=0xFD20; neoSpin(200, 60, 0); } // COL_WARN
   else if (showTilt) {
     if (fabsf(g_tiltX) >= fabsf(g_tiltY))
       snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_tiltX), g_tiltX > 0 ? "R" : "L");
     else
       snprintf(buf, sizeof(buf), "%.0f\xb0 %s", fabsf(g_tiltY), g_tiltY > 0 ? "F" : "B");
     col=0xFD20; // COL_WARN
-  } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; } // COL_GRAY_7
+    float tilt = sqrtf(g_tiltX * g_tiltX + g_tiltY * g_tiltY);
+    if (tilt > 30.0f) neoSolid(200, 80, 0); else neoSolid(180, 150, 0);
+  } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; neoSolid(0, 40, 0); } // COL_GRAY_7
   drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
 }
 void applyExpPreset(uint8_t preset){
@@ -3045,12 +3058,15 @@ bool doAICall(int idx, const char* customPrompt) {
 
   if(WiFi.status()!=WL_CONNECTED){
     WiFi.begin(wifiSSID,wifiPass);
+    neoSpin(0, 80, 255);
     unsigned long t0=millis();
     while(WiFi.status()!=WL_CONNECTED&&millis()-t0<15000){delay(300);esp_task_wdt_reset();}
     if(WiFi.status()!=WL_CONNECTED){
       drawAIStatus("WiFi gagal","periksa wifi.ini");
+      neoBurst(180, 0, 0, 5);
       delay(2500);return false;
     }
+    neoOff();
   }
 
   char featLabel[24];
@@ -3097,6 +3113,7 @@ bool doAICall(int idx, const char* customPrompt) {
     if(geminiKeyCount>1) snprintf(statusMsg,sizeof(statusMsg),"kirim... (key %d/%d)",keyIdx+1,geminiKeyCount);
     else strncpy(statusMsg,"mengirim ke Gemini...",sizeof(statusMsg)-1);
     drawAIStatus(statusHdr,statusMsg);
+    neoBreath(0, 200, 200);
     esp_task_wdt_reset();
 
     String url=String(GEMINI_URL_BASE)+String(geminiApiKeys[keyIdx]);
@@ -3109,6 +3126,7 @@ bool doAICall(int idx, const char* customPrompt) {
     esp_task_wdt_reset();
 
     if(httpCode==200){
+      neoBurst(0, 220, 0, 1); neoFade(0, 220, 0, 0, 0, 0, 500);
       resp=http.getString(); http.end();
       geminiKeyActive=keyIdx;
       Serial.printf("[GEMINI] key%d berhasil (HTTP 200) feat=%s\n",keyIdx+1,featLabel);
@@ -3118,6 +3136,7 @@ bool doAICall(int idx, const char* customPrompt) {
       http.end();
       Serial.printf("[GEMINI] key%d HTTP %d → fallback\n",keyIdx+1,httpCode);
       if(ki<geminiKeyCount-1){
+        neoBurst(200, 180, 0, 2);
         char fbMsg[48];
         snprintf(fbMsg,sizeof(fbMsg),"key%d %s → coba key%d...",
                  keyIdx+1,httpCode==403?"quota":"rate limit",
@@ -3135,6 +3154,7 @@ bool doAICall(int idx, const char* customPrompt) {
 
   body="";
   if(httpCode!=200){
+    for(int i=0; i<3; i++) { neoBurst(180,0,0,1); neoBurst(180,150,0,1); }
     Serial.printf("[GEMINI] semua %d key gagal\n",geminiKeyCount);
     char failMsg[40]; snprintf(failMsg,sizeof(failMsg),"semua %d key gagal (quota?)",geminiKeyCount);
     drawAIStatus("GAGAL",failMsg); delay(3000);return false;
@@ -3146,6 +3166,7 @@ bool doAICall(int idx, const char* customPrompt) {
   DynamicJsonDocument doc(8192);
   DeserializationError err=deserializeJson(doc,resp);
   if(err){
+    neoBurst(180, 0, 120, 3);
     Serial.printf("[GEMINI] JSON parse error: %s\n",err.c_str());
     drawAIStatus("parse error","respons tidak valid");
     delay(2500);return false;
@@ -3247,6 +3268,7 @@ void renderViewfinder(){
       drawCornerBrackets(bktCol);
       char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
       drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
+  if (!recActive && !g_tilted && !g_shake) neoBreath(0, 0, 80);
       char sensorPill[20];
       snprintf(sensorPill,sizeof(sensorPill),"%s%s",sensorName,ledFlashEnabled?" *":"");
       drawPill(DISP_W-42,10,sensorPill,COL_PILL_BG,COL_GRAY_A);
@@ -3319,6 +3341,7 @@ void runHDRFlow() {
   int cx = DISP_W / 2, cy = DISP_H / 2;
   uint32_t start = millis(); bool failed = false;
   int origVal = expManualVal;
+  neoFade(180,0,0, 0,180,0, 3000);
   while (millis() - start < HDR_WAIT_MS) {
     esp_task_wdt_reset(); // [PORTED v6.1] MPU tick
   mpuTick();
@@ -3348,6 +3371,7 @@ void runHDRFlow() {
     applyExpPreset(expPreset);
     char msg[32]; snprintf(msg, sizeof(msg), "HDR OK #%04d x3", photoCount);
     islandPush(NOTIF_OK, msg);
+    neoBurst(200, 150, 0, 3);
   }
   lcd.fillScreen(COL_BLACK);
   blockingWaitAllRelease(300);
@@ -3363,7 +3387,8 @@ void captureAndPreview() {
   }
   camera_fb_t* fb = esp_camera_fb_get();
   if (ledFlashEnabled) digitalWrite(LED_FLASH, LOW);
-  if (!fb) { blinkLED(5, 50, 50); return; }
+  if (!fb) { neoBurst(180, 0, 0, 5); return; }
+  neoBurst(0, 80, 255, 1);
   if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
     int dw = min((int)fb->width, (int)lcd.width());
     int dh = min((int)fb->height, (int)lcd.height());
@@ -3424,9 +3449,10 @@ void captureAndPreview() {
     char msg[28];
     bool isBmp = (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP);
     snprintf(msg, sizeof(msg), "SAVED %s #%04d", isBmp ? "BMP" : "JPG", photoCount);
-    islandPush(NOTIF_OK, msg); blinkLED(2, 150, 80);
+    islandPush(NOTIF_OK, msg);
+    neoBurst(200, 150, 0, 3); if (isBmp) neoBurst(0, 80, 200, 2); else neoBurst(0, 180, 0, 2);
   } else {
-    islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD"); blinkLED(5, 50, 50);
+    islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD"); neoBurst(180, 0, 0, 5);
   }
   fpsLastTime = millis(); fpsFrameCount = 0;
   resetAllButtons();
@@ -3707,6 +3733,7 @@ void drawUSBModeScreen(){
 }
 
 void enterUSBMode(){
+  neoBreath(0, 80, 255);
   if(!sdReady) return;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   islandForceHide();
@@ -3714,7 +3741,7 @@ void enterUSBMode(){
   WiFi.disconnect(true);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
-  blinkLED(3,200,100);resetAllButtons();
+  resetAllButtons();
 }
 
 void exitUSBMode(){
@@ -3732,7 +3759,7 @@ void exitUSBMode(){
     lcd.setTextColor(COL_GRAY_5);
     lcd.drawString("sd mount failed",(DISP_W-lcd.textWidth("sd mount failed"))/2,DISP_H/2-6);
   }
-  esp_task_wdt_reset();blinkLED(2,150,100);delay(1000);
+  neoOff();
   lcd.fillScreen(COL_BLACK);resetAllButtons();
   appMode=MODE_VIEWFINDER;
   fpsLastTime=millis();fpsFrameCount=0;fpsValue=0.0f;
@@ -3741,6 +3768,77 @@ void exitUSBMode(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
+
+
+void neoSetup() {
+  FastLED.addLeds<WS2812B, NEO_PIN, GRB>(leds, NEO_NUM);
+  FastLED.setBrightness(80);
+  for(int i=0; i<NEO_NUM; i++) leds[i] = CRGB::Black;
+  FastLED.show();
+}
+void neoSolid(uint8_t r, uint8_t g, uint8_t b) {
+  g_neoMode = NEO_MODE_SOLID; g_neoR = r; g_neoG = g; g_neoB = b;
+  leds[0] = CRGB(r, g, b); FastLED.show();
+}
+void neoOff() {
+  g_neoMode = NEO_MODE_OFF; leds[0] = CRGB::Black; FastLED.show();
+}
+void neoBurst(uint8_t r, uint8_t g, uint8_t b, int times) {
+  g_neoMode = NEO_MODE_OFF;
+  for (int i = 0; i < times; i++) {
+    leds[0] = CRGB(r, g, b); FastLED.show(); delay(150);
+    leds[0] = CRGB::Black;   FastLED.show(); if(i<times-1) delay(100);
+    esp_task_wdt_reset();
+  }
+}
+void neoPulse(uint8_t r, uint8_t g, uint8_t b) {
+  g_neoMode = NEO_MODE_PULSE; g_neoR = r; g_neoG = g; g_neoB = b;
+}
+void neoBreath(uint8_t r, uint8_t g, uint8_t b) {
+  g_neoMode = NEO_MODE_BREATH; g_neoR = r; g_neoG = g; g_neoB = b;
+}
+void neoSpin(uint8_t r, uint8_t g, uint8_t b) {
+  g_neoMode = NEO_MODE_SPIN; g_neoR = r; g_neoG = g; g_neoB = b;
+}
+void neoFade(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2, uint32_t durationMs) {
+  g_neoMode = NEO_MODE_OFF;
+  uint32_t start = millis();
+  while (millis() - start < durationMs) {
+    float p = (float)(millis() - start) / (float)durationMs;
+    leds[0] = CRGB(r1+(r2-r1)*p, g1+(g2-g1)*p, b1+(b2-b1)*p);
+    FastLED.show(); esp_task_wdt_reset(); delay(10);
+  }
+  leds[0] = CRGB(r2, g2, b2); FastLED.show();
+}
+void neoRainbow() {
+  g_neoMode = NEO_MODE_OFF;
+  for (int i=0; i<255; i++) {
+    leds[0] = CHSV(i, 255, 255); FastLED.show(); delay(5); esp_task_wdt_reset();
+  }
+}
+void neoTick() {
+  uint32_t now = millis();
+  if (recActive) {
+    if ((now / 1000) % 2 == 0) { leds[0] = CRGB(180, 0, 0); }
+    else { leds[0] = CRGB(60, 0, 0); }
+    FastLED.show(); return;
+  }
+  if (g_neoMode == NEO_MODE_OFF || g_neoMode == NEO_MODE_SOLID) return;
+  if (g_neoMode == NEO_MODE_BREATH) {
+    float v = (exp(sin(now/1500.0*PI)) - 0.36787944) * 0.42545906;
+    leds[0] = CRGB(g_neoR*v, g_neoG*v, g_neoB*v); FastLED.show();
+  } else if (g_neoMode == NEO_MODE_PULSE) {
+    float v = (sin(now/1000.0*PI) + 1.0) / 2.0;
+    leds[0] = CRGB(g_neoR*v, g_neoG*v, g_neoB*v); FastLED.show();
+  } else if (g_neoMode == NEO_MODE_SPIN) {
+    if (now - g_neoLastMs > 100) {
+      g_neoLastMs = now; g_neoState = !g_neoState;
+      leds[0] = g_neoState ? CRGB(g_neoR, g_neoG, g_neoB) : CRGB::Black;
+      FastLED.show();
+    }
+  }
+}
+
 void setup(){
   Serial.begin(115200);
   Serial.println("\n=== Sanzxcam v5.9-fix5 ===");
@@ -3751,7 +3849,7 @@ void setup(){
   galleryFileType=(GalleryFileType*)ps_malloc(GALLERY_MAX_FILES*sizeof(GalleryFileType));
   if(!galleryFiles||!galleryFileType){Serial.println("PSRAM alloc failed!");ESP.restart();}
 
-  pinMode(LED_PIN,  OUTPUT);digitalWrite(LED_PIN,  LOW);
+  neoSetup();
   pinMode(LED_FLASH,OUTPUT);digitalWrite(LED_FLASH,LOW);
   pinMode(BTN_BOOT, INPUT_PULLUP);
   pinMode(BTN_B,    INPUT_PULLUP);
@@ -3767,6 +3865,9 @@ void setup(){
   TJpgDec.setJpgScale(1);TJpgDec.setSwapBytes(true);TJpgDec.setCallback(tjpgdecOutput);
 
   sdReady=mountSDFull();
+  if(sdReady) { neoSolid(0, 80, 0); delay(3000); neoOff(); }
+  else neoPulse(200, 80, 0);
+  if(sdReady && sdTotalSectors > 0 && sdTotalSectors < 1000) neoPulse(180, 0, 0);
   if(sdReady){
     scanPhotoCount();
     scanVideoCount();
@@ -3814,12 +3915,12 @@ void setup(){
   if(!camOK){
     lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
     lcd.drawString("camera init failed",(DISP_W-lcd.textWidth("camera init failed"))/2,110);
-    while(true){blinkLED(3,100,100);delay(1000);}
+    while(true){neoPulse(180, 0, 0); neoTick(); delay(10); esp_task_wdt_reset();}
   }
 
   lcd.fillScreen(COL_BLACK);
   fpsLastTime=millis();fpsFrameCount=0;
-  blinkLED(3,120,120);
+  neoOff();
   blockingWaitAllRelease(600);
   Serial.println("[BOOT] Fixes applied: gyro-cal, no-autokal, hd-quality-map");
   resetAllButtons();
@@ -4100,6 +4201,7 @@ void handleModeDialogDelete(ButtonEvent evt){
 //  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 void loop(){
+  neoTick();
   esp_task_wdt_reset();
 
   if (g_hdrWaiting && (millis() - g_hdrFirstMs >= HDR_DOUBLE_TAP_MS)) {
