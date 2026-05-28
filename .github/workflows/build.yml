@@ -4,14 +4,17 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
+
       - name: Cache Arduino packages
         uses: actions/cache@v4
         with:
@@ -22,15 +25,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-arduino-esp32-2.0.17-v5-
             ${{ runner.os }}-arduino-
+
       - name: Install ESP32 Platform
         run: |
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.17
+
       - name: Clean Old Libraries and Cache
         run: |
           rm -rf ~/Arduino/libraries
           rm -rf ~/.arduino15/cache
           echo "Cleaned."
+
       - name: Install Libraries
         run: |
           arduino-cli lib install "LovyanGFX"
@@ -40,18 +46,27 @@ jobs:
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
           arduino-cli lib install "Adafruit NeoPixel"
+
       - name: Install esptool
         run: pip install esptool pyserial
+
       - name: Create output dir
         run: mkdir -p ./output
+
+      - name: Debug available boards
+        run: |
+          echo "=== ESP32S3 boards available ==="
+          arduino-cli board listall | grep -i s3 || true
+
       - name: Compile Sketch
         run: |
           arduino-cli compile \
-            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
-            --build-property "build.extra_flags=-DESP32 -DBOARD_HAS_PSRAM -DBitOrder=uint8_t" \
+            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi2 \
+            --build-property "build.extra_flags=-DESP32 -DBOARD_HAS_PSRAM" \
             --output-dir ./output \
             --verbose \
             camera_test/camera_test.ino
+
       - name: Merge Binaries
         run: |
           BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
@@ -71,6 +86,7 @@ jobs:
             0x8000 "$PARTITIONS" \
             0xe000 "$BOOTAPP0" \
             0x10000 "$APP"
+
       - name: Upload Firmware
         if: success()
         uses: actions/upload-artifact@v4
