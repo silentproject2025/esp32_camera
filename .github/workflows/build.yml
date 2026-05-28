@@ -53,12 +53,41 @@ jobs:
       - name: Create output dir
         run: mkdir -p ./output
 
-      - name: Debug FQBN options
-        run: |
-          echo "=== ESP32S3 PSRAM options ==="
-          arduino-cli board details --fqbn esp32:esp32:esp32s3 | grep -A5 -i psram
-          echo "=== All ESP32S3 options ==="
-          arduino-cli board details --fqbn esp32:esp32:esp32s3
-
       - name: Compile Sketch
-        run: echo "Lihat output Debug FQBN dulu sebelum compile"
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
+            --build-property "build.extra_flags=-DESP32 -DBOARD_HAS_PSRAM" \
+            --output-dir ./output \
+            --verbose \
+            camera_test/camera_test.ino
+
+      - name: Merge Binaries
+        run: |
+          BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
+          PARTITIONS=$(ls ./output/*.partitions.bin 2>/dev/null | head -1)
+          BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/ \
+            -name "boot_app0.bin" 2>/dev/null | head -1)
+          APP=$(ls ./output/camera_test.ino.bin 2>/dev/null | head -1)
+          echo "Bootloader : $BOOTLOADER"
+          echo "Partitions : $PARTITIONS"
+          echo "boot_app0  : $BOOTAPP0"
+          echo "App        : $APP"
+          esptool.py --chip esp32s3 merge_bin \
+            -o ./output/merged-firmware.bin \
+            --flash_mode dio \
+            --flash_size 16MB \
+            0x0000 "$BOOTLOADER" \
+            0x8000 "$PARTITIONS" \
+            0xe000 "$BOOTAPP0" \
+            0x10000 "$APP"
+
+      - name: Upload Firmware
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware-${{ github.sha }}
+          path: |
+            ./output/merged-firmware.bin
+            ./output/*.bin
+          retention-days: 30
