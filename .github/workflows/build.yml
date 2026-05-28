@@ -1,22 +1,17 @@
 name: Build ESP32
-
 on:
   push:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v2
-
       - name: Cache Arduino packages
         uses: actions/cache@v4
         with:
@@ -27,18 +22,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-arduino-esp32-2.0.17-v5-
             ${{ runner.os }}-arduino-
-
       - name: Install ESP32 Platform
         run: |
           arduino-cli core update-index
           arduino-cli core install esp32:esp32@2.0.17
-
       - name: Clean Old Libraries and Cache
         run: |
           rm -rf ~/Arduino/libraries
           rm -rf ~/.arduino15/cache
           echo "Cleaned."
-
       - name: Install Libraries
         run: |
           arduino-cli lib install "LovyanGFX"
@@ -47,13 +39,11 @@ jobs:
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
-
+          arduino-cli lib install "FastLED"
       - name: Install esptool
         run: pip install esptool pyserial
-
       - name: Create output dir
         run: mkdir -p ./output
-
       - name: Compile Sketch
         run: |
           arduino-cli compile \
@@ -62,7 +52,6 @@ jobs:
             --output-dir ./output \
             --verbose \
             camera_test/camera_test.ino
-
       - name: Merge Binaries
         run: |
           BOOTLOADER=$(ls ./output/*.bootloader.bin 2>/dev/null | head -1)
@@ -70,12 +59,10 @@ jobs:
           BOOTAPP0=$(find ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/ \
             -name "boot_app0.bin" 2>/dev/null | head -1)
           APP=$(ls ./output/camera_test.ino.bin 2>/dev/null | head -1)
-
           echo "Bootloader : $BOOTLOADER"
           echo "Partitions : $PARTITIONS"
           echo "boot_app0  : $BOOTAPP0"
           echo "App        : $APP"
-
           esptool.py --chip esp32s3 merge_bin \
             -o ./output/merged-firmware.bin \
             --flash_mode dio \
@@ -84,7 +71,6 @@ jobs:
             0x8000 "$PARTITIONS" \
             0xe000 "$BOOTAPP0" \
             0x10000 "$APP"
-
       - name: Upload Firmware
         if: success()
         uses: actions/upload-artifact@v4
