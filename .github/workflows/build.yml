@@ -39,7 +39,7 @@ jobs:
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
-          arduino-cli lib install "FastLED"
+          arduino-cli lib install "FastLED@3.6.0"
       - name: Install esptool
         run: pip install esptool pyserial
       - name: Create output dir
