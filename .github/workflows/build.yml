@@ -39,7 +39,7 @@ jobs:
           arduino-cli lib install "ArduinoJson"
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
-          arduino-cli lib install "FastLED@3.6.0"
+          arduino-cli lib install "Adafruit NeoPixel"
       - name: Install esptool
         run: pip install esptool pyserial
       - name: Create output dir
@@ -48,7 +48,7 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn esp32:esp32:esp32s3:FlashSize=16M,PartitionScheme=app3M_fat9M_16MB,PSRAM=opi \
-            --build-property "build.extra_flags=-DBOARD_HAS_PSRAM -DBitOrder=uint8_t" \
+            --build-property "build.extra_flags=-DESP32 -DBOARD_HAS_PSRAM -DBitOrder=uint8_t" \
             --output-dir ./output \
             --verbose \
             camera_test/camera_test.ino
