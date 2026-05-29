@@ -289,6 +289,9 @@ uint8_t g_neoR=0, g_neoG=0, g_neoB=0;
 uint32_t g_neoLastMs=0;
 bool g_neoState=false;
 AppMode prevMode = MODE_VIEWFINDER;
+AppMode prevMode = MODE_VIEWFINDER;
+static SemaphoreHandle_t mpuMutex = nullptr;
+static SemaphoreHandle_t neoMutex = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE DEFINITIONS
@@ -1770,8 +1773,6 @@ int      photoZoomOffY  = 0;
 float         recActualFps  = 15.0f;
 static TaskHandle_t  workerTaskHandle = nullptr;
 static QueueHandle_t recFrameQueue    = nullptr;
-static SemaphoreHandle_t mpuMutex     = nullptr;
-static SemaphoreHandle_t neoMutex     = nullptr;
 static uint16_t*     recEisBuf        = nullptr;
 
 struct RecFrame {
