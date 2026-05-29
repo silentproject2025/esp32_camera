@@ -2184,18 +2184,52 @@ void galleryUpdateHighlight(int oldSel,int newSel){
   }
 }
 
-// UI UPDATE v6.0
+void galleryGridUpdateHighlight(int oldSel, int newSel) {
+  int startIdx = (galleryScroll / 16) * 16;
+
+  // erase old highlight
+  int oldI = oldSel - startIdx;
+  if (oldI >= 0 && oldI < 16) {
+    int row = oldI / 4, col = oldI % 4;
+    int x = 4 + col * 78;
+    int y = 22 + row * 58;
+    lcd.drawRect(x, y, 76, 56, COL_GRAY_3);
+  }
+
+  // draw new highlight
+  int newI = newSel - startIdx;
+  if (newI >= 0 && newI < 16) {
+    int row = newI / 4, col = newI % 4;
+    int x = 4 + col * 78;
+    int y = 22 + row * 58;
+    lcd.drawRect(x, y, 76, 56, COL_WHITE);
+  }
+}
+
 void galleryStep(int delta){
   if(galleryCount<=0) return;
   int oldSel=gallerySelIdx;
   gallerySelIdx=(gallerySelIdx+delta%galleryCount+galleryCount)%galleryCount;
   if(gallerySelIdx==oldSel) return;
-  bool needRedraw=false;
+
   int pageSize = galleryGridMode ? 16 : GALLERY_ITEMS_PAGE;
-  if(gallerySelIdx<galleryScroll){galleryScroll=(gallerySelIdx / pageSize) * pageSize;needRedraw=true;}
-  else if(gallerySelIdx>=galleryScroll+pageSize){galleryScroll=(gallerySelIdx / pageSize) * pageSize;needRedraw=true;}
-  if(needRedraw) { if(galleryGridMode) drawGalleryGrid(); else drawGallery(); }
-  else { if(galleryGridMode) drawGalleryGrid(); else galleryUpdateHighlight(oldSel,gallerySelIdx); }
+  bool needRedraw = false;
+
+  if(gallerySelIdx < galleryScroll) {
+    galleryScroll = (gallerySelIdx / pageSize) * pageSize;
+    needRedraw = true;
+  } else if(gallerySelIdx >= galleryScroll + pageSize) {
+    galleryScroll = (gallerySelIdx / pageSize) * pageSize;
+    needRedraw = true;
+  }
+
+  if(needRedraw) {
+    if(galleryGridMode) drawGalleryGrid();
+    else drawGallery();
+  } else {
+    if(galleryGridMode) galleryGridUpdateHighlight(oldSel, gallerySelIdx);
+    else galleryUpdateHighlight(oldSel, gallerySelIdx);
+  }
 }
 
 bool photoLoadPixelBuf(int idx){
