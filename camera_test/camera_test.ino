@@ -1860,6 +1860,7 @@ int   mjpegFrame         = 0;
 unsigned long mjpegNotifUntilMs = 0;
 
 bool    mjpegLoop     = false;
+float    mjpegActualFps = 15.0f;
 uint8_t mjpegSpeedIdx = 1;
 const float mjpegSpeeds[3] = { 0.5f, 1.0f, 2.0f };
 
@@ -2654,6 +2655,20 @@ bool mjpegOpen(const char* filename){
   if(!mjpegBuf) return false;
   mjpegFile=fopen(path,"rb");
   if(!mjpegFile){free(mjpegBuf);mjpegBuf=nullptr;return false;}
+
+  mjpegActualFps = 15.0f;
+  char iniPath[48]; strncpy(iniPath, path, sizeof(iniPath)-1);
+  char* dot = strrchr(iniPath, '.');
+  if(dot) strcpy(dot, ".ini");
+  FILE* fIni = fopen(iniPath, "r");
+  if(fIni){
+    char line[48];
+    while(fgets(line, sizeof(line), fIni)){
+      sscanf(line, "fps=%f", &mjpegActualFps);
+    }
+    fclose(fIni);
+  }
+
   fileStream.f=mjpegFile;
   mjpeg.setup(&fileStream,mjpegBuf,jpegDrawCallback,true,0,0,DISP_W,DISP_H);
   strncpy(mjpegPath,filename,sizeof(mjpegPath)-1);
@@ -2661,7 +2676,6 @@ bool mjpegOpen(const char* filename){
   mjpegFrame=0;mjpegPlaying=true;mjpegPaused=false;mjpegNotifUntilMs=0;
   lcd.fillScreen(COL_BLACK); return true;
 }
-
 void mjpegClose(){
   if(mjpegFile){fclose(mjpegFile);mjpegFile=nullptr;}
   if(mjpegBuf){free(mjpegBuf);mjpegBuf=nullptr;}
@@ -2685,18 +2699,19 @@ void mjpegClearNotif(){
 }
 
 void mjpegDrawHUD(){
-  char buf[24];
-  snprintf(buf,sizeof(buf),"%.1f\xd7  %s",(double)mjpegSpeeds[mjpegSpeedIdx],mjpegLoop?"LOOP":"-");
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%.1f\xd7 %.0ffps %s", (double)mjpegSpeeds[mjpegSpeedIdx], (double)mjpegActualFps, mjpegLoop ? "LOOP" : "-");
   lcd.setFont(&fonts::Font0);
   int tw=lcd.textWidth(buf),pw=tw+10,ph=13;
   lcd.fillRoundRect(4,4,pw,ph,4,COL_PILL_BG);
   lcd.setTextColor(COL_GRAY_A);lcd.drawString(buf,9,6);
 }
 
+
+
 void loopMjpegPlayer(){
   if(!mjpegPlaying) return;
   if(!mjpegPaused){
-    int64_t frameStart=esp_timer_get_time();
     bool ok=mjpeg.readMjpegBuf();
     if(!ok){
       if(mjpegLoop){
@@ -2708,20 +2723,16 @@ void loopMjpegPlayer(){
     }
     mjpeg.drawJpg();mjpegFrame++;mjpegDrawHUD();
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
-    float speed=mjpegSpeeds[mjpegSpeedIdx];
-    int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
-    int64_t remain=targetUs-(esp_timer_get_time()-frameStart);
-    if(remain>1000){
-      int64_t waitEnd=esp_timer_get_time()+remain;
-      while(esp_timer_get_time()<waitEnd){delayMicroseconds(500);esp_task_wdt_reset();}
-    }
+    float speed = mjpegSpeeds[mjpegSpeedIdx];
+    uint32_t frameIntervalMs = (uint32_t)(1000.0f / (mjpegActualFps * speed));
+    frameIntervalMs = constrain(frameIntervalMs, 16, 500); // clamp between 2fps and 62fps
+    vTaskDelay(pdMS_TO_TICKS(frameIntervalMs));
   } else {
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
     delay(16);
   }
   esp_task_wdt_reset();
 }
-
 void openMjpegPlayer(const char* filename){
   mjpegLoop=false;mjpegSpeedIdx=1;
   if(!mjpegOpen(filename)){
@@ -2767,14 +2778,20 @@ void startRecording() {
 void stopRecording(){
   if(!recActive||!recFile) return;
   fclose(recFile);recFile=nullptr;recActive=false;
+  float actualFps = (float)recFrameCount / ((millis() - recStartMs) / 1000.0f);
+  char iniPath[48]; snprintf(iniPath, sizeof(iniPath), "/sdcard/video_%04d.ini", recVideoCount);
+  FILE* fIni = fopen(iniPath, "w");
+  if(fIni){
+    fprintf(fIni, "fps=%.2f\n", actualFps);
+    fprintf(fIni, "frames=%d\n", recFrameCount);
+    fclose(fIni);
+  }
   unsigned long dur=(millis()-recStartMs)/1000;
   char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
   islandPush(NOTIF_OK,buf);
   neoBurst(0, 180, 0, 3); neoOff();
   fpsLastTime=millis();fpsFrameCount=0;
 }
-
-
 void recordFrame() {
   if (!recActive || !recFile) return;
   camera_fb_t* fb = esp_camera_fb_get();
