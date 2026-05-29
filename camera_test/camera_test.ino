@@ -487,7 +487,7 @@ static bool hdrEnabled = true;
 static bool autoRotateEnabled = true;
 static bool mpuLogEnabled = false;
 static bool hudEnabled = true;
-static bool galleryGridMode = false;
+static bool galleryGridMode = true;
 static bool galleryGridActive = false;
 static int menuFeatSel = 0;
 static bool hdCaptureEnabled = false;
@@ -2352,8 +2352,10 @@ void drawDeleteDialog(const char* filename){
 
 void openDeleteDialog(){
   drawDeleteDialog(galleryFiles[photoViewIndex]);
-  deleteDialogOpenMs=millis();
-  resetAllButtons(); appMode=MODE_DIALOG_DELETE;
+  deleteDialogOpenMs = millis();
+  blockingWaitAllRelease(600);  // TAMBAH INI sebelum resetAllButtons
+  resetAllButtons();
+  appMode = MODE_DIALOG_DELETE;
   neoFade(180,0,0, 0,0,0, 8000);
 }
 
