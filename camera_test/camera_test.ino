@@ -1086,10 +1086,20 @@ void drawFeaturesMenu(int sel) {
   lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 14);
 }
 
+// UI UPDATE v6.0
 void handleModeFeatures(ButtonEvent evt) {
   if (!evt.valid) return;
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
+
+  if (evt.pin == BTN_B && evt.isShort) {
+    saveSettings();
+    appMode = MODE_VIEWFINDER;
+    islandNoClear = true;
+    lcd.fillScreen(COL_BLACK);
+    resetAllButtons();
+    return;
+  }
 
   if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 11; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 10) % 11; drawFeaturesMenu(menuFeatSel); }
@@ -1099,7 +1109,7 @@ void handleModeFeatures(ButtonEvent evt) {
       char buf[32]; snprintf(buf, sizeof(buf), "%s %s", labs[menuFeatSel], *feats[menuFeatSel] ? "ON" : "OFF");
       if (menuFeatSel == 4) { // HUD toggle
         saveSettings();
-        islandPush(NOTIF_INFO, *feats[menuFeatSel] ? "HUD ON" : "HUD OFF");
+        islandPush(NOTIF_INFO, hudEnabled ? "HUD ON" : "HUD OFF");
       } else {
         islandPush(NOTIF_INFO, buf);
       }
@@ -1137,6 +1147,7 @@ void handleModeFeatures(ButtonEvent evt) {
     }
   }
 }
+// UI UPDATE v6.0
 void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
@@ -1159,6 +1170,7 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     const AIFeatureDef& feat = AI_FEATURES[i];
     bool isSelected = (i == sel);
     int iy = startY + i * itemH;
+
     uint16_t rowBg = isSelected ? (((feat.iconColor >> 3) & 0x18C3) | 0x1082) : (i % 2 == 0 ? COL_GRAY_D : COL_BLACK);
     lcd.fillRect(0, iy, DISP_W, itemH - 1, rowBg);
     lcd.drawFastHLine(0, iy + itemH - 1, DISP_W, COL_GRAY_2);
@@ -1166,13 +1178,17 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_5);
     lcd.drawString(numBuf, 5, iy + 10);
     int iconX = 18, iconY = iy + 6;
+
     uint16_t icBg = isSelected ? feat.iconColor : ((feat.iconColor >> 2) & 0x39E7);
     lcd.fillRect(iconX, iconY, 14, 14, icBg);
+
     lcd.setTextColor(isSelected ? COL_BLACK : COL_GRAY_7);
     int iconTw = lcd.textWidth(feat.icon);
     lcd.drawString(feat.icon, iconX + (14 - iconTw) / 2, iconY + 3);
+
     lcd.setTextColor(isSelected ? COL_WHITE : COL_GRAY_C);
     lcd.drawString(feat.label, 38, iy + 10);
+
     if (isSelected) {
       lcd.setTextColor(feat.iconColor);
       lcd.drawString(">", DISP_W - 12, iy + 10);
@@ -1198,10 +1214,8 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("C=naik", 4, DISP_H - 14);
   lcd.drawString("D=turun", 60, DISP_H - 14);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("BOOT=jalankan", 120, DISP_H - 14);
-  lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("B=batal", DISP_W - 46, DISP_H - 14);
+  lcd.drawString("BOOT=pilih", 130, DISP_H - 14);
+  lcd.drawString("B=batal", 240, DISP_H - 14);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2011,20 +2025,31 @@ void drawGalleryGrid() {
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0);
   lcd.setTextColor(COL_GRAY_E);
-  char head[32];
+
   int currentPage = galleryScroll / 16 + 1;
   int totalPage = max(1, (galleryCount + 15) / 16);
-  snprintf(head, sizeof(head), "GALLERY GRID %d/%d", currentPage, totalPage);
-  lcd.drawString(head, (DISP_W - lcd.textWidth(head)) / 2, 6);
+  char hdr[32];
+  snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
+  lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+  lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK", DISP_W - 46, 6);
+  char pageInfo[8]; snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
+  lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo, 4, 6);
+
+  if (galleryCount == 0) {
+    lcd.setTextColor(COL_GRAY_5);
+    const char* msg = "SD kosong / tidak ada file";
+    lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, DISP_H / 2); return;
+  }
 
   int startIdx = (galleryScroll / 16) * 16;
   for (int i = 0; i < 16; i++) {
     int idx = startIdx + i;
     if (idx >= galleryCount) break;
     int row = i / 4, col = i % 4;
-    int x = col * 78 + 4, y = 22 + row * 58 + 4;
-    bool isSelected = (idx == gallerySelIdx);
+    int x = 4 + col * (76 + 2);
+    int y = 22 + row * (56 + 2);
 
+    bool isSelected = (idx == gallerySelIdx);
     lcd.fillRect(x, y, 76, 56, isSelected ? COL_GRAY_5 : COL_GRAY_D);
     lcd.drawRect(x, y, 76, 56, isSelected ? COL_WHITE : COL_GRAY_3);
 
@@ -2032,9 +2057,8 @@ void drawGalleryGrid() {
     if (ft == GFILE_JPG) {
       char path[64]; snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
       bool ok = false;
-      struct stat st; if (stat(path, &st) == 0 && st.st_size < 200 * 1024) {
-        if (TJpgDec.setJpgScale(8), TJpgDec.drawSdJpg(x + 18, y + 13, path) == JDR_OK) ok = true;
-      }
+      TJpgDec.setJpgScale(8);
+      if (TJpgDec.drawSdJpg(x + 18, y + 13, path) == JDR_OK) ok = true;
       if (!ok) {
         lcd.setTextColor(COL_GRAY_7);
         char fn[12]; strncpy(fn, galleryFiles[idx], 8); fn[8] = 0;
@@ -2061,21 +2085,18 @@ void drawGalleryGrid() {
   if (galleryCount > 16) {
     int barH = DISP_H - 22, indH = max(10, barH * 16 / galleryCount);
     int indY = 22 + (barH - indH) * (galleryScroll / 16) / max(1, (galleryCount - 1) / 16);
-  int currentPage=galleryScroll/(galleryGridMode ? 16 : GALLERY_ITEMS_PAGE)+1;
-  int totalPage=max(1,(galleryCount+(galleryGridMode ? 15 : GALLERY_ITEMS_PAGE-1))/(galleryGridMode ? 16 : GALLERY_ITEMS_PAGE));
+    lcd.fillRect(DISP_W - 4, 22, 4, barH, COL_GRAY_2);
     lcd.fillRect(DISP_W - 4, indY, 4, indH, COL_GRAY_7);
   }
 
-  lcd.fillRect(0, DISP_H - 18, DISP_W, 18, COL_GRAY_D);
-  lcd.drawFastHLine(0, DISP_H - 18, DISP_W, COL_GRAY_3);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_2);
-  const char* hint = "B-long=list  BOOT=buka  D-long=AI";
-  lcd.drawString(hint, (DISP_W - lcd.textWidth(hint)) / 2, DISP_H - 12);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
+  const char* footer = "B-long=list  BOOT=buka  D-long=AI";
+  lcd.drawString(footer, (DISP_W - lcd.textWidth(footer)) / 2, DISP_H - 10);
 }
 
 //  Gallery draw functions
 // ─────────────────────────────────────────────────────────────────────────────
+// UI UPDATE v6.0
 void drawGallery(){
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
@@ -2135,6 +2156,7 @@ void galleryUpdateHighlight(int oldSel,int newSel){
   }
 }
 
+// UI UPDATE v6.0
 void galleryStep(int delta){
   if(galleryCount<=0) return;
   int oldSel=gallerySelIdx;
@@ -2294,36 +2316,38 @@ void photoViewClearCaption(){
 // ─────────────────────────────────────────────────────────────────────────────
 // UI UPDATE v6.0
 void drawDeleteDialog(const char* filename){
-  int dw=200,dh=88,dx=(DISP_W-dw)/2,dy=(DISP_H-dh)/2;
-  lcd.fillRoundRect(dx,dy,dw,dh,4,COL_BLACK);
-  lcd.drawRoundRect(dx,dy,dw,dh,4,0xF800);
-  lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
+  int dw=200, dh=88, dx=(DISP_W-dw)/2, dy=(DISP_H-dh)/2;
+  lcd.fillRoundRect(dx, dy, dw, dh, 4, COL_BLACK);
+  lcd.drawRoundRect(dx, dy, dw, dh, 4, 0xF800);
+
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(0xF800);
-  const char* title="HAPUS FILE?";
-  lcd.drawString(title,dx+(dw-lcd.textWidth(title))/2,dy+8);
+  const char* title = "HAPUS FILE?";
+  lcd.drawString(title, dx+(dw-lcd.textWidth(title))/2, dy+8);
+
   lcd.setTextColor(COL_GRAY_5);
-  char truncName[28]; strncpy(truncName,filename,27);truncName[27]=0;
-  lcd.drawString(truncName,dx+(dw-lcd.textWidth(truncName))/2,dy+22);
+  char truncName[28]; strncpy(truncName, filename, 27); truncName[27]=0;
+  lcd.drawString(truncName, dx+(dw-lcd.textWidth(truncName))/2, dy+22);
 
-  // Timer bar background
-  lcd.fillRect(dx+10,dy+36,dw-20,4,COL_GRAY_2);
+  // Timer bar background only — actual fill drawn in handleModeDialogDelete
+  lcd.fillRect(dx+10, dy+36, dw-20, 4, COL_GRAY_2);
 
-  // Buttons row
-  int by = dy + 50;
-  int b1w = lcd.textWidth("BOOT = HAPUS") + 16, b1h = 14;
-  int b2w = lcd.textWidth("B = batal") + 16, b2h = 14;
-  int gap = 6;
-  int totalW = b1w + b2w + gap;
-  int bx = dx + (dw - totalW)/2;
+  // Button row
+  int by = dy+50;
+  int b1w = lcd.textWidth("BOOT = HAPUS")+16, b1h=14;
+  int b2w = lcd.textWidth("B = batal")+16,    b2h=14;
+  int gap2 = 6;
+  int totalW = b1w+b2w+gap2;
+  int bx = dx+(dw-totalW)/2;
 
   lcd.drawRect(bx, by, b1w, b1h, 0xA000);
   lcd.setTextColor(0xF800);
-  lcd.drawString("BOOT = HAPUS", bx + 8, by + 3);
+  lcd.drawString("BOOT = HAPUS", bx+8, by+3);
 
-  int bx2 = bx + b1w + gap;
+  int bx2 = bx+b1w+gap2;
   lcd.drawRect(bx2, by, b2w, b2h, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("B = batal", bx2 + 8, by + 3);
+  lcd.drawString("B = batal", bx2+8, by+3);
 }
 
 void openDeleteDialog(){
@@ -2467,61 +2491,63 @@ void openFormatMenu(){
 void drawExpMenu(int sel){
   lcd.fillScreen(COL_BLACK);
 
-  // TOP SECTION: Arc Meter
-  int ax=160, ay=80, rOut=55, rIn=49;
-  lcd.fillArc(ax, ay, rOut, rIn, 180, 180 + (sel * 36), COL_GRAY_7);
-  lcd.fillArc(ax, ay, rOut, rIn, 180 + (sel * 36), 360, COL_GRAY_2);
+  // Arc meter — centered at x=160, y=80
+  lcd.fillArc(160, 80, 55, 49, 180, 180 + (sel * 36), COL_GRAY_7);
+  lcd.fillArc(160, 80, 55, 49, 180 + (sel * 36), 360, COL_GRAY_2);
 
-  lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(COL_WHITE);
-  lcd.drawString(expPresetNames[sel], ax - lcd.textWidth(expPresetNames[sel])/2, ay - 15);
+  // Preset name center of arc
+  lcd.setFont(&fonts::FreeSansBold9pt7b);
+  lcd.setTextColor(COL_WHITE);
+  lcd.drawString(expPresetNames[sel], 160 - lcd.textWidth(expPresetNames[sel])/2, 65);
+
+  // Index below name
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
   char idxBuf[8]; snprintf(idxBuf, sizeof(idxBuf), "%d/5", sel);
-  lcd.drawString(idxBuf, ax - lcd.textWidth(idxBuf)/2, ay + 5);
+  lcd.drawString(idxBuf, 160 - lcd.textWidth(idxBuf)/2, 82);
 
-  // MIDDLE SECTION: chips
-  const char* shorts[6] = {"AUTO", "GRAY", "MOON", "NIGHT", "N-BW", "MAN"};
+  // Chip row — 6 chips, centered, 46x20px each, 4px gap
+  const char* shorts[6] = {"AUTO","GRAY","MOON","NIGHT","N-BW","MAN"};
   int cw=46, ch=20, gap=4;
   int tw = 6*cw + 5*gap;
   int sx = (DISP_W - tw) / 2;
   for(int i=0; i<6; i++){
-    int ix = sx + i*(cw + gap);
-    int iy = 100;
-    lcd.fillRoundRect(ix, iy, cw, ch, 3, (i==sel)?COL_WHITE:COL_GRAY_D);
+    int ix = sx + i*(cw+gap), iy = 100;
+    lcd.fillRoundRect(ix, iy, cw, ch, 3, i==sel ? COL_WHITE : COL_GRAY_D);
     if(i==sel) lcd.drawRoundRect(ix, iy, cw, ch, 3, COL_WHITE);
     lcd.setFont(&fonts::Font0);
-    lcd.setTextColor((i==sel)?COL_BLACK:COL_GRAY_5);
-    lcd.drawString(shorts[i], ix + (cw - lcd.textWidth(shorts[i]))/2, iy + 6);
+    lcd.setTextColor(i==sel ? COL_BLACK : COL_GRAY_5);
+    lcd.drawString(shorts[i], ix+(cw-lcd.textWidth(shorts[i]))/2, iy+6);
   }
 
-  // BOTTOM SECTION
+  // Bottom section
   int by = 140;
   if(sel == 5){
     lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextSize(2);
     lcd.setTextColor(COL_GRAY_C);
     char valBuf[16]; snprintf(valBuf, sizeof(valBuf), "%d", expManualVal);
-    lcd.drawString(valBuf, (DISP_W - lcd.textWidth(valBuf))/2, by + 10);
+    lcd.drawString(valBuf, (DISP_W-lcd.textWidth(valBuf))/2, by+10);
     lcd.setTextSize(1); lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_3);
-    lcd.drawString("C/D = adjust  B = gain", (DISP_W - lcd.textWidth("C/D = adjust  B = gain"))/2, by + 50);
+    lcd.drawString("C/D = adjust  B = gain", (DISP_W-lcd.textWidth("C/D = adjust  B = gain"))/2, by+50);
   } else {
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
     const char* descs[5] = {
-      "kamera atur otomatis",
-      "grayscale effect",
-      "objek terang / bulan",
-      "malam gelap",
-      "malam grayscale"
+      "kamera atur otomatis", "grayscale effect",
+      "objek terang / bulan", "malam gelap", "malam grayscale"
     };
-    lcd.drawString(descs[sel], (DISP_W - lcd.textWidth(descs[sel]))/2, by + 20);
+    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
+    lcd.drawString(descs[sel], (DISP_W-lcd.textWidth(descs[sel]))/2, by+20);
   }
 
+  // Footer
   lcd.setTextColor(COL_GRAY_3);
-  lcd.drawString("C/D=pilih  BOOT=ok  B=batal", (DISP_W - lcd.textWidth("C/D=pilih  BOOT=ok  B=batal"))/2, DISP_H - 30);
+  lcd.drawString("C/D=pilih  BOOT=ok  B=batal", (DISP_W-lcd.textWidth("C/D=pilih  BOOT=ok  B=batal"))/2, DISP_H-30);
+
+  // GC2145 format line (keep as-is from original)
   if(detectedSensor==PID_GC2145){
     lcd.setTextColor(COL_GRAY_5);
     char fmtBuf[32];
     snprintf(fmtBuf,sizeof(fmtBuf),"Format: %s  [D-long=ganti]",
              gc2145CaptureFormat==GFMT_BMP?"BMP":"JPG");
-    lcd.drawString(fmtBuf, (DISP_W - lcd.textWidth(fmtBuf))/2, DISP_H - 14);
+    lcd.drawString(fmtBuf,(DISP_W-lcd.textWidth(fmtBuf))/2, DISP_H-14);
   }
 }
 void drawExpAdjOverlay(){
@@ -3363,12 +3389,11 @@ void renderViewfinder(){
       uint16_t bktCol=recActive?0xF800:(COL_GRAY_E);
       drawCornerBrackets(bktCol);
 
-      if (!hudEnabled) {
-        if (recActive) {
-          bool blink = (millis() / 500) % 2;
-          lcd.fillCircle(10, 10, 4, blink ? 0xF800 : 0x4000);
-        }
-      } else {
+      if (recActive) {
+        lcd.fillCircle(10, 10, 4, (millis()/500%2) ? 0xF800 : 0x4000);
+      }
+
+      if (hudEnabled) {
         char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
         drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
         if (!recActive && !g_tilted && !g_shake) neoBreath(0, 0, 80);
@@ -4078,6 +4103,7 @@ void handleModeViewfinder(ButtonEvent evt){
   }
 }
 
+// UI UPDATE v6.0
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){
@@ -4295,14 +4321,16 @@ void handleModeMenuExpAdj(ButtonEvent evt){
   if(changed) applyExpPreset(5);
 }
 
+// UI UPDATE v6.0
 void handleModeDialogDelete(ButtonEvent evt){
   unsigned long elapsed=millis()-deleteDialogOpenMs;
   if(elapsed<DELETE_TIMEOUT_MS){
-    int dw=200,dh=88,dx=(DISP_W-dw)/2,dy=(DISP_H-dh)/2;
-    int barW=180,prog=(int)(barW * (1.0 - (double)elapsed/DELETE_TIMEOUT_MS));
-    prog=constrain(prog,0,barW);
-    lcd.fillRect(dx+10,dy+36,barW,4,COL_GRAY_2);
-    lcd.fillRect(dx+10,dy+36,prog,4,0xF800);
+    int dw=200, dh=88, dx=(DISP_W-dw)/2, dy=(DISP_H-dh)/2;
+    int barW=dw-20;
+    int prog = (int)(barW * (1.0 - (double)elapsed/DELETE_TIMEOUT_MS));
+    prog = constrain(prog, 0, barW);
+    lcd.fillRect(dx+10, dy+36, barW, 4, COL_GRAY_2);
+    lcd.fillRect(dx+10, dy+36, prog,  4, 0xF800);
   } else {
     resetAllButtons();showPhotoView(photoViewIndex);return;
   }
