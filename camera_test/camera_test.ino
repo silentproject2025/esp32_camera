@@ -171,28 +171,9 @@ public:
     }
     setPanel(&_panel_instance);
   }
-
-  void setScrollArea(uint16_t tfa, uint16_t vsa, uint16_t bfa) {
-    _panel_instance.startWrite();
-    _panel_instance.writeCommand(0x33, 8);
-    _panel_instance.writeData(tfa >> 8, 8);
-    _panel_instance.writeData(tfa & 0xFF, 8);
-    _panel_instance.writeData(vsa >> 8, 8);
-    _panel_instance.writeData(vsa & 0xFF, 8);
-    _panel_instance.writeData(bfa >> 8, 8);
-    _panel_instance.writeData(bfa & 0xFF, 8);
-    _panel_instance.endWrite();
-  }
-
-  void scroll(uint16_t vsp) {
-    _panel_instance.startWrite();
-    _panel_instance.writeCommand(0x37, 8);
-    _panel_instance.writeData(vsp >> 8, 8);
-    _panel_instance.writeData(vsp & 0xFF, 8);
-    _panel_instance.endWrite();
-  }
 };
 
+static LGFX lcd;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pin Kamera
@@ -201,7 +182,6 @@ public:
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM  15
 #define SIOD_GPIO_NUM   4
-static LGFX lcd;
 #define SIOC_GPIO_NUM   5
 #define Y9_GPIO_NUM    16
 #define Y8_GPIO_NUM    17
@@ -508,9 +488,6 @@ static bool autoRotateEnabled = true;
 static bool mpuLogEnabled = false;
 static bool hudEnabled = true;
 static bool galleryGridMode = true;
-static int  gridScrollRow    = 0;   // index of topmost visible row (0-based)
-static int  gridHWOffset     = 0;   // current hardware scroll offset in pixels
-static bool gridScrollInited = false; // whether scroll area has been set up
 static bool galleryGridActive = false;
 static int menuFeatSel = 0;
 static bool hdCaptureEnabled = false;
@@ -2040,160 +2017,8 @@ void scanGalleryFiles(){
   }
 }
 
-int gridTotalRows() {
-  return (galleryCount + 3) / 4;  // ceil(galleryCount / 4)
-}
-
-void gridRenderRow(int rowIdx, int screenY) {
-  for (int col = 0; col < 4; col++) {
-    int idx = rowIdx * 4 + col;
-    int x = 4 + col * 78;
-    int y = screenY;
-
-    // clear cell background
-    bool isSelected = (idx == gallerySelIdx);
-    lcd.fillRect(x, y, 76, 56, isSelected ? COL_GRAY_5 : COL_GRAY_D);
-    lcd.drawRect(x, y, 76, 56, isSelected ? COL_WHITE : COL_GRAY_3);
-
-    if (idx >= galleryCount) continue;  // empty cell, just background
-
-    GalleryFileType ft = galleryFileType[idx];
-
-    if (ft == GFILE_JPG) {
-      char path[64]; snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
-      bool ok = false;
-      FILE* f = fopen(path, "rb");
-      if (f) {
-        fseek(f, 0, SEEK_END);
-        size_t fsize = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (fsize > 0 && fsize < 250000) {
-          uint8_t* buf = (uint8_t*)ps_malloc(fsize);
-          if (buf) {
-            if (fread(buf, 1, fsize, f) == fsize) {
-              uint16_t tw = 0, th = 0;
-              TJpgDec.setJpgScale(4);
-              TJpgDec.setSwapBytes(true);
-              TJpgDec.setCallback(tjpgdecOutput);
-              _decodeTargetBuf = nullptr;
-              if (TJpgDec.getJpgSize(&tw, &th, buf, fsize) == JDR_OK && tw > 0 && th > 0) {
-                int tx = x + 2 + (72 - min((int)tw, 72)) / 2;
-                int ty = y + 2 + (42 - min((int)th, 42)) / 2;
-                lcd.setClipRect(x + 2, y + 2, 72, 42);
-                if (TJpgDec.drawJpg(tx, ty, buf, fsize) == JDR_OK) ok = true;
-                lcd.clearClipRect();
-              }
-            }
-            free(buf);
-          }
-        }
-        fclose(f);
-      }
-      TJpgDec.setJpgScale(1);
-      if (!ok) {
-        lcd.setTextColor(COL_GRAY_5);
-        lcd.setFont(&fonts::Font0);
-        lcd.drawString("JPG", x + 28, y + 20);
-      }
-    } else if (ft == GFILE_BMP) {
-      for (int r = 0; r < 42; r++) {
-        uint16_t gCol = lcd.color565(0, 0, 20 + r / 2);
-        lcd.drawFastHLine(x + 2, y + 2 + r, 72, gCol);
-      }
-      lcd.setFont(&fonts::Font0);
-      lcd.setTextColor(COL_BMP_ACCENT);
-      lcd.drawString("BMP", x + (76 - lcd.textWidth("BMP")) / 2, y + 18);
-    } else if (ft == GFILE_VIDEO) {
-      lcd.fillRect(x + 2, y + 2, 72, 42, COL_GRAY_2);
-      int cx = x + 38, cy = y + 21;
-      lcd.fillTriangle(cx - 8, cy - 8, cx - 8, cy + 8, cx + 10, cy, COL_GRAY_7);
-      lcd.setFont(&fonts::Font0);
-      lcd.setTextColor(COL_VID_ACCENT);
-    }
-
-    // index number bottom-left of cell
-    lcd.setFont(&fonts::Font0);
-    lcd.setTextColor(COL_GRAY_3);
-    char idxBuf[8]; snprintf(idxBuf, sizeof(idxBuf), "%d", idx + 1);
-    lcd.drawString(idxBuf, x + 4, y + 46);
-
-    esp_task_wdt_reset();
-  }
-}
-
-void drawGalleryGridScroll() {
-  // Draw fixed header
-  lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
-  lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_E);
-  char hdr[32]; snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
-  lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
-  lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK", DISP_W - 46, 6);
-
-  if (galleryCount == 0) {
-    lcd.fillRect(0, 20, DISP_W, 208, COL_BLACK);
-    lcd.setTextColor(COL_GRAY_5);
-    const char* msg = "SD kosong / tidak ada file";
-    lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, DISP_H / 2);
-    return;
-  }
-
-  // Setup hardware scroll area: top=20, scroll=208, bottom=12
-  lcd.setScrollArea(20, 208, 12);
-  gridHWOffset  = 0;
-  gridScrollRow = 0;
-  gridScrollInited = true;
-  lcd.scroll(0);  // reset scroll position
-
-  // Clear grid area
-  lcd.fillRect(0, 20, DISP_W, 208, COL_BLACK);
-
-  // Render first 4 visible rows (rows 0..3)
-  int totalRows = gridTotalRows();
-  for (int r = 0; r < min(4, totalRows); r++) {
-    gridRenderRow(r, 20 + r * 58);
-    esp_task_wdt_reset();
-  }
-
-  // Draw fixed footer
-  lcd.fillRect(0, DISP_H - 12, DISP_W, 12, COL_GRAY_D);
-  lcd.drawFastHLine(0, DISP_H - 12, DISP_W, COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
-  const char* footer = "B-long=list  BOOT=buka  D-long=AI";
-  lcd.drawString(footer, (DISP_W - lcd.textWidth(footer)) / 2, DISP_H - 10);
-}
-
-void gridScrollDown() {
-  int totalRows = gridTotalRows();
-  if (gridScrollRow + 4 >= totalRows) return;  // already at bottom
-  gridScrollRow++;
-
-  // Hardware scroll up 58px
-  gridHWOffset = (gridHWOffset + 58) % 208;
-  lcd.scroll(gridHWOffset);
-
-  // Render new bottom row at virtual position
-  int newRowIdx = gridScrollRow + 3;
-  // screenY in hardware scroll virtual space:
-  int screenY = 20 + ((gridScrollRow + 3) * 58) % 208;
-  gridRenderRow(newRowIdx, screenY);
-  esp_task_wdt_reset();
-}
-
-void gridScrollUp() {
-  if (gridScrollRow <= 0) return;  // already at top
-  gridScrollRow--;
-
-  // Hardware scroll down 58px
-  gridHWOffset = (gridHWOffset - 58 + 208) % 208;
-  lcd.scroll(gridHWOffset);
-
-  // Render new top row
-  int screenY = 20 + (gridScrollRow * 58) % 208;
-  gridRenderRow(gridScrollRow, screenY);
-  esp_task_wdt_reset();
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// UI UPDATE v6.0
 void drawGalleryGrid() {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
@@ -2381,60 +2206,35 @@ void galleryGridUpdateHighlight(int oldSel, int newSel) {
   }
 }
 
+void galleryStep(int delta){
+  if(galleryCount<=0) return;
+  int oldSel=gallerySelIdx;
+  gallerySelIdx=(gallerySelIdx+delta%galleryCount+galleryCount)%galleryCount;
+  if(gallerySelIdx==oldSel) return;
 
-void galleryStep(int delta) {
-  if (galleryCount <= 0) return;
-  int oldSel = gallerySelIdx;
-  gallerySelIdx = (gallerySelIdx + delta % galleryCount + galleryCount) % galleryCount;
-  if (gallerySelIdx == oldSel) return;
+  int pageSize = galleryGridMode ? 16 : GALLERY_ITEMS_PAGE;
+  bool needRedraw = false;
 
-  if (!galleryGridMode) {
-    // LIST MODE: existing page logic
-    bool needRedraw = false;
-    if (gallerySelIdx < galleryScroll) {
-      galleryScroll = (gallerySelIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
-      needRedraw = true;
-    } else if (gallerySelIdx >= galleryScroll + GALLERY_ITEMS_PAGE) {
-      galleryScroll = (gallerySelIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
-      needRedraw = true;
-    }
-    if (needRedraw) drawGallery();
+  if(gallerySelIdx < galleryScroll) {
+    galleryScroll = (gallerySelIdx / pageSize) * pageSize;
+    needRedraw = true;
+  } else if(gallerySelIdx >= galleryScroll + pageSize) {
+    galleryScroll = (gallerySelIdx / pageSize) * pageSize;
+    needRedraw = true;
+  }
+
+  if(needRedraw) {
+    if(galleryGridMode) drawGalleryGrid();
+    else drawGallery();
+  } else {
+    if(galleryGridMode) galleryGridUpdateHighlight(oldSel, gallerySelIdx);
     else galleryUpdateHighlight(oldSel, gallerySelIdx);
-    return;
   }
-
-  // GRID MODE: row-based scroll
-  int newRow = gallerySelIdx / 4;
-  int oldRow = oldSel / 4;
-  int visibleTopRow = gridScrollRow;
-  int visibleBotRow = gridScrollRow + 3;
-
-  // Scroll display to keep new selection visible
-  while (newRow < gridScrollRow) gridScrollUp();
-  while (newRow > gridScrollRow + 3) gridScrollDown();
-
-  // Update highlight only — redraw old and new cell border
-  int startIdx = gridScrollRow * 4;
-
-  // erase old highlight
-  int oldCellRow = oldSel / 4;
-  int oldCellCol = oldSel % 4;
-  int oldScreenY = 20 + ((oldCellRow - gridScrollRow + 4) % 4) * 58;
-  // only erase if it was on screen before scroll
-  if (oldCellRow >= visibleTopRow && oldCellRow <= visibleBotRow) {
-    int x = 4 + oldCellCol * 78;
-    lcd.drawRect(x, oldScreenY, 76, 56, COL_GRAY_3);
-  }
-
-  // draw new highlight
-  int newCellCol = gallerySelIdx % 4;
-  int newScreenY = 20 + ((newRow - gridScrollRow + 4) % 4) * 58;
-  int x = 4 + newCellCol * 78;
-  lcd.drawRect(x, newScreenY, 76, 56, COL_WHITE);
 }
+
 bool photoLoadPixelBuf(int idx){
-  if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   if(idx<0||idx>=galleryCount||gIsVideo(idx)) return false;
+  if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   photoBufW=0;photoBufH=0;
   char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[idx]);
   if(gIsBmp(idx)){
@@ -2628,7 +2428,7 @@ void photoViewDeleteCurrent(){
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   scanGalleryFiles();scanPhotoCount();
   gallerySelIdx=0;
-  resetAllButtons(); appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+  resetAllButtons(); appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
   neoBurst(120, 0, 180, 1); neoOff();
 }
 
@@ -2647,7 +2447,7 @@ void showPhotoView(int idx){
   if(!photoLoadPixelBuf(idx)){
     lcd.fillScreen(COL_BLACK);
     lcd.drawString("gagal load foto",20,DISP_H/2);
-    delay(1500);lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();return;
+    delay(1500);lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();return;
   }
   photoViewRender();
   photoViewDrawCaption(idx);
@@ -2901,10 +2701,10 @@ void loopMjpegPlayer(){
     if(!ok){
       if(mjpegLoop){
         mjpegClose();
-        if(!mjpegOpen(mjpegPathSaved)){lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();}
+        if(!mjpegOpen(mjpegPathSaved)){lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();}
         return;
       }
-      mjpegClose();lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();return;
+      mjpegClose();lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();return;
     }
     mjpeg.drawJpg();mjpegFrame++;mjpegDrawHUD();
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
@@ -3960,7 +3760,7 @@ void openJumpDialog(){
 void handleModeJumpInput(ButtonEvent evtBoot,ButtonEvent evtB,
                           ButtonEvent evtC,ButtonEvent evtD){
   if(millis()-jumpOpenMs>=JUMP_TIMEOUT_MS){
-    jumpActive=false;lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+    jumpActive=false;lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
     islandPush(NOTIF_INFO,"JUMP BATAL (timeout)");return;
   }
   bool redraw=false;
@@ -3971,7 +3771,7 @@ void handleModeJumpInput(ButtonEvent evtBoot,ButtonEvent evtB,
   if(evtBoot.valid&&evtBoot.isShort){
     int target=jumpGetValue();jumpActive=false;
     if(target<1||target>galleryCount){
-      lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+      lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
       char warnBuf[32]; snprintf(warnBuf,sizeof(warnBuf),"INDEX %d diluar range",target);
       islandPush(NOTIF_WARN,warnBuf);
     } else {
@@ -3979,14 +3779,14 @@ void handleModeJumpInput(ButtonEvent evtBoot,ButtonEvent evtB,
       gallerySelIdx=newIdx;
       galleryScroll=(newIdx/GALLERY_ITEMS_PAGE)*GALLERY_ITEMS_PAGE;
       galleryHoldDir=0;
-      lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+      lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
       char infoBuf[24]; snprintf(infoBuf,sizeof(infoBuf),"JUMP #%d",target);
       islandPush(NOTIF_INFO,infoBuf);
     }
     return;
   }
   if(evtBoot.valid&&evtBoot.isLong){
-    jumpActive=false;lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+    jumpActive=false;lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
     islandPush(NOTIF_INFO,"JUMP BATAL");return;
   }
   if(redraw) drawJumpDialog();
@@ -4350,9 +4150,9 @@ void handleModeViewfinder(ButtonEvent evt){
     if(evt.isShort){
       if(sdReady){
         scanGalleryFiles();
-        gallerySelIdx=0;galleryScroll=0;galleryHoldDir=0; gridScrollRow=0; gridHWOffset=0; gridScrollInited=false;
+        gallerySelIdx=0;galleryScroll=0;galleryHoldDir=0;
         islandForceHide();islandNoClear=false;
-        lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();
+        lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();
       }
     }
     else{
@@ -4368,7 +4168,6 @@ void handleModeViewfinder(ButtonEvent evt){
 }
 
 // UI UPDATE v6.0
-
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){
@@ -4380,15 +4179,10 @@ void handleModeGallery(ButtonEvent evt){
     galleryLastStep=millis();galleryStep(1);return;
   }
   if(!cHeld&&!dHeld) galleryHoldDir=0;
-
   if(galleryHoldDir!=0){
     uint32_t held=millis()-galleryHoldStart;
     uint32_t interval=(held<500)?200:(held<1500)?100:50;
-    if(millis()-galleryLastStep>=interval){
-      galleryStep(galleryHoldDir);
-      galleryLastStep=millis();
-      if (galleryGridMode) galleryScroll = gridScrollRow * 4;
-    }
+    if(millis()-galleryLastStep>=interval){galleryStep(galleryHoldDir);galleryLastStep=millis();}
     return;
   }
   if(!evt.valid) return;
@@ -4407,13 +4201,8 @@ void handleModeGallery(ButtonEvent evt){
   else if(evt.pin==BTN_B){
     if(evt.isLong){
       galleryGridMode=!galleryGridMode;
-      if (galleryGridMode) {
-        gridScrollRow = 0; gridHWOffset = 0; gridScrollInited = false;
-        drawGalleryGridScroll();
-      } else {
-        galleryScroll = (gallerySelIdx / GALLERY_ITEMS_PAGE) * GALLERY_ITEMS_PAGE;
-        drawGallery();
-      }
+      galleryScroll=(gallerySelIdx / (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE)) * (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE);
+      if(galleryGridMode) drawGalleryGrid(); else drawGallery();
     } else {
       if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
       galleryHoldDir=0;islandForceHide();resetAllButtons();
@@ -4431,6 +4220,7 @@ void handleModeGallery(ButtonEvent evt){
     openAIFeatureMenu(false);
   }
 }
+
 void handleModePhotoView(ButtonEvent evt){
   static unsigned long lastPanTime=0;
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
@@ -4451,7 +4241,7 @@ void handleModePhotoView(ButtonEvent evt){
     photoViewCaptionVisible=false;photoViewCaptionUntilMs=0;
     photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0;
     if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
-    lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();return;
+    lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();return;
   }
   if(evt.pin==BTN_B){
     if(evt.isLong){photoViewClearCaption();openDeleteDialog();}
@@ -4503,7 +4293,7 @@ void handleModePhotoView(ButtonEvent evt){
 void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
                             ButtonEvent evtC,ButtonEvent evtD){
   static unsigned long lastToggleTime=0;
-  if(evtBoot.valid){mjpegClose();lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGridScroll(); else drawGallery();return;}
+  if(evtBoot.valid){mjpegClose();lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();return;}
   if(evtB.valid&&(millis()-lastToggleTime)>=200){
     mjpegPaused=!mjpegPaused;mjpegShowNotif(mjpegPaused?"PAUSE":"PLAY");lastToggleTime=millis();
   }
