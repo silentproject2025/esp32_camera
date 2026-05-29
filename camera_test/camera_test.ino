@@ -1252,7 +1252,14 @@ bool captureForAI(char* outPath, int outPathLen) {
       uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
       if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
       if (tmp) {
-        int sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W); int sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
+        int sx = 0, sy = 0;
+            if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+              sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W);
+              sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
+              xSemaphoreGive(mpuMutex);
+            } else {
+              sx = EIS_CROP_X; sy = EIS_CROP_Y;
+            }
         for (int y = 0; y < DISP_H; y++) {
           int srY = sy + (y * EIS_VP_H / DISP_H);
           for (int x = 0; x < DISP_W; x++) {
@@ -1760,6 +1767,18 @@ float    photoZoomFactors[ZOOM_LEVELS] = { 1.0f, 2.0f, 4.0f };
 uint8_t  photoZoomLevel = 0;
 int      photoZoomOffX  = 0;
 int      photoZoomOffY  = 0;
+float         recActualFps  = 15.0f;
+static TaskHandle_t  workerTaskHandle = nullptr;
+static QueueHandle_t recFrameQueue    = nullptr;
+static SemaphoreHandle_t mpuMutex     = nullptr;
+static SemaphoreHandle_t neoMutex     = nullptr;
+static uint16_t*     recEisBuf        = nullptr;
+
+struct RecFrame {
+  uint8_t* jpg;
+  size_t   len;
+};
+
 uint16_t* photoPixelBuf = nullptr;
 uint16_t  photoBufW     = 0;
 uint16_t  photoBufH     = 0;
@@ -2709,7 +2728,7 @@ void loopMjpegPlayer(){
     mjpeg.drawJpg();mjpegFrame++;mjpegDrawHUD();
     if(mjpegNotifUntilMs>0&&millis()>mjpegNotifUntilMs) mjpegClearNotif();
     float speed=mjpegSpeeds[mjpegSpeedIdx];
-    int64_t targetUs=(int64_t)(1000000.0f/(MJPEG_FRAME_RATE*speed));
+    int64_t targetUs=(int64_t)(1000000.0f/(recActualFps*speed));
     int64_t remain=targetUs-(esp_timer_get_time()-frameStart);
     if(remain>1000){
       int64_t waitEnd=esp_timer_get_time()+remain;
@@ -2724,6 +2743,16 @@ void loopMjpegPlayer(){
 
 void openMjpegPlayer(const char* filename){
   mjpegLoop=false;mjpegSpeedIdx=1;
+  recActualFps = 15.0f;
+  const char* p = filename;
+  while ((p = strstr(p, "_")) != nullptr) {
+    int parsed = 0;
+    if (sscanf(p, "_%dfps.mjpeg", &parsed) == 1 && parsed >= 5) {
+      recActualFps = constrain((float)parsed, 5.0f, 30.0f);
+      break;
+    }
+    p++;
+  }
   if(!mjpegOpen(filename)){
     lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
     lcd.drawString("gagal buka file",20,DISP_H/2);
@@ -2752,13 +2781,19 @@ void drawRecIndicator(){
 void startRecording() {
   if (!sdReady || recActive) return;
   neoSolid(180, 0, 0);
-  if (!sdReady || recActive) return;
   recVideoCount++;
-  char path[48]; snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
+  char path[48]; snprintf(path, sizeof(path), "/sdcard/video_%04d_tmp.mjpeg", recVideoCount);
   recFile = fopen(path, "wb");
   if (!recFile) { recVideoCount--; return; }
-  g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
-  g_eisBiasX = 0; g_eisBiasY = 0;
+
+  if (!recEisBuf) recEisBuf = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
+  recFrameQueue = xQueueCreate(3, sizeof(RecFrame));
+
+  if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
+    g_eisBiasX = 0; g_eisBiasY = 0;
+    xSemaphoreGive(mpuMutex);
+  }
   recFrameCount = 0; recStartMs = millis(); recActive = true;
   char buf[20]; snprintf(buf, sizeof(buf), "REC #%04d", recVideoCount);
   islandPush(NOTIF_REC, buf);
@@ -2766,62 +2801,91 @@ void startRecording() {
 
 void stopRecording(){
   if(!recActive||!recFile) return;
-  fclose(recFile);recFile=nullptr;recActive=false;
-  unsigned long dur=(millis()-recStartMs)/1000;
-  char buf[28]; snprintf(buf,sizeof(buf),"%df  %02lu:%02lu",recFrameCount,dur/60,dur%60);
-  islandPush(NOTIF_OK,buf);
-  neoBurst(0, 180, 0, 3); neoOff();
-  fpsLastTime=millis();fpsFrameCount=0;
-}
 
+  RecFrame rf;
+  while (recFrameQueue && xQueueReceive(recFrameQueue, &rf, pdMS_TO_TICKS(200)) == pdTRUE) {
+    if (recFile && rf.jpg && rf.len > 0) fwrite(rf.jpg, 1, rf.len, recFile);
+    if (rf.jpg) free(rf.jpg);
+  }
+  if (recFrameQueue) { vQueueDelete(recFrameQueue); recFrameQueue = nullptr; }
+
+  fclose(recFile); recFile = nullptr; recActive = false;
+
+  unsigned long dur = millis() - recStartMs;
+  float actualFps = (dur > 0) ? (recFrameCount * 1000.0f / dur) : 15.0f;
+  actualFps = constrain(actualFps, 5.0f, 30.0f);
+  int fpsInt = (int)roundf(actualFps);
+  recActualFps = actualFps;
+
+  char oldPath[52], newPath[52];
+  snprintf(oldPath, sizeof(oldPath), "/sdcard/video_%04d_tmp.mjpeg", recVideoCount);
+  snprintf(newPath, sizeof(newPath), "/sdcard/video_%04d_%dfps.mjpeg", recVideoCount, fpsInt);
+  rename(oldPath, newPath);
+
+  char buf[28]; snprintf(buf, sizeof(buf), "%df %dfps", recFrameCount, fpsInt);
+  islandPush(NOTIF_OK, buf);
+  neoBurst(0, 180, 0, 3); neoOff();
+  fpsLastTime = millis(); fpsFrameCount = 0;
+}
 
 void recordFrame() {
-  if (!recActive || !recFile) return;
+  if (!recActive || !recFile || !recFrameQueue) return;
+
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { esp_task_wdt_reset(); return; }
-  if (eisEnabled && fb->format == PIXFORMAT_RGB565) {
+
+  uint8_t* jpg = nullptr;
+  size_t   jLen = 0;
+  bool     ok   = false;
+  int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 90) : 80;
+
+  if (eisEnabled && fb->format == PIXFORMAT_RGB565 && recEisBuf) {
     uint16_t* src = (uint16_t*)fb->buf;
-    uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-    if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
-    if (tmp) {
-      int sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W); int sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
-      for (int y = 0; y < DISP_H; y++) {
-        int srY = sy + (y * EIS_VP_H / DISP_H);
-        for (int x = 0; x < DISP_W; x++) {
-          int srX = sx + (x * EIS_VP_W / DISP_W);
-          tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
-        }
-      }
-      uint8_t* out = nullptr; size_t oLen = 0;
-      camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
-      if (frame2jpg(&fk, recQ, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
-      if (recFrameCount % 3 == 0) {
-        int dw = min((int)DISP_W, (int)lcd.width());
-        int dh = min((int)DISP_H, (int)lcd.height());
-        lcd.pushImage(0, 0, dw, dh, tmp);
-      }
-      free(tmp);
+    int sx = 0, sy = 0;
+    if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W);
+      sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
+      xSemaphoreGive(mpuMutex);
+    } else {
+      sx = EIS_CROP_X; sy = EIS_CROP_Y;
     }
-    esp_camera_fb_return(fb); return;
+    for (int y = 0; y < DISP_H; y++) {
+      int srY = sy + (y * EIS_VP_H / DISP_H);
+      for (int x = 0; x < DISP_W; x++)
+        recEisBuf[y * DISP_W + x] =
+          src[srY * DISP_W + sx + (x * EIS_VP_W / DISP_W)];
+    }
+    camera_fb_t fk = *fb;
+    fk.buf = (uint8_t*)recEisBuf;
+    fk.width = DISP_W; fk.height = DISP_H;
+    ok = frame2jpg(&fk, recQ, &jpg, &jLen);
+
+    if ((recFrameCount % 4) == 0)
+      lcd.pushImage(0, 0, DISP_W, DISP_H, recEisBuf);
+
+  } else if (fb->format == PIXFORMAT_RGB565) {
+    ok = frame2jpg(fb, recQ, &jpg, &jLen);
+    if ((recFrameCount % 4) == 0)
+      lcd.pushImage(0, 0, DISP_W, DISP_H, (uint16_t*)fb->buf);
+  } else if (fb->format == PIXFORMAT_JPEG) {
+    jpg = (uint8_t*)malloc(fb->len);
+    if (jpg) { memcpy(jpg, fb->buf, fb->len); jLen = fb->len; ok = true; }
   }
-  uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
-  ok = frame2jpg(fb, recQ, &jpg, &jLen); }
-  if (ok && jpg) {
-    fwrite(jpg, 1, jLen, recFile); recFrameCount++;
-    if (fb->format != PIXFORMAT_JPEG) free(jpg);
+
+  esp_camera_fb_return(fb);
+
+  if (ok && jpg && jLen > 0) {
+    RecFrame rf = { jpg, jLen };
+    if (xQueueSend(recFrameQueue, &rf, 0) != pdTRUE) {
+      free(jpg);
+    }
+  } else {
+    if (jpg) free(jpg);
   }
-  if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    int dw = min((int)fb->width, (int)lcd.width());
-    int dh = min((int)fb->height, (int)lcd.height());
-    lcd.pushImage(0, 0, dw, dh, (uint16_t*)fb->buf);
-  }
-  esp_camera_fb_return(fb); esp_task_wdt_reset();
+
+  esp_task_wdt_reset();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 //  USB MSC
 // ─────────────────────────────────────────────────────────────────────────────
 static int32_t onRead(uint32_t lba,uint32_t offset,void* buffer,uint32_t bufsize){
@@ -3460,7 +3524,9 @@ void renderViewfinder(){
       if (hudEnabled) {
         char fpsBuf[12]; snprintf(fpsBuf,sizeof(fpsBuf),"%.0f fps",fpsValue);
         drawPill(32,10,fpsBuf,COL_PILL_BG,COL_GRAY_A);
-        if (!recActive && !g_tilted && !g_shake) neoBreath(0, 0, 80);
+        bool tlt=false, shk=false;
+        if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) { tlt=g_tilted; shk=g_shake; xSemaphoreGive(mpuMutex); }
+        if (!recActive && !tlt && !shk) neoBreath(0, 0, 80);
         char sensorPill[20];
         snprintf(sensorPill,sizeof(sensorPill),"%s%s",sensorName,ledFlashEnabled?" *":"");
         drawPill(DISP_W-42,10,sensorPill,COL_PILL_BG,COL_GRAY_A);
@@ -3537,8 +3603,11 @@ void runHDRFlow() {
   neoFade(180,0,0, 0,180,0, 3000);
   while (millis() - start < HDR_WAIT_MS) {
     esp_task_wdt_reset(); // [PORTED v6.1] MPU tick
-  mpuTick();
-    float gmag = sqrtf(g_gyroX * g_gyroX + g_gyroY * g_gyroY + g_gyroZ * g_gyroZ);
+    float gmag = 0;
+    if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      gmag = sqrtf(g_gyroX * g_gyroX + g_gyroY * g_gyroY + g_gyroZ * g_gyroZ);
+      xSemaphoreGive(mpuMutex);
+    }
     if (gmag > HDR_STABLE_THRESH) { failed = true; break; }
     lcd.setFont(&fonts::FreeSansBold9pt7b); lcd.setTextColor(0x07E0); // COL_ACCENT
     lcd.drawString("HDR CAPTURE", cx - lcd.textWidth("HDR CAPTURE") / 2, cy - 40);
@@ -3604,7 +3673,14 @@ void captureAndPreview() {
           uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
           if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
           if (tmp) {
-            int sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W); int sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
+            int sx = 0, sy = 0;
+            if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+              sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W);
+              sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
+              xSemaphoreGive(mpuMutex);
+            } else {
+              sx = EIS_CROP_X; sy = EIS_CROP_Y;
+            }
             for (int y = 0; y < DISP_H; y++) {
               int srY = sy + (y * EIS_VP_H / DISP_H);
               for (int x = 0; x < DISP_W; x++) {
@@ -3648,6 +3724,18 @@ void captureAndPreview() {
     islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD"); neoBurst(180, 0, 0, 5);
   }
   fpsLastTime = millis(); fpsFrameCount = 0;
+    mpuMutex = xSemaphoreCreateMutex();
+  neoMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(
+    workerTask,       // task function
+    "worker",         // name
+    8192,             // stack size
+    nullptr,          // param
+    1,                // priority (low)
+    &workerTaskHandle,
+    1                 // Core 1
+  );
   resetAllButtons();
 }
 
@@ -3934,6 +4022,18 @@ void enterUSBMode(){
   WiFi.disconnect(true);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
+    mpuMutex = xSemaphoreCreateMutex();
+  neoMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(
+    workerTask,       // task function
+    "worker",         // name
+    8192,             // stack size
+    nullptr,          // param
+    1,                // priority (low)
+    &workerTaskHandle,
+    1                 // Core 1
+  );
   resetAllButtons();
 }
 
@@ -3970,13 +4070,31 @@ void neoSetup() {
   strip.show();
 }
 void neoSolid(uint8_t r, uint8_t g, uint8_t b) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoSolid_internal(r, g, b);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoSolid_internal(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_SOLID; g_neoR = r; g_neoG = g; g_neoB = b;
   strip.setPixelColor(0, r, g, b); strip.show();
 }
 void neoOff() {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoOff_internal();
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoOff_internal() {
   g_neoMode = NEO_MODE_OFF; strip.setPixelColor(0, 0, 0, 0); strip.show();
 }
 void neoBurst(uint8_t r, uint8_t g, uint8_t b, int times) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoBurst_internal(r, g, b, times);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoBurst_internal(uint8_t r, uint8_t g, uint8_t b, int times) {
   g_neoMode = NEO_MODE_OFF;
   for (int i = 0; i < times; i++) {
     strip.setPixelColor(0, r, g, b); strip.show(); delay(150);
@@ -3985,15 +4103,39 @@ void neoBurst(uint8_t r, uint8_t g, uint8_t b, int times) {
   }
 }
 void neoPulse(uint8_t r, uint8_t g, uint8_t b) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoPulse_internal(r, g, b);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoPulse_internal(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_PULSE; g_neoR = r; g_neoG = g; g_neoB = b;
 }
 void neoBreath(uint8_t r, uint8_t g, uint8_t b) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoBreath_internal(r, g, b);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoBreath_internal(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_BREATH; g_neoR = r; g_neoG = g; g_neoB = b;
 }
 void neoSpin(uint8_t r, uint8_t g, uint8_t b) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoSpin_internal(r, g, b);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoSpin_internal(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_SPIN; g_neoR = r; g_neoG = g; g_neoB = b;
 }
 void neoFade(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2, uint32_t durationMs) {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoFade_internal(r1, g1, b1, r2, g2, b2, durationMs);
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoFade_internal(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t b2, uint32_t durationMs) {
   g_neoMode = NEO_MODE_OFF;
   uint32_t start = millis();
   while (millis() - start < durationMs) {
@@ -4004,6 +4146,12 @@ void neoFade(uint8_t r1, uint8_t g1, uint8_t b1, uint8_t r2, uint8_t g2, uint8_t
   strip.setPixelColor(0, r2, g2, b2); strip.show();
 }
 void neoRainbow() {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+    neoRainbow_internal();
+    xSemaphoreGive(neoMutex);
+  }
+}
+void neoRainbow_internal() {
   g_neoMode = NEO_MODE_OFF;
   for (int i=0; i<255; i++) {
     uint32_t c = strip.ColorHSV((uint16_t)i * 257, 255, 255);
@@ -4012,13 +4160,19 @@ void neoRainbow() {
   }
 }
 void neoTick() {
+  if (xSemaphoreTake(neoMutex, pdMS_TO_TICKS(5)) != pdTRUE) return;
   uint32_t now = millis();
   if (recActive) {
     if ((now / 1000) % 2 == 0) { strip.setPixelColor(0, 180, 0, 0); }
     else { strip.setPixelColor(0, 60, 0, 0); }
-    strip.show(); return;
+    strip.show();
+    xSemaphoreGive(neoMutex);
+    return;
   }
-  if (g_neoMode == NEO_MODE_OFF || g_neoMode == NEO_MODE_SOLID) return;
+  if (g_neoMode == NEO_MODE_OFF || g_neoMode == NEO_MODE_SOLID) {
+    xSemaphoreGive(neoMutex);
+    return;
+  }
   if (g_neoMode == NEO_MODE_BREATH) {
     float v = (exp(sin(now/1500.0*PI)) - 0.36787944) * 0.42545906;
     strip.setPixelColor(0, g_neoR*v, g_neoG*v, g_neoB*v); strip.show();
@@ -4032,6 +4186,47 @@ void neoTick() {
       else strip.setPixelColor(0, 0, 0, 0);
       strip.show();
     }
+  }
+  xSemaphoreGive(neoMutex);
+}
+
+
+void workerTask(void* param) {
+  const TickType_t mpuInterval = pdMS_TO_TICKS(MPU_READ_MS);
+  const TickType_t neoInterval = pdMS_TO_TICKS(30);
+  TickType_t lastMpu = 0, lastNeo = 0;
+
+  for (;;) {
+    TickType_t now = xTaskGetTickCount();
+
+    // MPU tick
+    if (now - lastMpu >= mpuInterval) {
+      if (xSemaphoreTake(mpuMutex, 0) == pdTRUE) {
+        mpuTick();
+        xSemaphoreGive(mpuMutex);
+      }
+      lastMpu = now;
+    }
+
+    // Neo tick
+    if (now - lastNeo >= neoInterval) {
+      neoTick();
+      lastNeo = now;
+    }
+
+    // SD write from queue (non-blocking check)
+    RecFrame rf;
+    if (recFrameQueue &&
+        xQueueReceive(recFrameQueue, &rf, 0) == pdTRUE) {
+      if (recFile && rf.jpg && rf.len > 0) {
+        fwrite(rf.jpg, 1, rf.len, recFile);
+        recFrameCount++;
+      }
+      if (rf.jpg) free(rf.jpg);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(5));
+    esp_task_wdt_reset();
   }
 }
 
@@ -4119,14 +4314,32 @@ void setup(){
   neoOff();
   blockingWaitAllRelease(600);
   Serial.println("[BOOT] Fixes applied: gyro-cal, no-autokal, hd-quality-map");
+  mpuMutex = xSemaphoreCreateMutex();
+  neoMutex = xSemaphoreCreateMutex();
+
+  xTaskCreatePinnedToCore(
+    workerTask,       // task function
+    "worker",         // name
+    8192,             // stack size
+    nullptr,          // param
+    1,                // priority (low)
+    &workerTaskHandle,
+    1                 // Core 1
+  );
   resetAllButtons();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MODE HANDLERS
-// ─────────────────────────────────────────────────────────────────────────────
 void handleModeViewfinder(ButtonEvent evt){
   galleryGridActive=false;
+  if (autoRotateEnabled) {
+    uint8_t r = 3;
+    if (xSemaphoreTake(mpuMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      if (g_tiltX > 45.0f) r = 2;
+      else if (g_tiltX < -45.0f) r = 0;
+      xSemaphoreGive(mpuMutex);
+    }
+    if (lcd.getRotation() != r) lcd.setRotation(r);
+  }
   if(!evt.valid){renderViewfinder();return;}
   if(evt.pin==BTN_BOOT){
     if(evt.isLong){if(sdReady) enterUSBMode();}
@@ -4407,7 +4620,6 @@ void handleModeDialogDelete(ButtonEvent evt){
 //  LOOP
 // ─────────────────────────────────────────────────────────────────────────────
 void loop(){
-  neoTick();
   esp_task_wdt_reset();
 
   if (g_hdrWaiting && (millis() - g_hdrFirstMs >= HDR_DOUBLE_TAP_MS)) {
@@ -4433,7 +4645,6 @@ void loop(){
     photoViewClearCaption();
 
   // [PORTED v6.1] MPU tick
-  mpuTick();
   if(usbModeActive){if(evtBoot.valid) exitUSBMode();return;}
   if(recActive){if(evtB.valid) stopRecording();else recordFrame();return;}
 
