@@ -71,6 +71,10 @@
  */
 
 #include "esp_camera.h"
+extern "C" {
+  int SCCB_Write(uint8_t slv_addr, uint8_t reg, uint8_t val);
+  int SCCB_Read(uint8_t slv_addr, uint8_t reg);
+}
 #include "esp_timer.h"
 #include "img_converters.h"
 #include "FS.h"
@@ -3020,10 +3024,76 @@ void mpuDrawIndicator() {
   } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; neoSolid(0, 40, 0); } // COL_GRAY_7
   drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
 }
+
+
+// Write one register to GC2145 via SCCB
+static void gc2145WriteReg(uint8_t reg, uint8_t val) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+  SCCB_Write(s->slv_addr, reg, val);
+}
+
+// Read one register from GC2145 via SCCB
+static uint8_t gc2145ReadReg(uint8_t reg) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return 0;
+  return (uint8_t)SCCB_Read(s->slv_addr, reg);
+}
+
+// Enable or disable AEC (auto exposure control)
+// reg 0xb6 bit[0]: 1=AEC on, 0=manual
+static void gc2145SetAEC(bool enable) {
+  gc2145WriteReg(0xfe, 0x00); // select page 0
+  uint8_t val = gc2145ReadReg(0xb6);
+  if (enable) val |=  0x01;
+  else        val &= ~0x01;
+  gc2145WriteReg(0xb6, val);
+}
+
+// Set manual shutter value (0–1200 scale mapped to 13-bit GC2145 register)
+// GC2145 exposure = 13-bit: reg 0x03[4:0] high, reg 0x04[7:0] low
+static void gc2145SetExposure(uint16_t expVal) {
+  uint16_t mapped = (uint16_t)((uint32_t)expVal * 0x1FFF / 1200);
+  mapped = constrain(mapped, 0, 0x1FFF);
+  gc2145WriteReg(0xfe, 0x00); // page 0
+  gc2145WriteReg(0x03, (mapped >> 8) & 0x1F);
+  gc2145WriteReg(0x04, mapped & 0xFF);
+}
+
+// Set gain ceiling via page 1 reg 0x08 (0x10=lowest, 0xFF=highest)
+static void gc2145SetGain(uint8_t gain) {
+  gc2145WriteReg(0xfe, 0x01); // page 1
+  gc2145WriteReg(0x08, gain);
+  gc2145WriteReg(0xfe, 0x00); // back to page 0
+}
+
 void applyExpPreset(uint8_t preset){
   sensor_t *s=esp_camera_sensor_get(); if(!s) return;
   expPreset=preset;
   const ExpPresetCfg& c=expPresets[preset];
+  if (detectedSensor == PID_GC2145) {
+    // All set_* functions are set_dummy on GC2145 — use direct register access
+    int aecVal  = (preset == 5) ? expManualVal  : c.aec_val;
+    int gainVal = (preset == 5) ? expManualGain : c.agc_gain;
+    gc2145SetAEC(c.aec_on);
+    if (!c.aec_on) {
+      gc2145SetExposure((uint16_t)constrain(aecVal, 0, 1200));
+      // map agc_gain 0-30 to gain register 0x10-0xFF
+      uint8_t gainReg = (uint8_t)map(gainVal, 0, 30, 0x10, 0xFF);
+      gc2145SetGain(gainReg);
+    }
+    // special_effect is the ONE set_* that actually works on GC2145
+    s->set_special_effect(s, c.special_effect);
+    s->set_hmirror(s, HMIRROR_GC2145);
+    s->set_vflip(s, VFLIP_GC2145);
+    delay(150); esp_task_wdt_reset();
+    for (int i = 0; i < 2; i++) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) esp_camera_fb_return(fb);
+      esp_task_wdt_reset();
+    }
+    return; // skip the OV3660/generic set_* calls below
+  }
   int aecVal=(preset==5)?expManualVal:c.aec_val;
   int gainVal=(preset==5)?expManualGain:c.agc_gain;
   s->set_exposure_ctrl(s,c.aec_on?1:0);
@@ -3530,7 +3600,12 @@ void renderViewfinder(){
 // [PORTED v6.1] HDR Triple Capture
 bool captureHDRFrame(const char* path, int aecVal) {
   sensor_t* s = esp_camera_sensor_get(); if (!s) return false;
-  s->set_exposure_ctrl(s, 0); s->set_aec_value(s, aecVal);
+  if (detectedSensor == PID_GC2145) {
+    gc2145SetAEC(false);
+    gc2145SetExposure((uint16_t)constrain(aecVal, 0, 1200));
+  } else {
+    s->set_exposure_ctrl(s, 0); s->set_aec_value(s, aecVal);
+  }
   delay(250); esp_task_wdt_reset();
   for (int i = 0; i < 3; i++) { camera_fb_t* t = esp_camera_fb_get(); if (t) esp_camera_fb_return(t); esp_task_wdt_reset(); }
   camera_fb_t* fb = esp_camera_fb_get(); if (!fb) return false;
