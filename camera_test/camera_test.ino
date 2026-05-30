@@ -759,6 +759,7 @@ bool          sdmmcDriverInit = false;
 uint64_t      sdSizeMB        = 0;
 
 bool ledFlashEnabled = false;
+static bool neoFlashEnabled = false;
 
 uint8_t expPreset    = 0;
 int     expManualVal = 300;
@@ -783,6 +784,7 @@ void saveSettings() {
   if (!f) return;
   fprintf(f, "# Sanzxcam v5.9-fix5 settings\n");
   fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
+  fprintf(f, "neoflash=%d\n",   (int)neoFlashEnabled);
   fprintf(f, "exp_preset=%d\n", (int)expPreset);
   fprintf(f, "exp_val=%d\n",    expManualVal);
   fprintf(f, "exp_gain=%d\n",   expManualGain);
@@ -808,6 +810,7 @@ void loadSettings() {
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     int v = 0;
     if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
+    else if (sscanf(line, "neoflash=%d",   &v) == 1) { neoFlashEnabled    = (bool)v; }
     else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v,0,5); }
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
     else if (sscanf(line, "exp_gain=%d",   &v) == 1) { expManualGain      = constrain(v,0,30); }
@@ -1234,7 +1237,7 @@ void openAIFeatureMenu(bool fromViewfinder) {
 bool captureForAI(char* outPath, int outPathLen) {
   snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
   if (ledFlashEnabled) {
-    digitalWrite(LED_FLASH, HIGH); delay(150);
+    digitalWrite(LED_FLASH, HIGH); if (neoFlashEnabled) neoWhiteFlash(); delay(150);
     for (int i = 0; i < 2; i++) {
       camera_fb_t *tfb = esp_camera_fb_get();
       if (tfb) esp_camera_fb_return(tfb);
@@ -2476,7 +2479,7 @@ void photoViewNext(){
 //  Menu LED
 // ─────────────────────────────────────────────────────────────────────────────
 void drawLedMenu(int sel){
-  int mw=200,mh=90,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
+  int mw=220,mh=114,mx=(DISP_W-mw)/2,my=(DISP_H-mh)/2;
   lcd.fillRoundRect(mx,my,mw,mh,10,COL_GRAY_D);
   lcd.drawRoundRect(mx,my,mw,mh,10,COL_GRAY_5);
   lcd.setFont(&fonts::Font0);lcd.setTextSize(1);
@@ -2484,14 +2487,20 @@ void drawLedMenu(int sel){
   const char* title="LED FLASH";
   lcd.drawString(title,mx+(mw-lcd.textWidth(title))/2,my+7);
   lcd.drawFastHLine(mx+10,my+19,mw-20,COL_GRAY_3);
-  for(int i=0;i<2;i++){
+  for(int i=0;i<3;i++){
     int iy=my+24+i*24;
-    bool isChecked=(i==0)?ledFlashEnabled:!ledFlashEnabled,isHighlight=(i==sel);
+    bool isChecked=false;
+    if(i==0) isChecked = (!ledFlashEnabled && !neoFlashEnabled);
+    else if(i==1) isChecked = (ledFlashEnabled && !neoFlashEnabled);
+    else if(i==2) isChecked = (ledFlashEnabled && neoFlashEnabled);
+    bool isHighlight=(i==sel);
     lcd.fillRect(mx+8,iy,mw-16,18,isHighlight?COL_GRAY_5:COL_GRAY_D);
     lcd.setTextColor(isHighlight?COL_WHITE:(isChecked?COL_GRAY_E:COL_GRAY_7));
     lcd.drawRect(mx+12,iy+5,8,8,isHighlight?COL_WHITE:COL_GRAY_5);
     if(isChecked){lcd.drawFastHLine(mx+14,iy+9,4,isHighlight?COL_WHITE:COL_GRAY_E);lcd.drawFastVLine(mx+14,iy+7,4,isHighlight?COL_WHITE:COL_GRAY_E);}
-    lcd.drawString((i==0)?"LED ON   - flash saat capture":"LED OFF  - tanpa flash",mx+24,iy+5);
+    if(i==0)      lcd.drawString("LED OFF   - tanpa flash",mx+24,iy+5);
+    else if(i==1) lcd.drawString("LED ON    - flash LED saja",mx+24,iy+5);
+    else if(i==2) lcd.drawString("LED+NEO   - flash LED & NeoPixel putih",mx+24,iy+5);
   }
   lcd.setTextColor(COL_GRAY_3);
   const char* hint="C/D=pilih  BOOT=ok  B=batal";
@@ -2501,7 +2510,9 @@ void drawLedMenu(int sel){
 void openLedMenu(){
   lcd.setRotation(3);
   lcd.setRotation(3);
-  menuLedSel=ledFlashEnabled?0:1;
+  if (neoFlashEnabled) menuLedSel = 2;
+  else if (ledFlashEnabled) menuLedSel = 1;
+  else menuLedSel = 0;
   drawLedMenu(menuLedSel);
   resetAllButtons();prevMode=appMode;appMode=MODE_MENU_LED;
 }
@@ -3589,7 +3600,7 @@ void runHDRFlow() {
 
 void captureAndPreview() {
   if (ledFlashEnabled) {
-    digitalWrite(LED_FLASH, HIGH); delay(150);
+    digitalWrite(LED_FLASH, HIGH); if (neoFlashEnabled) neoWhiteFlash(); delay(150);
     for (int i = 0; i < 2; i++) {
       camera_fb_t *tfb = esp_camera_fb_get();
       if (tfb) esp_camera_fb_return(tfb); esp_task_wdt_reset();
@@ -4001,6 +4012,13 @@ void neoBurst(uint8_t r, uint8_t g, uint8_t b, int times) {
     esp_task_wdt_reset();
   }
 }
+
+void neoWhiteFlash() {
+  strip.setPixelColor(0, 255, 255, 255); strip.show();
+  delay(150);
+  strip.setPixelColor(0, 0, 0, 0); strip.show();
+  g_neoMode = NEO_MODE_OFF;
+}
 void neoPulse(uint8_t r, uint8_t g, uint8_t b) {
   g_neoMode = NEO_MODE_PULSE; g_neoR = r; g_neoG = g; g_neoB = b;
 }
@@ -4328,13 +4346,14 @@ void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
 void handleModeMenuLed(ButtonEvent evt){
   if(!evt.valid) return;
   if(evt.pin==BTN_BOOT){
-    ledFlashEnabled=(menuLedSel==0);
-    islandPush(NOTIF_FLASH,ledFlashEnabled?"FLASH ON":"FLASH OFF");
+    if(menuLedSel==0){ ledFlashEnabled=false; neoFlashEnabled=false; islandPush(NOTIF_FLASH,"FLASH OFF"); }
+    else if(menuLedSel==1){ ledFlashEnabled=true; neoFlashEnabled=false; islandPush(NOTIF_FLASH,"FLASH ON"); }
+    else if(menuLedSel==2){ ledFlashEnabled=true; neoFlashEnabled=true; islandPush(NOTIF_FLASH,"FLASH+NEO ON"); }
     saveSettings();lcd.fillScreen(COL_BLACK);resetAllButtons();
     islandNoClear=true;appMode=MODE_VIEWFINDER;
   }
   else if(evt.pin==BTN_B){lcd.fillScreen(COL_BLACK);resetAllButtons();islandNoClear=true;appMode=MODE_VIEWFINDER;}
-  else if(evt.pin==BTN_C||evt.pin==BTN_D){menuLedSel=(menuLedSel==0)?1:0;drawLedMenu(menuLedSel);}
+  else if(evt.pin==BTN_C||evt.pin==BTN_D){menuLedSel=(menuLedSel+1)%3;drawLedMenu(menuLedSel);}
 }
 
 void handleModeMenuFormat(ButtonEvent evt){
