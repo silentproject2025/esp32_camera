@@ -4523,10 +4523,15 @@ void handleModeGallery(ButtonEvent evt){
     if(galleryFileType[gallerySelIdx]==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
     photoViewIndex=gallerySelIdx; strncpy(photoViewPath,galleryFiles[gallerySelIdx],sizeof(photoViewPath)-1); openAIFeatureMenu(false);
   } else if(evt.pin==BTN_C && evt.isLong) {
-    multiDeleteMode = true; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
-    if(galleryGridMode) drawGalleryGrid(); else drawGallery();
+    int n = photoViewIndex;
+    for(int i=0; i<galleryCount; i++) {
+      n = (n + 1) % galleryCount;
+      if (gIsPhoto(n) && n != photoViewIndex) break;
+    }
+    // bebaskan pixel buf dulu sebelum alokasi compare buffer
+    if(photoPixelBuf){ free(photoPixelBuf); photoPixelBuf=nullptr; }
+    openCompareMode(photoViewIndex, n);
   }
-}
 
 
 void handleModePhotoView(ButtonEvent evt){
