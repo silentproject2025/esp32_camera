@@ -286,7 +286,6 @@ enum AppMode {
   MODE_KEY_MANAGER,
   MODE_FEATURES,
   MODE_DIALOG_MULTI_DELETE,
-  MODE_COMPARE,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
@@ -308,8 +307,7 @@ enum AIFeature : uint8_t {
   AI_FEAT_SKY         = 4,
   AI_FEAT_PEST        = 5,
   AI_FEAT_PRODUCE     = 6,
-  AI_FEAT_COMPARE     = 7,
-  AI_FEAT_COUNT       = 8,
+  AI_FEAT_COUNT       = 7,
 };
 
 struct AIFeatureDef {
@@ -389,13 +387,7 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
     "Untuk setiap item: nama umum, nama ilmiah, perkiraan jumlah, kondisi, dan nilai gizi singkat. "
     "Format: ITEM: [nama] | JUMLAH: [angka] | KONDISI: [status] | INFO: [kalimat singkat]. "
     "Di bagian akhir, estimasi total nilai gizi koleksi ini. Gunakan Bahasa Indonesia."
-  },
-  {
-    "Compare",
-    "~",
-    0xF81F,
-    "Kamu adalah analis foto profesional. Kamu diberikan DUA foto. Bandingkan kedua foto ini secara mendetail. Analisis: 1) KOMPOSISI: perbedaan sudut, framing, subjek. 2) PENCAHAYAAN: perbedaan eksposur, bayangan, highlight. 3) KETAJAMAN: mana yang lebih tajam dan di area mana. 4) WARNA: perbedaan tone, saturasi, white balance. 5) REKOMENDASI: foto mana yang lebih baik dan mengapa. Format jawaban: KOMPOSISI: [...] | CAHAYA: [...] | KETAJAMAN: [...] | WARNA: [...] | REKOMENDASI: foto [1/2] lebih baik karena [...]. Gunakan Bahasa Indonesia. Maksimal 8 kalimat total."
-  },
+  }
 };
 
 static AIFeature aiSelectedFeature = AI_FEAT_DESCRIBE;
@@ -1031,9 +1023,6 @@ int   gallerySelIdx = 0;
 static bool multiDeleteMode = false;
 static bool multiDeleteSelected[GALLERY_MAX_FILES] = {};
 static int  multiDeleteCount = 0;
-static int compareIdxA = 0, compareIdxB = 0, compareActiveSlot = 0;
-static uint16_t *compareBufA = nullptr, *compareBufB = nullptr;
-static int compareWA=0, compareHA=0, compareWB=0, compareHB=0;
 
 inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
 inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
@@ -4388,104 +4377,13 @@ void handleModeDialogMultiDelete(ButtonEvent evt) {
   else { neoOff(); multiDeleteMode = false; resetAllButtons(); appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery(); }
 }
 
-void drawCompareScreen() {
-  lcd.fillScreen(COL_BLACK);
-  auto ds = [&](int slot, uint16_t* buf, int w, int h) {
-    if (!buf) return;
-    int sx = (slot == 0) ? 0 : 160;
-    float sc = max(160.0f / w, 240.0f / h);
-    int sw = (int)(160 / sc), sh = (int)(240 / sc);
-    int ox = (w - sw) / 2, oy = (h - sh) / 2;
-    uint16_t line[160];
-    for (int dy = 0; dy < 240; dy++) {
-      int sy = oy + (int)(dy / sc); if (sy >= h) sy = h - 1;
-      for (int dx = 0; dx < 160; dx++) {
-        int sx_ = ox + (int)(dx / sc); if (sx_ >= w) sx_ = w - 1;
-        line[dx] = buf[sy * w + sx_];
-      }
-      lcd.pushImage(sx, dy, 160, 1, line);
-      if (dy % 20 == 0) esp_task_wdt_reset();
-    }
-  };
-  ds(0, compareBufA, compareWA, compareHA); ds(1, compareBufB, compareWB, compareHB);
-  lcd.drawFastVLine(160, 0, 240, COL_GRAY_5);
-  lcd.fillTriangle(80, 0, 88, 8, 72, 8, (compareActiveSlot == 0) ? COL_WHITE : COL_GRAY_3);
-  lcd.fillTriangle(240, 0, 248, 8, 232, 8, (compareActiveSlot == 1) ? COL_WHITE : COL_GRAY_3);
-  lcd.fillRect(0, 228, 160, 12, COL_GRAY_D); lcd.fillRect(160, 228, 160, 12, COL_GRAY_D);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  char nA[20], nB[20]; strncpy(nA, galleryFiles[compareIdxA], 19); nA[19]=0; strncpy(nB, galleryFiles[compareIdxB], 19); nB[19]=0;
-  lcd.drawString(nA, 4, 230); lcd.drawString(nB, 164, 230);
-  lcd.setTextColor(COL_GRAY_3);
-  const char* h = "C/D=nav  B=swap  BOOT=back  D-long=AI";
-  lcd.drawString(h, (DISP_W - lcd.textWidth(h)) / 2, 218);
-}
 
-void openCompareMode(int idxA, int idxB) {
-  auto l2b = [](int idx, uint16_t** b, int* w, int* h) -> bool {
-    char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
-    uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
-    *w = jw; *h = jh; *b = (uint16_t*)ps_malloc(jw * jh * 2); if (!*b) *b = (uint16_t*)malloc(jw * jh * 2);
-    if (*b) memset(*b, 0, jw * jh * 2);
-    if (!*b) return false;
-    FILE* f = fopen(p, "rb"); if (!f) { if (*b) { free(*b); *b = nullptr; } return false; }
-    fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
-    uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
-    if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = *b; _decodeTargetW = jw; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; _decodeTargetW = 0; esp_task_wdt_reset(); return true; }
-    fclose(f); if (*b) { free(*b); *b = nullptr; } return false;
-  };
-  if (compareBufA) { free(compareBufA); compareBufA = nullptr; }
-  if (compareBufB) { free(compareBufB); compareBufB = nullptr; }
-  if (!l2b(idxA, &compareBufA, &compareWA, &compareHA)) return;
-  if (!l2b(idxB, &compareBufB, &compareWB, &compareHB)) { free(compareBufA); compareBufA = nullptr; return; }
-  compareIdxA = idxA; compareIdxB = idxB; compareActiveSlot = 0; appMode = MODE_COMPARE; drawCompareScreen(); resetAllButtons();
-}
 
-void handleModeCompare(ButtonEvent evt) {
-  if (!evt.valid) return;
-  if (evt.pin == BTN_BOOT && evt.isShort) {
-    if (compareBufA) { free(compareBufA); compareBufA = nullptr; }
-    if (compareBufB) { free(compareBufB); compareBufB = nullptr; }
-    appMode = MODE_PHOTO_VIEW; photoViewRender(); photoViewDrawCaption(photoViewIndex); resetAllButtons(); return;
-  }
-  if (evt.pin == BTN_B && evt.isShort) { compareActiveSlot = 1 - compareActiveSlot; drawCompareScreen(); return; }
-  if ((evt.pin == BTN_C || evt.pin == BTN_D) && evt.isShort) {
-    int d = (evt.pin == BTN_C) ? -1 : 1, n = (compareActiveSlot == 0) ? compareIdxA : compareIdxB;
-    for (int i = 0; i < galleryCount; i++) { n = (n + d + galleryCount) % galleryCount; if (gIsPhoto(n)) break; }
-    auto l2b = [](int idx, uint16_t** b, int* w, int* h) -> bool {
-      char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
-      uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
-      uint16_t* nb = (uint16_t*)ps_malloc(jw * jh * 2); if (!nb) nb = (uint16_t*)malloc(jw * jh * 2);
-      if (nb) memset(nb, 0, jw * jh * 2);
-      if (!nb) return false;
-      FILE* f = fopen(p, "rb"); if (!f) { free(nb); return false; }
-      fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
-      uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
-      if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = nb; _decodeTargetW = jw; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; _decodeTargetW = 0; esp_task_wdt_reset(); if (*b) free(*b); *b = nb; *w = jw; *h = jh; return true; }
-      fclose(f); if (nb) free(nb); return false;
-    };
-    if (compareActiveSlot == 0) { if (l2b(n, &compareBufA, &compareWA, &compareHA)) compareIdxA = n; }
-    else { if (l2b(n, &compareBufB, &compareWB, &compareHB)) compareIdxB = n; }
-    drawCompareScreen();
-  }
-  if (evt.pin == BTN_D && evt.isLong) { openAICompare(compareIdxA, compareIdxB); }
-}
 
-void openAICompare(int idxA, int idxB) {
-  aiSelectedFeature = AI_FEAT_COMPARE; char statusHdr[32] = "AI: Compare"; lcd.fillScreen(COL_BLACK); drawAIStatus(statusHdr, "menyiapkan data...");
-  auto gB64 = [](int idx) -> String {
-    size_t l = 0; uint8_t* b = aiLoadPhotoAsJpeg(idx, &l); if (!b || l == 0) return "";
-    String out; base64Encode(b, l, out); free(b); return out;
-  };
-  String bA = gB64(idxA); if (bA == "") { islandPush(NOTIF_WARN, "Gagal baca foto 1"); return; }
-  String bB = gB64(idxB); if (bB == "") { islandPush(NOTIF_WARN, "Gagal baca foto 2"); return; }
-  String body = "{\"contents\":[{\"parts\":[";
-  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + bA + "\"}},";
-  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + bB + "\"}},";
-  body += "{\"text\":\"" + String(AI_FEATURES[AI_FEAT_COMPARE].prompt) + "\"}";
-  body += "]}]}";
-  if (doAICall(-1, "", &body)) { aiWrapText(aiResult); drawAIDescribeScreen(); appMode = MODE_AI_DESCRIBE; }
-  else { islandPush(NOTIF_WARN, "Compare AI gagal"); drawCompareScreen(); appMode = MODE_COMPARE; }
-}
+
+
+
+
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){ galleryHoldDir=-1;galleryHoldStart=millis(); galleryLastStep=millis();galleryStep(-1);return; }
@@ -4524,16 +4422,7 @@ void handleModeGallery(ButtonEvent evt){
     if(galleryCount==0){islandPush(NOTIF_WARN,"Gallery kosong");return;}
     if(galleryFileType[gallerySelIdx]==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
     photoViewIndex=gallerySelIdx; strncpy(photoViewPath,galleryFiles[gallerySelIdx],sizeof(photoViewPath)-1); openAIFeatureMenu(false);
-  } else if(evt.pin==BTN_C && evt.isLong) {
-    int n = photoViewIndex; 
-    for(int i=0; i<galleryCount; i++) { 
-        n = (n + 1) % galleryCount; 
-        if (gIsPhoto(n) && n != photoViewIndex) break; 
-    }
-    // FREE dulu sebelum alokasi compare buffer
-    if(photoPixelBuf){ free(photoPixelBuf); photoPixelBuf = nullptr; }
-    openCompareMode(photoViewIndex, n);
- }
+  }
 }
 
 void handleModePhotoView(ButtonEvent evt){
@@ -4559,11 +4448,7 @@ void handleModePhotoView(ButtonEvent evt){
         photoZoomOffX=max(0,(int)photoBufW/2-vpW/2); photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
       }
       photoViewRender();
-    }
-  } else if(evt.pin==BTN_C && evt.isLong) {
-    int n = photoViewIndex; for(int i=0; i<galleryCount; i++) { n = (n + 1) % galleryCount; if (gIsPhoto(n) && n != photoViewIndex) break; }
-    if(photoPixelBuf){ free(photoPixelBuf); photoPixelBuf = nullptr; }
-    openCompareMode(photoViewIndex, n);
+      }
   }
   else if(evt.pin==BTN_C && !cHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewPrev(); }
   else if(evt.pin==BTN_D && evt.isLong){
@@ -4731,7 +4616,6 @@ void loop(){
     case MODE_MENU_EXP_ADJ:    handleModeMenuExpAdj(singleEvt);                break;
     case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
     case MODE_DIALOG_MULTI_DELETE: handleModeDialogMultiDelete(singleEvt);        break;
-    case MODE_COMPARE:             handleModeCompare(singleEvt);                   break;
     case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
     case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
     case MODE_FEATURES:        handleModeFeatures(singleEvt);                  break;
@@ -4741,7 +4625,7 @@ void loop(){
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
   if (appMode != MODE_VIEWFINDER) {
-    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_COMPARE || appMode == MODE_DIALOG_MULTI_DELETE);
+    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE);
     if (!isMenu) islandNoClear = false;
     islandTick();
   }
