@@ -4562,8 +4562,6 @@ void handleModePhotoView(ButtonEvent evt){
     openAIFeatureMenu(false);
   }
   else if(evt.pin==BTN_D && !dHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewNext(); }
-    openCompareMode(photoViewIndex, n);
-  }
 }
 
 
