@@ -4425,12 +4425,13 @@ void openCompareMode(int idxA, int idxB) {
     char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
     uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
     *w = jw; *h = jh; *b = (uint16_t*)ps_malloc(jw * jh * 2); if (!*b) *b = (uint16_t*)malloc(jw * jh * 2);
+    if (*b) memset(*b, 0, jw * jh * 2);
     if (!*b) return false;
-    FILE* f = fopen(p, "rb"); if (!f) return false;
+    FILE* f = fopen(p, "rb"); if (!f) { if (*b) { free(*b); *b = nullptr; } return false; }
     fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
     uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
-    if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = *b; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; return true; }
-    fclose(f); return false;
+    if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = *b; _decodeTargetW = jw; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; _decodeTargetW = 0; esp_task_wdt_reset(); return true; }
+    fclose(f); if (*b) { free(*b); *b = nullptr; } return false;
   };
   if (compareBufA) { free(compareBufA); compareBufA = nullptr; }
   if (compareBufB) { free(compareBufB); compareBufB = nullptr; }
@@ -4454,12 +4455,13 @@ void handleModeCompare(ButtonEvent evt) {
       char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
       uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
       uint16_t* nb = (uint16_t*)ps_malloc(jw * jh * 2); if (!nb) nb = (uint16_t*)malloc(jw * jh * 2);
+      if (nb) memset(nb, 0, jw * jh * 2);
       if (!nb) return false;
       FILE* f = fopen(p, "rb"); if (!f) { free(nb); return false; }
       fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
       uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
-      if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = nb; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; if (*b) free(*b); *b = nb; return true; }
-      fclose(f); free(nb); return false;
+      if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = nb; _decodeTargetW = jw; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; _decodeTargetW = 0; esp_task_wdt_reset(); if (*b) free(*b); *b = nb; *w = jw; *h = jh; return true; }
+      fclose(f); if (nb) free(nb); return false;
     };
     if (compareActiveSlot == 0) { if (l2b(n, &compareBufA, &compareWA, &compareHA)) compareIdxA = n; }
     else { if (l2b(n, &compareBufB, &compareWB, &compareHB)) compareIdxB = n; }
@@ -4560,6 +4562,7 @@ void handleModePhotoView(ButtonEvent evt){
     }
   } else if(evt.pin==BTN_C && evt.isLong) {
     int n = photoViewIndex; for(int i=0; i<galleryCount; i++) { n = (n + 1) % galleryCount; if (gIsPhoto(n) && n != photoViewIndex) break; }
+    if(photoPixelBuf){ free(photoPixelBuf); photoPixelBuf = nullptr; }
     openCompareMode(photoViewIndex, n);
   }
   else if(evt.pin==BTN_C && !cHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewPrev(); }
