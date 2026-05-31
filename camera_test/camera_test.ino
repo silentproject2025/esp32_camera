@@ -102,6 +102,7 @@ extern "C" {
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
 
+#include <sys/stat.h>
 #include <Adafruit_NeoPixel.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
@@ -1038,7 +1039,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 292, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 314, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -1046,16 +1047,16 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[11] = {
+  static const char* const rowLabels[12] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
     "CALIBRATE MPU  recalibrate",
     "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
     "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
-    "DLPF  filter bandwidth"
+    "DLPF  filter bandwidth", "CLEAR THUMB CACHE"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 11; i++) {
+  for (int i = 0; i < 12; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
@@ -1086,6 +1087,9 @@ void drawFeaturesMenu(int sel) {
     } else if (i == 10) {
       lcd.setTextColor(COL_WHITE);
       lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
+    } else if (i == 11) {
+      lcd.setTextColor(COL_GRAY_7);
+      lcd.drawString("RUN", mx + mw - 30, iy + 5);
     }
   }
   lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
@@ -1108,8 +1112,8 @@ void handleModeFeatures(ButtonEvent evt) {
     return;
   }
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 11; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 10) % 11; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 12; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 11) % 12; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1151,6 +1155,24 @@ void handleModeFeatures(ButtonEvent evt) {
       applyDLPF();
       char buf[32]; snprintf(buf, sizeof(buf), "DLPF: %s", DLPF_LABELS[mpuDlpfIndex]);
       islandPush(NOTIF_INFO, buf); drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 11) {
+      DIR* d = opendir("/sdcard/.cache");
+      if (d) {
+        struct dirent* e; int count = 0;
+        while ((e = readdir(d)) != nullptr) {
+          String n = e->d_name;
+          if (n.endsWith(".bin")) {
+            char dp[64]; snprintf(dp, sizeof(dp), "/sdcard/.cache/%s", e->d_name);
+            remove(dp); count++; esp_task_wdt_reset();
+          }
+        }
+        closedir(d);
+        char msg[32]; snprintf(msg, sizeof(msg), "Cache: %d file dihapus", count);
+        islandPush(NOTIF_OK, msg);
+      } else {
+        islandPush(NOTIF_WARN, "Cache dir tidak ada");
+      }
+      drawFeaturesMenu(menuFeatSel);
     }
   }
 }
@@ -1998,6 +2020,7 @@ void scanGalleryFiles(){
   DIR* dir=opendir("/sdcard"); if(!dir) return;
   struct dirent* entry;
   while((entry=readdir(dir))!=nullptr&&galleryCount<GALLERY_MAX_FILES){
+    if (strncmp(entry->d_name, ".", 1) == 0) continue;
     String name=entry->d_name;
     bool isJpg=name.endsWith(".jpg")||name.endsWith(".JPG");
     bool isBmp=name.endsWith(".bmp")||name.endsWith(".BMP");
@@ -2011,6 +2034,7 @@ void scanGalleryFiles(){
       galleryCount++;
     }
   }
+  if (sdReady) thumbCacheEnsureDir();
   closedir(dir);
   for(int i=1;i<galleryCount;i++){
     char tmpN[32]; strncpy(tmpN,galleryFiles[i],31); tmpN[31]='\0';
@@ -2027,6 +2051,84 @@ void scanGalleryFiles(){
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI UPDATE v6.0
+
+
+void thumbCacheEnsureDir() {
+  struct stat st;
+  if (stat("/sdcard/.cache", &st) != 0) {
+    mkdir("/sdcard/.cache", 0755);
+  }
+}
+
+void thumbCachePath(const char* galleryFilename, char* outPath, int outLen) {
+  char base[32];
+  strncpy(base, galleryFilename, sizeof(base)-1);
+  base[sizeof(base)-1] = '\0';
+  char* dot = strrchr(base, '.');
+  if (dot) *dot = '\0';
+  snprintf(outPath, outLen, "/sdcard/.cache/%s.bin", base);
+}
+
+bool thumbCacheLoad(const char* galleryFilename, uint16_t* outBuf) {
+  char path[64];
+  thumbCachePath(galleryFilename, path, sizeof(path));
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  size_t bytesRead = fread(outBuf, 1, 72*42*2, f);
+  fclose(f);
+  return (bytesRead == 72*42*2);
+}
+
+void thumbCacheSave(const char* galleryFilename, const uint16_t* buf) {
+  char path[64];
+  thumbCachePath(galleryFilename, path, sizeof(path));
+  FILE* f = fopen(path, "wb");
+  if (!f) return;
+  fwrite(buf, 1, 72*42*2, f);
+  fclose(f);
+}
+
+bool thumbDecodeJpeg(const char* galleryFilename, uint16_t* outBuf) {
+  char path[64];
+  snprintf(path, sizeof(path), "/sdcard/%s", galleryFilename);
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  fseek(f, 0, SEEK_END);
+  size_t fsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fsize == 0 || fsize > 250000) { fclose(f); return false; }
+  uint8_t* buf = (uint8_t*)ps_malloc(fsize);
+  if (!buf) buf = (uint8_t*)malloc(fsize);
+  if (!buf) { fclose(f); return false; }
+  if (fread(buf, 1, fsize, f) != fsize) { free(buf); fclose(f); return false; }
+  fclose(f);
+
+  uint16_t* tmpBuf = (uint16_t*)ps_malloc(80*60*2);
+  if (!tmpBuf) tmpBuf = (uint16_t*)malloc(80*60*2);
+  if (!tmpBuf) { free(buf); return false; }
+  memset(tmpBuf, 0, 80*60*2);
+
+  TJpgDec.setJpgScale(4);
+  TJpgDec.setSwapBytes(true);
+  TJpgDec.setCallback(tjpgdecOutput);
+  _decodeTargetBuf = tmpBuf;
+  _decodeTargetW   = 80;
+  TJpgDec.drawJpg(0, 0, buf, fsize);
+  _decodeTargetBuf = nullptr;
+  free(buf);
+
+  for (int dy = 0; dy < 42; dy++) {
+    int sy = dy * 60 / 42;
+    for (int dx = 0; dx < 72; dx++) {
+      int sx = dx * 80 / 72;
+      outBuf[dy * 72 + dx] = tmpBuf[sy * 80 + sx];
+    }
+  }
+  free(tmpBuf);
+  esp_task_wdt_reset();
+  return true;
+}
+
 void drawGalleryGrid() {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
@@ -2049,6 +2151,7 @@ void drawGalleryGrid() {
     lcd.drawString(msg, (DISP_W - lcd.textWidth(msg)) / 2, DISP_H / 2); return;
   }
 
+  static uint16_t thumbBuf[72 * 42];
   int startIdx = (galleryScroll / 16) * 16;
   for (int i = 0; i < 16; i++) {
     int idx = startIdx + i;
@@ -2062,33 +2165,21 @@ void drawGalleryGrid() {
     lcd.drawRect(x, y, 76, 56, isSelected ? COL_WHITE : COL_GRAY_3);
 
     GalleryFileType ft = galleryFileType[idx];
-        if (ft == GFILE_JPG) {
-      char path[64]; snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[idx]);
+    if (ft == GFILE_JPG) {
       bool ok = false;
-      FILE* f = fopen(path, "rb");
-      if (f) {
-        fseek(f, 0, SEEK_END);
-        size_t fsize = ftell(f);
-        fseek(f, 0, SEEK_SET);
-        if (fsize > 0 && fsize < 250000) {
-          uint8_t* buf = (uint8_t*)ps_malloc(fsize);
-          if (buf) {
-            if (fread(buf, 1, fsize, f) == fsize) {
-              uint16_t w, h;
-              TJpgDec.setJpgScale(4);
-              if (TJpgDec.getJpgSize(&w, &h, buf, fsize) == JDR_OK) {
-                int tw = w / 4, th = h / 4;
-                int tx = x + 2 + (72 - tw) / 2;
-                int ty = y + 2 + (42 - th) / 2;
-                lcd.setClipRect(x + 2, y + 2, 72, 42);
-                if (TJpgDec.drawJpg(tx, ty, buf, fsize) == JDR_OK) ok = true;
-                lcd.clearClipRect();
-              }
-            }
-            free(buf);
-          }
+      if (thumbCacheLoad(galleryFiles[idx], thumbBuf)) {
+        lcd.setClipRect(x + 2, y + 2, 72, 42);
+        lcd.pushImage(x + 2, y + 2, 72, 42, thumbBuf);
+        lcd.clearClipRect();
+        ok = true;
+      } else {
+        if (thumbDecodeJpeg(galleryFiles[idx], thumbBuf)) {
+          thumbCacheSave(galleryFiles[idx], thumbBuf);
+          lcd.setClipRect(x + 2, y + 2, 72, 42);
+          lcd.pushImage(x + 2, y + 2, 72, 42, thumbBuf);
+          lcd.clearClipRect();
+          ok = true;
         }
-        fclose(f);
       }
       if (!ok) {
         lcd.setTextColor(COL_GRAY_7);
@@ -2432,6 +2523,11 @@ void openDeleteDialog(){
 void photoViewDeleteCurrent(){
   char path[56]; snprintf(path,sizeof(path),"/sdcard/%s",galleryFiles[photoViewIndex]);
   bool ok=(remove(path)==0);
+  if (ok && gIsJpg(photoViewIndex)) {
+    char cachePath[64];
+    thumbCachePath(galleryFiles[photoViewIndex], cachePath, sizeof(cachePath));
+    remove(cachePath);
+  }
   islandPush(ok?NOTIF_OK:NOTIF_WARN,ok?"FILE DIHAPUS":"GAGAL HAPUS");
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   scanGalleryFiles();scanPhotoCount();
