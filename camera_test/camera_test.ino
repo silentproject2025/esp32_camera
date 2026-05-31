@@ -4532,7 +4532,7 @@ void handleModeGallery(ButtonEvent evt){
     if(photoPixelBuf){ free(photoPixelBuf); photoPixelBuf=nullptr; }
     openCompareMode(photoViewIndex, n);
   }
-
+}
 
 void handleModePhotoView(ButtonEvent evt){
   static unsigned long lastPanTime=0; bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
