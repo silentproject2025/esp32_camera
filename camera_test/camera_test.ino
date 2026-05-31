@@ -4553,10 +4553,15 @@ void handleModePhotoView(ButtonEvent evt){
       }
       photoViewRender();
     }
-  } else if(evt.pin==BTN_C && !cHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewPrev(); }
-  else if(evt.pin==BTN_D && !dHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewNext(); }
-  else if(evt.pin==BTN_C && evt.isLong) {
+  } else if(evt.pin==BTN_C && evt.isLong) {
     int n = photoViewIndex; for(int i=0; i<galleryCount; i++) { n = (n + 1) % galleryCount; if (gIsPhoto(n) && n != photoViewIndex) break; }
+    openCompareMode(photoViewIndex, n);
+  }
+  else if(evt.pin==BTN_C && !cHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewPrev(); }
+  else if(evt.pin==BTN_D && evt.isLong){
+    openAIFeatureMenu(false);
+  }
+  else if(evt.pin==BTN_D && !dHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewNext(); }
     openCompareMode(photoViewIndex, n);
   }
 }
