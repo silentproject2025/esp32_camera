@@ -285,6 +285,8 @@ enum AppMode {
   MODE_AI_NO_CONFIG,
   MODE_KEY_MANAGER,
   MODE_FEATURES,
+  MODE_DIALOG_MULTI_DELETE,
+  MODE_COMPARE,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
@@ -306,7 +308,8 @@ enum AIFeature : uint8_t {
   AI_FEAT_SKY         = 4,
   AI_FEAT_PEST        = 5,
   AI_FEAT_PRODUCE     = 6,
-  AI_FEAT_COUNT       = 7,
+  AI_FEAT_COMPARE     = 7,
+  AI_FEAT_COUNT       = 8,
 };
 
 struct AIFeatureDef {
@@ -386,6 +389,12 @@ static const AIFeatureDef AI_FEATURES[AI_FEAT_COUNT] = {
     "Untuk setiap item: nama umum, nama ilmiah, perkiraan jumlah, kondisi, dan nilai gizi singkat. "
     "Format: ITEM: [nama] | JUMLAH: [angka] | KONDISI: [status] | INFO: [kalimat singkat]. "
     "Di bagian akhir, estimasi total nilai gizi koleksi ini. Gunakan Bahasa Indonesia."
+  },
+  {
+    "Compare",
+    "~",
+    0xF81F,
+    "Kamu adalah analis foto profesional. Kamu diberikan DUA foto. Bandingkan kedua foto ini secara mendetail. Analisis: 1) KOMPOSISI: perbedaan sudut, framing, subjek. 2) PENCAHAYAAN: perbedaan eksposur, bayangan, highlight. 3) KETAJAMAN: mana yang lebih tajam dan di area mana. 4) WARNA: perbedaan tone, saturasi, white balance. 5) REKOMENDASI: foto mana yang lebih baik dan mengapa. Format jawaban: KOMPOSISI: [...] | CAHAYA: [...] | KETAJAMAN: [...] | WARNA: [...] | REKOMENDASI: foto [1/2] lebih baik karena [...]. Gunakan Bahasa Indonesia. Maksimal 8 kalimat total."
   },
 };
 
@@ -1019,6 +1028,12 @@ GalleryFileType*   galleryFileType   = nullptr;
 int   galleryCount  = 0;
 int   galleryScroll = 0;
 int   gallerySelIdx = 0;
+static bool multiDeleteMode = false;
+static bool multiDeleteSelected[GALLERY_MAX_FILES] = {};
+static int  multiDeleteCount = 0;
+static int compareIdxA = 0, compareIdxB = 0, compareActiveSlot = 0;
+static uint16_t *compareBufA = nullptr, *compareBufB = nullptr;
+static int compareWA=0, compareHA=0, compareWB=0, compareHB=0;
 
 inline bool gIsVideo(int i) { return galleryFileType[i] == GFILE_VIDEO; }
 inline bool gIsBmp  (int i) { return galleryFileType[i] == GFILE_BMP;   }
@@ -1290,10 +1305,10 @@ bool captureForAI(char* outPath, int outPathLen) {
           }
         }
         camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-        int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+        int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
         ok = frame2jpg(&fk, captureQ, &jpg_buf, &jpg_len); free(tmp);
       }
-    } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+    } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
     ok = frame2jpg(fb, captureQ, &jpg_buf, &jpg_len); }
   } else if (fb->format == PIXFORMAT_JPEG) {
     jpg_buf = fb->buf; jpg_len = fb->len; ok = true;
@@ -2016,6 +2031,7 @@ void scanVideoCount(){
 }
 
 void scanGalleryFiles(){
+  multiDeleteMode = false; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
   galleryCount=0;galleryScroll=0;
   DIR* dir=opendir("/sdcard"); if(!dir) return;
   struct dirent* entry;
@@ -2134,16 +2150,21 @@ void drawGalleryGrid() {
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_E);
 
-  int currentPage = galleryScroll / 16 + 1;
-  int totalPage = max(1, (galleryCount + 15) / 16);
-  char hdr[32];
-  snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
-  lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+  if (multiDeleteMode) {
+    lcd.setTextColor(COL_AI_WARN);
+    char hdr[32]; snprintf(hdr, sizeof(hdr), "MULTI-DEL  [%d] dipilih", multiDeleteCount);
+    lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+  } else {
+    lcd.setTextColor(COL_GRAY_E);
+    int currentPage = galleryScroll / 16 + 1;
+    int totalPage = max(1, (galleryCount + 15) / 16);
+    char hdr[32]; snprintf(hdr, sizeof(hdr), "GALLERY  %d item", galleryCount);
+    lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+    char pageInfo[8]; snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
+    lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo, 4, 6);
+  }
   lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK", DISP_W - 46, 6);
-  char pageInfo[8]; snprintf(pageInfo, sizeof(pageInfo), "%d/%d", currentPage, totalPage);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo, 4, 6);
 
   if (galleryCount == 0) {
     lcd.setTextColor(COL_GRAY_5);
@@ -2166,22 +2187,16 @@ void drawGalleryGrid() {
 
     GalleryFileType ft = galleryFileType[idx];
     if (ft == GFILE_JPG) {
-      bool ok = false;
       if (thumbCacheLoad(galleryFiles[idx], thumbBuf)) {
         lcd.setClipRect(x + 2, y + 2, 72, 42);
         lcd.pushImage(x + 2, y + 2, 72, 42, thumbBuf);
         lcd.clearClipRect();
-        ok = true;
+      } else if (thumbDecodeJpeg(galleryFiles[idx], thumbBuf)) {
+        thumbCacheSave(galleryFiles[idx], thumbBuf);
+        lcd.setClipRect(x + 2, y + 2, 72, 42);
+        lcd.pushImage(x + 2, y + 2, 72, 42, thumbBuf);
+        lcd.clearClipRect();
       } else {
-        if (thumbDecodeJpeg(galleryFiles[idx], thumbBuf)) {
-          thumbCacheSave(galleryFiles[idx], thumbBuf);
-          lcd.setClipRect(x + 2, y + 2, 72, 42);
-          lcd.pushImage(x + 2, y + 2, 72, 42, thumbBuf);
-          lcd.clearClipRect();
-          ok = true;
-        }
-      }
-      if (!ok) {
         lcd.setTextColor(COL_GRAY_7);
         lcd.drawString("JPG", x + 28, y + 20);
       }
@@ -2203,12 +2218,13 @@ void drawGalleryGrid() {
       lcd.setTextColor(COL_VID_ACCENT);
       lcd.drawString(vidNum, x + (76 - lcd.textWidth(vidNum)) / 2, y + 34);
     }
-    lcd.setTextColor(COL_GRAY_3);
-    char idxBuf[8]; snprintf(idxBuf, sizeof(idxBuf), "%d", idx + 1);
-    lcd.drawString(idxBuf, x + 4, y + 46);
+
+    if (multiDeleteMode && multiDeleteSelected[idx]) {
+      lcd.fillRect(x + 2, y + 2, 10, 10, COL_AI_WARN);
+      lcd.drawRect(x + 2, y + 2, 10, 10, COL_WHITE);
+    }
   }
 
-  TJpgDec.setJpgScale(1);
   if (galleryCount > 16) {
     int barH = DISP_H - 22, indH = max(10, barH * 16 / galleryCount);
     int indY = 22 + (barH - indH) * (galleryScroll / 16) / max(1, (galleryCount - 1) / 16);
@@ -2217,7 +2233,7 @@ void drawGalleryGrid() {
   }
 
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
-  const char* footer = "B-long=list  BOOT=buka  D-long=AI";
+  const char* footer = multiDeleteMode ? "BOOT=pilih  B-long=konfirmasi  B=batal" : "B-long=list  BOOT=buka  D-long=AI";
   lcd.drawString(footer, (DISP_W - lcd.textWidth(footer)) / 2, DISP_H - 10);
 }
 
@@ -2228,14 +2244,22 @@ void drawGallery(){
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0,0,DISP_W,20,COL_GRAY_D);
   lcd.drawFastHLine(0,20,DISP_W,COL_GRAY_3);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_E);
-  int currentPage=galleryScroll/GALLERY_ITEMS_PAGE+1;
-  int totalPage=max(1,(galleryCount+GALLERY_ITEMS_PAGE-1)/GALLERY_ITEMS_PAGE);
-  char hdr[32]; snprintf(hdr,sizeof(hdr),"GALLERY  %d item",galleryCount);
-  lcd.drawString(hdr,(DISP_W-lcd.textWidth(hdr))/2,6);
+  lcd.setFont(&fonts::Font0);
+  if (multiDeleteMode) {
+    lcd.setTextColor(COL_AI_WARN);
+    char hdr[32]; snprintf(hdr, sizeof(hdr), "MULTI-DEL  [%d] dipilih", multiDeleteCount);
+    lcd.drawString(hdr, (DISP_W - lcd.textWidth(hdr)) / 2, 6);
+  } else {
+    lcd.setTextColor(COL_GRAY_E);
+    int currentPage=galleryScroll/GALLERY_ITEMS_PAGE+1;
+    int totalPage=max(1,(galleryCount+GALLERY_ITEMS_PAGE-1)/GALLERY_ITEMS_PAGE);
+    char hdr[32]; snprintf(hdr,sizeof(hdr),"GALLERY  %d item",galleryCount);
+    lcd.drawString(hdr,(DISP_W-lcd.textWidth(hdr))/2,6);
+    char pageInfo[8]; snprintf(pageInfo,sizeof(pageInfo),"%d/%d",currentPage,totalPage);
+    lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo,4,6);
+  }
   lcd.setTextColor(COL_GRAY_5); lcd.drawString("B=BACK",DISP_W-46,6);
-  char pageInfo[8]; snprintf(pageInfo,sizeof(pageInfo),"%d/%d",currentPage,totalPage);
-  lcd.setTextColor(COL_GRAY_3); lcd.drawString(pageInfo,4,6);
+
   if(galleryCount==0){
     lcd.setTextColor(COL_GRAY_5);
     const char* msg="SD kosong / tidak ada file";
@@ -2247,8 +2271,20 @@ void drawGallery(){
     uint16_t rowBg=(i%2==0)?COL_GRAY_D:COL_BLACK;
     lcd.fillRect(0,rowY,DISP_W,GALLERY_ITEM_H-1,rowBg);
     lcd.drawFastHLine(0,rowY+GALLERY_ITEM_H-1,DISP_W,COL_GRAY_2);
-    lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_5);
-    char num[6]; snprintf(num,sizeof(num),"%3d",i+1); lcd.drawString(num,6,rowY+8);
+    lcd.setFont(&fonts::Font0);
+
+    if (multiDeleteMode) {
+      if (multiDeleteSelected[i]) {
+        lcd.fillRect(6, rowY + 6, 8, 8, COL_AI_WARN);
+        lcd.drawRect(6, rowY + 6, 8, 8, COL_WHITE);
+      } else {
+        lcd.drawRect(6, rowY + 6, 8, 8, COL_GRAY_5);
+      }
+    } else {
+      lcd.setTextColor(COL_GRAY_5);
+      char num[6]; snprintf(num,sizeof(num),"%3d",i+1); lcd.drawString(num,6,rowY+8);
+    }
+
     GalleryFileType ft=galleryFileType[i];
     if(ft==GFILE_VIDEO){ lcd.setTextColor(COL_VID_ACCENT); lcd.drawString("\x10",26,rowY+8); }
     else if(ft==GFILE_BMP){ lcd.drawRect(26,rowY+5,9,9,COL_BMP_ACCENT); lcd.setTextColor(COL_BMP_ACCENT); lcd.drawString("B",28,rowY+6); }
@@ -2267,7 +2303,8 @@ void drawGallery(){
     lcd.fillRect(DISP_W-4,22,4,barH,COL_GRAY_2); lcd.fillRect(DISP_W-4,indY,4,indH,COL_GRAY_7);
   }
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_2);
-  lcd.drawString("B-long=grid  D-long=AI",(DISP_W-lcd.textWidth("B-long=grid  D-long=AI"))/2,DISP_H-10);
+  const char* footer = multiDeleteMode ? "BOOT=pilih  B-long=konfirmasi  B=batal" : "B-long=grid  D-long=AI";
+  lcd.drawString(footer, (DISP_W - lcd.textWidth(footer)) / 2, DISP_H - 10);
 }
 
 void galleryUpdateHighlight(int oldSel,int newSel){
@@ -2922,7 +2959,7 @@ void recordFrame() {
       }
       uint8_t* out = nullptr; size_t oLen = 0;
       camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+      int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
       if (frame2jpg(&fk, recQ, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
       if (recFrameCount % 3 == 0) {
         int dw = min((int)DISP_W, (int)lcd.width());
@@ -2935,7 +2972,7 @@ void recordFrame() {
   }
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
   if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
   ok = frame2jpg(fb, recQ, &jpg, &jLen); }
   if (ok && jpg) {
     fwrite(jpg, 1, jLen, recFile); recFrameCount++;
@@ -3420,145 +3457,54 @@ static uint8_t* aiLoadPhotoAsJpeg(int idx,size_t* outLen){
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Core HTTP call dengan multi-key fallback
 // ─────────────────────────────────────────────────────────────────────────────
-bool doAICall(int idx, const char* customPrompt) {
-  bool wifiOK   = (wifiSSID[0]!='\0'&&strcmp(wifiSSID,"NamaWiFiKamu")!=0);
+bool doAICall(int idx, const char* customPrompt, const String* prebuiltBody = nullptr) {
+  bool wifiOK = (wifiSSID[0]!='\0'&&strcmp(wifiSSID,"NamaWiFiKamu")!=0);
   bool geminiOK = (geminiKeyCount>0);
-  if(!wifiOK)   wifiOK   = loadWifiConfig();
+  if(!wifiOK) wifiOK = loadWifiConfig();
   if(!geminiOK) geminiOK = loadGeminiConfig();
-  if(!wifiOK||!geminiOK){
-    resetAllButtons();
-    drawAINoConfigScreen(!wifiOK,!geminiOK);
-    appMode=MODE_AI_NO_CONFIG;
-    return false;
-  }
-
-  lcd.fillScreen(COL_BLACK);
-  drawAIStatus("CONNECTING","menghubungkan WiFi...");
-
+  if(!wifiOK||!geminiOK){ resetAllButtons(); drawAINoConfigScreen(!wifiOK,!geminiOK); appMode=MODE_AI_NO_CONFIG; return false; }
+  lcd.fillScreen(COL_BLACK); drawAIStatus("CONNECTING","menghubungkan WiFi...");
   if(WiFi.status()!=WL_CONNECTED){
-    WiFi.begin(wifiSSID,wifiPass);
-    neoSpin(0, 80, 255);
-    unsigned long t0=millis();
+    WiFi.begin(wifiSSID,wifiPass); neoSpin(0, 80, 255); unsigned long t0=millis();
     while(WiFi.status()!=WL_CONNECTED&&millis()-t0<15000){delay(300);esp_task_wdt_reset();}
-    if(WiFi.status()!=WL_CONNECTED){
-      drawAIStatus("WiFi gagal","periksa wifi.ini");
-      neoBurst(180, 0, 0, 5);
-      delay(2500);return false;
-    }
+    if(WiFi.status()!=WL_CONNECTED){ drawAIStatus("WiFi gagal","periksa wifi.ini"); neoBurst(180, 0, 0, 5); delay(2500);return false; }
     neoOff();
   }
-
-  char featLabel[24];
-  strncpy(featLabel,AI_FEATURES[(int)aiSelectedFeature].label,sizeof(featLabel)-1);
+  char featLabel[24]; strncpy(featLabel,AI_FEATURES[(int)aiSelectedFeature].label,sizeof(featLabel)-1);
   char statusHdr[32]; snprintf(statusHdr,sizeof(statusHdr),"AI: %s",featLabel);
-
-  drawAIStatus(statusHdr,"membaca foto...");
-  esp_task_wdt_reset();
-
-  size_t jpgLen=0;
-  uint8_t* jpgBuf=aiLoadPhotoAsJpeg(idx,&jpgLen);
-  if(!jpgBuf||jpgLen==0){drawAIStatus("gagal baca foto","");delay(2000);return false;}
-
-  drawAIStatus(statusHdr,"encode base64...");
-  esp_task_wdt_reset();
-
-  String b64;
-  base64Encode(jpgBuf,jpgLen,b64);
-  free(jpgBuf);
-
   String body;
-  body.reserve(b64.length()+512);
-  body  = "{\"contents\":[{\"parts\":[";
-  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"";
-  body += b64;
-  body += "\"}},";
-  body += "{\"text\":\"";
-  for(const char* p=customPrompt;*p;p++){
-    if(*p=='"') body+="\\\"";
-    else if(*p=='\n') body+="\\n";
-    else body+=*p;
+  if (prebuiltBody) { body = *prebuiltBody; }
+  else {
+    drawAIStatus(statusHdr,"membaca foto..."); esp_task_wdt_reset();
+    size_t jl=0; uint8_t* jb=aiLoadPhotoAsJpeg(idx,&jl); if(!jb||jl==0){drawAIStatus("gagal baca foto","");delay(2000);return false;}
+    drawAIStatus(statusHdr,"encode base64..."); esp_task_wdt_reset();
+    String b64; base64Encode(jb,jl,b64); free(jb);
+    body = "{\"contents\":[{\"parts\":[{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + b64 + "\"}},{\"text\":\"";
+    for(const char* p=customPrompt;*p;p++){
+      if(*p=='\"') body+="\\\""; else if(*p=='\n') body+="\\n"; else body+=*p;
+    }
+    body += "\"}]}]}";
   }
-  body += "\"}";
-  body += "]}]}";
-  b64="";
-  esp_task_wdt_reset();
-
-  int httpCode=0;
-  String resp="";
-
+  int hCode=0; String resp="";
   for(int ki=0;ki<geminiKeyCount;ki++){
-    int keyIdx=(geminiKeyActive+ki)%geminiKeyCount;
-    char statusMsg[48];
-    if(geminiKeyCount>1) snprintf(statusMsg,sizeof(statusMsg),"kirim... (key %d/%d)",keyIdx+1,geminiKeyCount);
-    else strncpy(statusMsg,"mengirim ke Gemini...",sizeof(statusMsg)-1);
-    drawAIStatus(statusHdr,statusMsg);
-    neoBreath(0, 200, 200);
-    esp_task_wdt_reset();
-
-    String url=String(GEMINI_URL_BASE)+String(geminiApiKeys[keyIdx]);
-    WiFiClientSecure client; client.setInsecure();
-    HTTPClient http; http.begin(client,url);
-    http.addHeader("Content-Type","application/json");
-    http.setTimeout(30000);
-    esp_task_wdt_reset();
-    httpCode=http.POST(body);
-    esp_task_wdt_reset();
-
-    if(httpCode==200){
-      neoBurst(0, 220, 0, 1); neoFade(0, 220, 0, 0, 0, 0, 500);
-      resp=http.getString(); http.end();
-      geminiKeyActive=keyIdx;
-      Serial.printf("[GEMINI] key%d berhasil (HTTP 200) feat=%s\n",keyIdx+1,featLabel);
-      break;
-    }
-    if(httpCode==403||httpCode==429){
+    int kIdx=(geminiKeyActive+ki)%geminiKeyCount;
+    drawAIStatus(statusHdr,geminiKeyCount>1?("kirim... (key "+String(kIdx+1)+")").c_str():"mengirim ke Gemini...");
+    neoBreath(0, 200, 200); esp_task_wdt_reset();
+    WiFiClientSecure client; client.setInsecure(); HTTPClient http;
+    if(http.begin(client,String(GEMINI_URL_BASE)+geminiApiKeys[kIdx])){
+      http.addHeader("Content-Type","application/json"); hCode=http.POST(body);
+      if(hCode==200){ resp=http.getString(); geminiKeyActive=kIdx; http.end(); break; }
       http.end();
-      Serial.printf("[GEMINI] key%d HTTP %d → fallback\n",keyIdx+1,httpCode);
-      if(ki<geminiKeyCount-1){
-        neoBurst(200, 180, 0, 2);
-        char fbMsg[48];
-        snprintf(fbMsg,sizeof(fbMsg),"key%d %s → coba key%d...",
-                 keyIdx+1,httpCode==403?"quota":"rate limit",
-                 ((geminiKeyActive+ki+1)%geminiKeyCount)+1);
-        drawAIStatus("FALLBACK",fbMsg); delay(800); esp_task_wdt_reset();
-      }
-      continue;
     }
-    Serial.printf("[GEMINI] key%d HTTP %d\n",keyIdx+1,httpCode);
-    http.end();
-    char errBuf[32]; snprintf(errBuf,sizeof(errBuf),"HTTP error %d",httpCode);
-    drawAIStatus(errBuf,"cek koneksi internet");
-    body=""; delay(3000);return false;
   }
-
-  body="";
-  if(httpCode!=200){
-    for(int i=0; i<3; i++) { neoBurst(180,0,0,1); neoBurst(180,150,0,1); }
-    Serial.printf("[GEMINI] semua %d key gagal\n",geminiKeyCount);
-    char failMsg[40]; snprintf(failMsg,sizeof(failMsg),"semua %d key gagal (quota?)",geminiKeyCount);
-    drawAIStatus("GAGAL",failMsg); delay(3000);return false;
-  }
-
-  drawAIStatus(statusHdr,"parsing respons...");
-  esp_task_wdt_reset();
-
-  DynamicJsonDocument doc(8192);
-  DeserializationError err=deserializeJson(doc,resp);
-  if(err){
-    neoBurst(180, 0, 120, 3);
-    Serial.printf("[GEMINI] JSON parse error: %s\n",err.c_str());
-    drawAIStatus("parse error","respons tidak valid");
-    delay(2500);return false;
-  }
-
-  const char* text=doc["candidates"][0]["content"]["parts"][0]["text"]|"";
-  if(!text||strlen(text)==0){drawAIStatus("respons kosong","");delay(2000);return false;}
-
-  strncpy(aiResult,text,AI_RESULT_MAX);
-  aiResult[AI_RESULT_MAX]='\0';
-  Serial.printf("[GEMINI] feat=%s hasil: %.80s...\n",featLabel,aiResult);
-  return true;
+  if(hCode!=200){ drawAIStatus("Gagal",("Error: "+String(hCode)).c_str()); neoBurst(180, 0, 0, 3); delay(2500); return false; }
+  DynamicJsonDocument doc(8192); DeserializationError error = deserializeJson(doc, resp);
+  if(error){ drawAIStatus("Parse Error","JSON invalid"); delay(2000); return false; }
+  const char* text = doc["candidates"][0]["content"]["parts"][0]["text"];
+  if(!text){ drawAIStatus("AI Kosong","tidak ada jawaban"); delay(2000); return false; }
+  strncpy(aiResult,text,AI_RESULT_MAX); aiResult[AI_RESULT_MAX]='\0'; return true;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Entry point utama
@@ -3707,7 +3653,7 @@ bool captureHDRFrame(const char* path, int aecVal) {
   camera_fb_t* fb = esp_camera_fb_get(); if (!fb) return false;
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
   if (fb->format == PIXFORMAT_RGB565) {
-    int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+    int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
     ok = frame2jpg(fb, captureQ, &jpg, &jLen);
   }
   else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
@@ -3812,10 +3758,10 @@ void captureAndPreview() {
               }
             }
             camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
-            int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+            int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
             ok = frame2jpg(&fk, captureQ, &jpg, &jLen); free(tmp);
           }
-        } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 10, 1, 50, 95) : 85;
+        } else { int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
         ok = frame2jpg(fb, captureQ, &jpg, &jLen); }
       } else if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
       if (ok && jpg && jLen > 0) {
@@ -4374,127 +4320,247 @@ void handleModeViewfinder(ButtonEvent evt){
 }
 
 // UI UPDATE v6.0
+
+void drawMultiDeleteConfirmDialog(int count) {
+  int dw=200, dh=88, dx=(DISP_W-dw)/2, dy=(DISP_H-dh)/2;
+  lcd.fillRoundRect(dx, dy, dw, dh, 4, COL_BLACK);
+  lcd.drawRoundRect(dx, dy, dw, dh, 4, 0xF800);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(0xF800);
+  char title[24]; snprintf(title, sizeof(title), "HAPUS %d FILE?", count);
+  lcd.drawString(title, dx+(dw-lcd.textWidth(title))/2, dy+8);
+  lcd.setTextColor(COL_GRAY_5);
+  lcd.drawString("Aksi ini permanen", dx+(dw-lcd.textWidth("Aksi ini permanen"))/2, dy+22);
+  lcd.fillRect(dx+10, dy+36, dw-20, 4, COL_GRAY_2);
+  int by = dy+50;
+  int b1w = lcd.textWidth("BOOT = HAPUS")+16, b1h=14;
+  int b2w = lcd.textWidth("B = batal")+16, b2h=14;
+  int bx = dx+(dw-(b1w+b2w+6))/2;
+  lcd.drawRect(bx, by, b1w, b1h, 0xA000);
+  lcd.setTextColor(0xF800); lcd.drawString("BOOT = HAPUS", bx+8, by+3);
+  int bx2 = bx+b1w+6;
+  lcd.drawRect(bx2, by, b2w, b2h, COL_GRAY_3);
+  lcd.setTextColor(COL_GRAY_A); lcd.drawString("B = batal", bx2+8, by+3);
+}
+
+void openMultiDeleteConfirmDialog() {
+  drawMultiDeleteConfirmDialog(multiDeleteCount);
+  deleteDialogOpenMs = millis();
+  blockingWaitAllRelease(600); resetAllButtons();
+  appMode = MODE_DIALOG_MULTI_DELETE; neoSolid(120, 0, 0);
+}
+
+void executeMultiDelete() {
+  int deletedCount = 0;
+  for (int i = 0; i < galleryCount; i++) {
+    if (multiDeleteSelected[i]) {
+      char path[56]; snprintf(path, sizeof(path), "/sdcard/%s", galleryFiles[i]);
+      if (remove(path) == 0) {
+        if (gIsJpg(i)) {
+          char cachePath[64]; thumbCachePath(galleryFiles[i], cachePath, sizeof(cachePath));
+          remove(cachePath);
+        }
+        deletedCount++;
+      }
+      if (deletedCount % 10 == 0) esp_task_wdt_reset();
+    }
+  }
+  multiDeleteMode = false; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
+  scanGalleryFiles(); scanPhotoCount(); gallerySelIdx = 0;
+  char msg[32]; snprintf(msg, sizeof(msg), "%d file dihapus", deletedCount);
+  islandPush(NOTIF_OK, msg); neoBurst(0, 180, 0, 2); neoOff();
+  resetAllButtons(); appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery();
+}
+
+void handleModeDialogMultiDelete(ButtonEvent evt) {
+  unsigned long elapsed = millis() - deleteDialogOpenMs;
+  if (elapsed < DELETE_TIMEOUT_MS) {
+    int dw=200, dh=88, dx=(DISP_W-dw)/2, dy=(DISP_H-dh)/2;
+    int prog = (int)((dw-20) * (1.0 - (double)elapsed/DELETE_TIMEOUT_MS));
+    lcd.fillRect(dx+10, dy+36, dw-20, 4, COL_GRAY_2);
+    lcd.fillRect(dx+10, dy+36, constrain(prog,0,dw-20), 4, 0xF800);
+  } else {
+    neoOff(); multiDeleteMode = false; resetAllButtons();
+    appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery(); return;
+  }
+  if (!evt.valid) return;
+  if (evt.pin == BTN_BOOT) { neoOff(); executeMultiDelete(); }
+  else { neoOff(); multiDeleteMode = false; resetAllButtons(); appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery(); }
+}
+
+void drawCompareScreen() {
+  lcd.fillScreen(COL_BLACK);
+  auto ds = [&](int slot, uint16_t* buf, int w, int h) {
+    if (!buf) return;
+    int sx = (slot == 0) ? 0 : 160;
+    float sc = max(160.0f / w, 240.0f / h);
+    int sw = (int)(160 / sc), sh = (int)(240 / sc);
+    int ox = (w - sw) / 2, oy = (h - sh) / 2;
+    uint16_t line[160];
+    for (int dy = 0; dy < 240; dy++) {
+      int sy = oy + (int)(dy / sc); if (sy >= h) sy = h - 1;
+      for (int dx = 0; dx < 160; dx++) {
+        int sx_ = ox + (int)(dx / sc); if (sx_ >= w) sx_ = w - 1;
+        line[dx] = buf[sy * w + sx_];
+      }
+      lcd.pushImage(sx, dy, 160, 1, line);
+      if (dy % 20 == 0) esp_task_wdt_reset();
+    }
+  };
+  ds(0, compareBufA, compareWA, compareHA); ds(1, compareBufB, compareWB, compareHB);
+  lcd.drawFastVLine(160, 0, 240, COL_GRAY_5);
+  lcd.fillTriangle(80, 0, 88, 8, 72, 8, (compareActiveSlot == 0) ? COL_WHITE : COL_GRAY_3);
+  lcd.fillTriangle(240, 0, 248, 8, 232, 8, (compareActiveSlot == 1) ? COL_WHITE : COL_GRAY_3);
+  lcd.fillRect(0, 228, 160, 12, COL_GRAY_D); lcd.fillRect(160, 228, 160, 12, COL_GRAY_D);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
+  char nA[20], nB[20]; strncpy(nA, galleryFiles[compareIdxA], 19); nA[19]=0; strncpy(nB, galleryFiles[compareIdxB], 19); nB[19]=0;
+  lcd.drawString(nA, 4, 230); lcd.drawString(nB, 164, 230);
+  lcd.setTextColor(COL_GRAY_3);
+  const char* h = "C/D=nav  B=swap  BOOT=back  D-long=AI";
+  lcd.drawString(h, (DISP_W - lcd.textWidth(h)) / 2, 218);
+}
+
+void openCompareMode(int idxA, int idxB) {
+  auto l2b = [](int idx, uint16_t** b, int* w, int* h) -> bool {
+    char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
+    uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
+    *w = jw; *h = jh; *b = (uint16_t*)ps_malloc(jw * jh * 2); if (!*b) *b = (uint16_t*)malloc(jw * jh * 2);
+    if (!*b) return false;
+    FILE* f = fopen(p, "rb"); if (!f) return false;
+    fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
+    uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
+    if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = *b; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; return true; }
+    fclose(f); return false;
+  };
+  if (compareBufA) { free(compareBufA); compareBufA = nullptr; }
+  if (compareBufB) { free(compareBufB); compareBufB = nullptr; }
+  if (!l2b(idxA, &compareBufA, &compareWA, &compareHA)) return;
+  if (!l2b(idxB, &compareBufB, &compareWB, &compareHB)) { free(compareBufA); compareBufA = nullptr; return; }
+  compareIdxA = idxA; compareIdxB = idxB; compareActiveSlot = 0; appMode = MODE_COMPARE; drawCompareScreen(); resetAllButtons();
+}
+
+void handleModeCompare(ButtonEvent evt) {
+  if (!evt.valid) return;
+  if (evt.pin == BTN_BOOT && evt.isShort) {
+    if (compareBufA) { free(compareBufA); compareBufA = nullptr; }
+    if (compareBufB) { free(compareBufB); compareBufB = nullptr; }
+    appMode = MODE_PHOTO_VIEW; photoViewRender(); photoViewDrawCaption(photoViewIndex); resetAllButtons(); return;
+  }
+  if (evt.pin == BTN_B && evt.isShort) { compareActiveSlot = 1 - compareActiveSlot; drawCompareScreen(); return; }
+  if ((evt.pin == BTN_C || evt.pin == BTN_D) && evt.isShort) {
+    int d = (evt.pin == BTN_C) ? -1 : 1, n = (compareActiveSlot == 0) ? compareIdxA : compareIdxB;
+    for (int i = 0; i < galleryCount; i++) { n = (n + d + galleryCount) % galleryCount; if (gIsPhoto(n)) break; }
+    auto l2b = [](int idx, uint16_t** b, int* w, int* h) -> bool {
+      char p[64]; snprintf(p, sizeof(p), "/sdcard/%s", galleryFiles[idx]);
+      uint16_t jw, jh; if (!TJpgDec.getSdJpgSize(&jw, &jh, p)) return false;
+      uint16_t* nb = (uint16_t*)ps_malloc(jw * jh * 2); if (!nb) nb = (uint16_t*)malloc(jw * jh * 2);
+      if (!nb) return false;
+      FILE* f = fopen(p, "rb"); if (!f) { free(nb); return false; }
+      fseek(f, 0, SEEK_END); size_t l = ftell(f); fseek(f, 0, SEEK_SET);
+      uint8_t* jb = (uint8_t*)ps_malloc(l); if (!jb) jb = (uint8_t*)malloc(l);
+      if (jb) { fread(jb, 1, l, f); fclose(f); _decodeTargetBuf = nb; TJpgDec.drawJpg(0, 0, jb, l); free(jb); _decodeTargetBuf = nullptr; if (*b) free(*b); *b = nb; return true; }
+      fclose(f); free(nb); return false;
+    };
+    if (compareActiveSlot == 0) { if (l2b(n, &compareBufA, &compareWA, &compareHA)) compareIdxA = n; }
+    else { if (l2b(n, &compareBufB, &compareWB, &compareHB)) compareIdxB = n; }
+    drawCompareScreen();
+  }
+  if (evt.pin == BTN_D && evt.isLong) { openAICompare(compareIdxA, compareIdxB); }
+}
+
+void openAICompare(int idxA, int idxB) {
+  aiSelectedFeature = AI_FEAT_COMPARE; char statusHdr[32] = "AI: Compare"; lcd.fillScreen(COL_BLACK); drawAIStatus(statusHdr, "menyiapkan data...");
+  auto gB64 = [](int idx) -> String {
+    size_t l = 0; uint8_t* b = aiLoadPhotoAsJpeg(idx, &l); if (!b || l == 0) return "";
+    String out; base64Encode(b, l, out); free(b); return out;
+  };
+  String bA = gB64(idxA); if (bA == "") { islandPush(NOTIF_WARN, "Gagal baca foto 1"); return; }
+  String bB = gB64(idxB); if (bB == "") { islandPush(NOTIF_WARN, "Gagal baca foto 2"); return; }
+  String body = "{\"contents\":[{\"parts\":[";
+  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + bA + "\"}},";
+  body += "{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + bB + "\"}},";
+  body += "{\"text\":\"" + String(AI_FEATURES[AI_FEAT_COMPARE].prompt) + "\"}";
+  body += "]}]}";
+  if (doAICall(-1, "", &body)) { aiWrapText(aiResult); drawAIDescribeScreen(); appMode = MODE_AI_DESCRIBE; }
+  else { islandPush(NOTIF_WARN, "Compare AI gagal"); drawCompareScreen(); appMode = MODE_COMPARE; }
+}
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
-  if(cHeld&&galleryHoldDir!=-1){
-    galleryHoldDir=-1;galleryHoldStart=millis();
-    galleryLastStep=millis();galleryStep(-1);return;
-  }
-  if(dHeld&&galleryHoldDir!=1){
-    galleryHoldDir=1;galleryHoldStart=millis();
-    galleryLastStep=millis();galleryStep(1);return;
-  }
+  if(cHeld&&galleryHoldDir!=-1){ galleryHoldDir=-1;galleryHoldStart=millis(); galleryLastStep=millis();galleryStep(-1);return; }
+  if(dHeld&&galleryHoldDir!=1){ galleryHoldDir=1;galleryHoldStart=millis(); galleryLastStep=millis();galleryStep(1);return; }
   if(!cHeld&&!dHeld) galleryHoldDir=0;
   if(galleryHoldDir!=0){
-    uint32_t held=millis()-galleryHoldStart;
-    uint32_t interval=(held<500)?200:(held<1500)?100:50;
-    if(millis()-galleryLastStep>=interval){galleryStep(galleryHoldDir);galleryLastStep=millis();}
-    return;
+    uint32_t held=millis()-galleryHoldStart; uint32_t interval=(held<500)?200:(held<1500)?100:50;
+    if(millis()-galleryLastStep>=interval){galleryStep(galleryHoldDir);galleryLastStep=millis();} return;
   }
   if(!evt.valid) return;
+  if(multiDeleteMode) {
+    if(evt.pin==BTN_BOOT && evt.isShort) {
+      if(galleryCount>0 && gallerySelIdx>=0) {
+        multiDeleteSelected[gallerySelIdx] = !multiDeleteSelected[gallerySelIdx];
+        multiDeleteCount += multiDeleteSelected[gallerySelIdx] ? 1 : -1;
+        if(galleryGridMode) drawGalleryGrid(); else drawGallery();
+      }
+    } else if(evt.pin==BTN_B) {
+      if(evt.isLong) { if(multiDeleteCount > 0) openMultiDeleteConfirmDialog(); }
+      else { multiDeleteMode = false; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0; if(galleryGridMode) drawGalleryGrid(); else drawGallery(); }
+    }
+    return;
+  }
   if(evt.pin==BTN_BOOT){
-    if(evt.isLong){
-      if(galleryCount>0) openJumpDialog();
-      else islandPush(NOTIF_WARN,"GALLERY KOSONG");
-    } else if(evt.isShort){
+    if(evt.isLong){ if(galleryCount>0) openJumpDialog(); else islandPush(NOTIF_WARN,"GALLERY KOSONG"); }
+    else if(evt.isShort){
       if(galleryCount>0&&gallerySelIdx>=0&&gallerySelIdx<galleryCount){
         GalleryFileType ft=galleryFileType[gallerySelIdx];
-        if(ft==GFILE_VIDEO) openMjpegPlayer(galleryFiles[gallerySelIdx]);
-        else                showPhotoView(gallerySelIdx);
+        if(ft==GFILE_VIDEO) openMjpegPlayer(galleryFiles[gallerySelIdx]); else showPhotoView(gallerySelIdx);
       }
     }
-  }
-  else if(evt.pin==BTN_B){
-    if(evt.isLong){
-      galleryGridMode=!galleryGridMode;
-      galleryScroll=(gallerySelIdx / (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE)) * (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE);
-      if(galleryGridMode) drawGalleryGrid(); else drawGallery();
-    } else {
-      if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
-      galleryHoldDir=0;islandForceHide();resetAllButtons();
-      islandNoClear=true;
-      appMode=MODE_VIEWFINDER;lcd.fillScreen(COL_BLACK);
-      fpsLastTime=millis();fpsFrameCount=0;
-    }
-  }
-  else if(evt.pin==BTN_D&&evt.isLong){
+  } else if(evt.pin==BTN_B){
+    if(evt.isLong){ galleryGridMode=!galleryGridMode; galleryScroll=(gallerySelIdx / (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE)) * (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE); if(galleryGridMode) drawGalleryGrid(); else drawGallery(); }
+    else { if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;} galleryHoldDir=0;islandForceHide();resetAllButtons(); islandNoClear=true; appMode=MODE_VIEWFINDER;lcd.fillScreen(COL_BLACK); fpsLastTime=millis();fpsFrameCount=0; }
+  } else if(evt.pin==BTN_D&&evt.isLong){
     if(galleryCount==0){islandPush(NOTIF_WARN,"Gallery kosong");return;}
-    GalleryFileType ft=galleryFileType[gallerySelIdx];
-    if(ft==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
-    photoViewIndex=gallerySelIdx;
-    strncpy(photoViewPath,galleryFiles[gallerySelIdx],sizeof(photoViewPath)-1);
-    openAIFeatureMenu(false);
+    if(galleryFileType[gallerySelIdx]==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
+    photoViewIndex=gallerySelIdx; strncpy(photoViewPath,galleryFiles[gallerySelIdx],sizeof(photoViewPath)-1); openAIFeatureMenu(false);
+  } else if(evt.pin==BTN_C && evt.isLong) {
+    multiDeleteMode = true; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
+    if(galleryGridMode) drawGalleryGrid(); else drawGallery();
   }
 }
 
+
 void handleModePhotoView(ButtonEvent evt){
-  static unsigned long lastPanTime=0;
-  bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
+  static unsigned long lastPanTime=0; bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(photoZoomLevel>0&&(cHeld||dHeld)&&millis()-lastPanTime>120){
-    float zf=photoZoomFactors[photoZoomLevel];
-    int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
-    int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
-    if(cHeld) photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX);
-    if(dHeld) photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);
+    float zf=photoZoomFactors[photoZoomLevel]; int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf)), maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
+    if(cHeld) photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX); if(dHeld) photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);
     photoViewRender();lastPanTime=millis();return;
   }
   if(!evt.valid) return;
-  static unsigned long lastActionTime=0;
-  if(millis()-lastActionTime<150) return;
-  lastActionTime=millis();
-
+  static unsigned long lastActionTime=0; if(millis()-lastActionTime<150) return; lastActionTime=millis();
   if(evt.pin==BTN_BOOT&&evt.isShort){
-    photoViewCaptionVisible=false;photoViewCaptionUntilMs=0;
-    photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0;
+    photoViewCaptionVisible=false;photoViewCaptionUntilMs=0; photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0;
     if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
     lcd.setRotation(3); resetAllButtons();appMode=MODE_GALLERY; if(galleryGridMode) drawGalleryGrid(); else drawGallery();return;
   }
   if(evt.pin==BTN_B){
     if(evt.isLong){photoViewClearCaption();openDeleteDialog();}
     else{
-      photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS;
-      photoZoomOffX=0;photoZoomOffY=0;
+      photoZoomLevel=(photoZoomLevel+1)%ZOOM_LEVELS; photoZoomOffX=0;photoZoomOffY=0;
       if(photoZoomLevel>0){
-        float zf=photoZoomFactors[photoZoomLevel];
-        int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
-        photoZoomOffX=max(0,(int)photoBufW/2-vpW/2);
-        photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
+        float zf=photoZoomFactors[photoZoomLevel]; int vpW=(int)(DISP_W/zf),vpH=(int)(DISP_H/zf);
+        photoZoomOffX=max(0,(int)photoBufW/2-vpW/2); photoZoomOffY=max(0,(int)photoBufH/2-vpH/2);
       }
       photoViewRender();
-      if(photoZoomLevel==0){
-        photoViewDrawCaption(photoViewIndex);
-        photoViewCaptionUntilMs=millis()+2000;photoViewCaptionVisible=true;
-      }
     }
-    return;
-  }
-
-  if(evt.pin==BTN_D&&evt.isLong){
-    if(!sdReady){islandPush(NOTIF_WARN,"SD tidak tersedia");return;}
-    photoViewClearCaption();
-    openAIFeatureMenu(false);
-    return;
-  }
-
-  if(photoZoomLevel==0){
-    if(evt.pin==BTN_C&&evt.isShort) photoViewPrev();
-    if(evt.pin==BTN_D&&evt.isShort) photoViewNext();
-  } else {
-    float zf=photoZoomFactors[photoZoomLevel];
-    int maxOffX=max(0,(int)photoBufW-(int)(DISP_W/zf));
-    int maxOffY=max(0,(int)photoBufH-(int)(DISP_H/zf));
-    bool moved=false;
-    if(evt.pin==BTN_C){
-      if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX-PAN_STEP,0,maxOffX);moved=true;}
-      else           {photoZoomOffY=constrain(photoZoomOffY-PAN_STEP,0,maxOffY);moved=true;}
-    }
-    if(evt.pin==BTN_D){
-      if(evt.isShort){photoZoomOffX=constrain(photoZoomOffX+PAN_STEP,0,maxOffX);moved=true;}
-      else           {photoZoomOffY=constrain(photoZoomOffY+PAN_STEP,0,maxOffY);moved=true;}
-    }
-    if(moved) photoViewRender();
+  } else if(evt.pin==BTN_C && !cHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewPrev(); }
+  else if(evt.pin==BTN_D && !dHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewNext(); }
+  else if(evt.pin==BTN_C && evt.isLong) {
+    int n = photoViewIndex; for(int i=0; i<galleryCount; i++) { n = (n + 1) % galleryCount; if (gIsPhoto(n) && n != photoViewIndex) break; }
+    openCompareMode(photoViewIndex, n);
   }
 }
+
 
 void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
                             ButtonEvent evtC,ButtonEvent evtD){
@@ -4653,6 +4719,8 @@ void loop(){
     case MODE_MENU_EXP:        handleModeMenuExp(singleEvt);                   break;
     case MODE_MENU_EXP_ADJ:    handleModeMenuExpAdj(singleEvt);                break;
     case MODE_DIALOG_DELETE:   handleModeDialogDelete(singleEvt);              break;
+    case MODE_DIALOG_MULTI_DELETE: handleModeDialogMultiDelete(singleEvt);        break;
+    case MODE_COMPARE:             handleModeCompare(singleEvt);                   break;
     case MODE_MENU_FORMAT:     handleModeMenuFormat(singleEvt);                break;
     case MODE_JUMP_INPUT:      handleModeJumpInput(evtBoot,evtB,evtC,evtD);    break;
     case MODE_FEATURES:        handleModeFeatures(singleEvt);                  break;
@@ -4662,11 +4730,7 @@ void loop(){
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
   }
   if (appMode != MODE_VIEWFINDER) {
-    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE ||
-                   appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU ||
-                   appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES ||
-                   appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED ||
-                   appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ);
+    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_COMPARE || appMode == MODE_DIALOG_MULTI_DELETE);
     if (!isMenu) islandNoClear = false;
     islandTick();
   }
