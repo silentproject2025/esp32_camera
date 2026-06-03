@@ -1,9 +1,9 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v5.9-fix5
+ * Version: v6.0
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v5.9-fix5 (di atas v5.9-fix4):
+ *  CHANGELOG v6.0 (di atas v6.0-fix4):
  *
  *  [AI-MENU] Sub-menu pilih fitur AI (6 fitur)
  *    - Trigger dari VIEWFINDER: longpress C
@@ -21,7 +21,7 @@
  *    - Format pilihan ada di tab terakhir Exp Menu (shortpress BOOT di Exp)
  *
  * ═══════════════════════════════════════════════════════════════
- *  TETAP dari v5.9-fix4:
+ *  TETAP dari v6.0-fix4:
  *  [MULTI-KEY] Support hingga 5 Gemini API key sekaligus
  *  [KEY-MANAGER] Menu manajemen API key dari dalam kamera
  *  [AI-DESCRIBE] Deskripsi foto via Google Gemini Vision API
@@ -32,7 +32,7 @@
  *  [EXIF]        Inject EXIF ke JPEG
  * ═══════════════════════════════════════════════════════════════
  *
- * TOMBOL LAYOUT (final v5.9-fix5):
+ * TOMBOL LAYOUT (final v6.0):
  *
  *  VIEWFINDER:
  *    BOOT short  = capture foto
@@ -788,7 +788,7 @@ void saveSettings() {
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) return;
-  fprintf(f, "# Sanzxcam v5.9-fix5 settings\n");
+  fprintf(f, "# Sanzxcam v6.0 settings\n");
   fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
   fprintf(f, "neoflash=%d\n",   (int)neoFlashEnabled);
   fprintf(f, "exp_preset=%d\n", (int)expPreset);
@@ -1539,7 +1539,7 @@ void handleModeKeyManager(ButtonEvent evtBoot, ButtonEvent evtB,
 // ─────────────────────────────────────────────────────────────────────────────
 #define STEGO_PAYLOAD_LEN  32
 #define STEGO_MAGIC        "SANZXCAM"
-#define STEGO_VERSION      "v5.9"
+#define STEGO_VERSION      "v6.0"
 
 void stegoMakePayload(char* out, int maxLen, int photoNum) {
   snprintf(out, maxLen, "%s|%04d|%s", STEGO_MAGIC, photoNum, STEGO_VERSION);
@@ -1658,7 +1658,7 @@ uint8_t* exifInjectToJpeg(const uint8_t* jpgIn,size_t jpgLen,int photoNum,const 
   snprintf(strDesc,sizeof(strDesc),"photo_%04d",photoNum);
   snprintf(strMake,sizeof(strMake),"SANZXCAM");
   snprintf(strModel,sizeof(strModel),"%s",sensorStr?sensorStr:"UNKNOWN");
-  snprintf(strSoftware,sizeof(strSoftware),"v5.9-fix5");
+  snprintf(strSoftware,sizeof(strSoftware),"v6.0");
   exifMakeTimestamp(strDt,sizeof(strDt));
   int lenDesc=strlen(strDesc)+1,lenMake=strlen(strMake)+1;
   int lenModel=strlen(strModel)+1,lenSoftware=strlen(strSoftware)+1,lenDt=20;
@@ -3998,7 +3998,7 @@ void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
   const char* sub="ESP32-S3  CAMERA SYSTEM";
   lcd.drawString(sub,cx-lcd.textWidth(sub)/2,cy+10);
   lcd.setTextColor(COL_GRAY_3);
-  const char* ver="v5.9-fix5";
+  const char* ver="v6.0";
   lcd.drawString(ver,cx-lcd.textWidth(ver)/2,cy+22);
   lcd.drawFastHLine(cx-80,cy+32,160,COL_GRAY_2);
   delay(600);esp_task_wdt_reset();
@@ -4033,7 +4033,7 @@ void drawUSBModeScreen(){
   lcd.setTextColor(COL_GRAY_3);lcd.drawString("ESP32-S3",6,4);
   lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("USB MASS STORAGE",(DISP_W-lcd.textWidth("USB MASS STORAGE"))/2,4);
-  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v5.9-fix5",DISP_W-52,4);
+  lcd.setTextColor(COL_GRAY_3);lcd.drawString("v6.0",DISP_W-52,4);
   drawUSBIcon(DISP_W/2,85,COL_GRAY_7);
   lcd.setFont(&fonts::FreeSansBold9pt7b);lcd.setTextColor(COL_GRAY_E);
   lcd.drawString("SD CONNECTED",(DISP_W-lcd.textWidth("SD CONNECTED"))/2,118);
@@ -4178,7 +4178,7 @@ void neoTick() {
 
 void setup(){
   Serial.begin(115200);
-  Serial.println("\n=== Sanzxcam v5.9-fix5 ===");
+  Serial.println("\n=== Sanzxcam v6.0 ===");
   Serial.println("[AI-MENU] 7 fitur: Describe/Scavenger/Mood/ANPR/Sky/Pest/Produce");
   Serial.println("[TRIGGER] Clong=viewfinder  Dlong=gallery  Dlong=photo view");
 
@@ -4418,6 +4418,10 @@ void handleModeGallery(ButtonEvent evt){
   } else if(evt.pin==BTN_B){
     if(evt.isLong){ galleryGridMode=!galleryGridMode; galleryScroll=(gallerySelIdx / (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE)) * (galleryGridMode ? 16 : GALLERY_ITEMS_PAGE); if(galleryGridMode) drawGalleryGrid(); else drawGallery(); }
     else { if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;} galleryHoldDir=0;islandForceHide();resetAllButtons(); islandNoClear=true; appMode=MODE_VIEWFINDER;lcd.fillScreen(COL_BLACK); fpsLastTime=millis();fpsFrameCount=0; }
+  } else if(evt.pin==BTN_C&&evt.isLong){
+    if(galleryCount==0){islandPush(NOTIF_WARN,"Gallery kosong");return;}
+    multiDeleteMode = true; multiDeleteCount = 0; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected));
+    if(galleryGridMode) drawGalleryGrid(); else drawGallery();
   } else if(evt.pin==BTN_D&&evt.isLong){
     if(galleryCount==0){islandPush(NOTIF_WARN,"Gallery kosong");return;}
     if(galleryFileType[gallerySelIdx]==GFILE_VIDEO){islandPush(NOTIF_WARN,"Pilih foto, bukan video");return;}
@@ -4456,8 +4460,6 @@ void handleModePhotoView(ButtonEvent evt){
   }
   else if(evt.pin==BTN_D && !dHeld){ photoZoomLevel=0;photoZoomOffX=0;photoZoomOffY=0; photoViewNext(); }
 }
-
-
 void handleModeMjpegPlayer(ButtonEvent evtBoot,ButtonEvent evtB,
                             ButtonEvent evtC,ButtonEvent evtD){
   static unsigned long lastToggleTime=0;
