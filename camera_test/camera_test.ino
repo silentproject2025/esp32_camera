@@ -1,9 +1,9 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v6.0
+ * Version: v6.1
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v6.0 (di atas v6.0-fix4):
+ *  CHANGELOG v6.1 (di atas v6.0-fix4):
  *
  *  [AI-MENU] Sub-menu pilih fitur AI (6 fitur)
  *    - Trigger dari VIEWFINDER: longpress C
@@ -30,6 +30,7 @@
  *  [JUMP]        Jump-to-number di Gallery (BOOT long-press)
  *  [STEGO]       Steganografi JPEG & BMP
  *  [EXIF]        Inject EXIF ke JPEG
+ *  [BT-MP3]      Bluetooth MP3 Player integration
  * ═══════════════════════════════════════════════════════════════
  *
  * TOMBOL LAYOUT (final v6.0):
