@@ -1044,7 +1044,7 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 
 // [PORTED v6.1] Features Menu
 void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 314, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  int mw = 220, mh = 230, mx = (DISP_W - mw) / 2, my = 5;
   lcd.fillScreen(COL_BLACK);
   lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
   lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
@@ -1052,19 +1052,19 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[12] = {
+  static const char* const rowLabels[13] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
     "CALIBRATE MPU  recalibrate",
     "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
     "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
-    "DLPF  filter bandwidth", "CLEAR THUMB CACHE"
+    "DLPF  filter bandwidth", "CLEAR THUMB CACHE", "BT MP3 PLAYER  A2DP Source"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 12; i++) {
-    int iy = my + 24 + i * 22; bool hl = (i == sel);
-    lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
-    if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
+  for (int i = 0; i < 13; i++) {
+    int iy = my + 20 + i * 15; bool hl = (i == sel);
+    lcd.fillRect(mx + 8, iy, mw - 16, 14, hl ? COL_GRAY_5 : COL_GRAY_D);
+    if (hl) lcd.fillRect(mx + 2, iy, 4, 14, COL_WHITE);
     lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
     lcd.drawString(rowLabels[i], mx + 12, iy + 5);
 
@@ -1096,10 +1096,14 @@ void drawFeaturesMenu(int sel) {
       lcd.setTextColor(COL_GRAY_7);
       lcd.drawString("RUN", mx + mw - 30, iy + 5);
     }
+    else if (i == 12) {
+      lcd.setTextColor(btConnected ? 0x07E0 : COL_GRAY_7);
+      lcd.drawString(btConnected ? "CON" : "RUN", mx + mw - 30, iy + 5);
+    }
   }
-  lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
+  lcd.drawFastHLine(mx + 10, my + mh - 18, mw - 20, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 14);
+  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 10);
 }
 
 // UI UPDATE v6.0
@@ -1117,8 +1121,8 @@ void handleModeFeatures(ButtonEvent evt) {
     return;
   }
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 12; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 11) % 12; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 13; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 12) % 13; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1178,6 +1182,9 @@ void handleModeFeatures(ButtonEvent evt) {
         islandPush(NOTIF_WARN, "Cache dir tidak ada");
       }
       drawFeaturesMenu(menuFeatSel);
+    }
+    else if (menuFeatSel == 12) {
+      btStartScan();
     }
   }
 }
