@@ -504,7 +504,6 @@ static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 // [PORTED v6.2] Radio globals
 #define PIN_RADIO_SDA 43
 #define PIN_RADIO_SCL 44
-TwoWire WireRadio = TwoWire(1);
 static RDA5807M radio;
 static uint16_t radioFreq = 10070; // 100.7 MHz default
 static uint8_t  radioVol = 5;
@@ -3068,6 +3067,7 @@ static KalmanAngle kalmanX, kalmanY;
 static uint32_t kalmanLastMs = 0;
 
 void mpuTick() {
+  if (appMode == MODE_RADIO) return;
   esp_task_wdt_reset();
   if (!g_mpuOk) return;
   uint32_t now = millis();
@@ -4554,8 +4554,8 @@ void handleModeMenuExp(ButtonEvent evt){
 
 // [PORTED v6.2] RADIO IMPLEMENTATION
 void radioInit() {
-  WireRadio.begin(PIN_RADIO_SDA, PIN_RADIO_SCL);
-  radio.initWire(WireRadio);
+  radio.initWire(Wire);
+
   radio.setBand(RADIO_BAND_FM);
   radio.setFrequency(radioFreq);
   radio.setVolume(radioVol);
@@ -4569,6 +4569,7 @@ void openRadio() {
   lcd.fillScreen(COL_BLACK);
   resetAllButtons();
   appMode = MODE_RADIO;
+  drawRadioUI();
 }
 
 void drawRadioUI() {
@@ -4639,7 +4640,7 @@ void handleModeRadio(ButtonEvent evt) {
   if (millis() - lastUpdate > 500) {
     radioFreq = radio.getFrequency();
     RADIO_INFO info;
-    radio.getRadioInfo(&info);
+    radio.checkRDS(); radio.getRadioInfo(&info);
     radioStereo = info.stereo;
     lastUpdate = millis();
     drawRadioUI();
