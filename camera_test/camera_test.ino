@@ -4644,7 +4644,7 @@ void drawRadioUI() {
   radioSprite.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
   radioSprite.setTextColor(COL_GRAY_8);
   radioSprite.setFont(&fonts::Font0);
-  const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit)";
+  const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit) BOOT:Mute (Hold:Scan)";
   radioSprite.drawString(hint, mx + (mw - radioSprite.textWidth(hint)) / 2, my + mh - 16);
 
   radioSprite.pushSprite(0, 0);
@@ -4680,7 +4680,7 @@ void handleModeRadio(ButtonEvent evt) {
       radio.seekDown(true);
     } else {
       radioFreq -= 10;
-      if (radioFreq < 8750) radioFreq = 10800;
+      if (radioFreq < 5000) radioFreq = 11500;
       radio.setFrequency(radioFreq);
     }
   } else if (evt.pin == BTN_D) {
@@ -4688,12 +4688,16 @@ void handleModeRadio(ButtonEvent evt) {
       radio.seekUp(true);
     } else {
       radioFreq += 10;
-      if (radioFreq > 10800) radioFreq = 8750;
+      if (radioFreq > 11500) radioFreq = 5000;
       radio.setFrequency(radioFreq);
     }
   } else if (evt.pin == BTN_BOOT) {
-    radioMute = !radioMute;
-    radio.setMute(radioMute);
+    if (evt.isLong) {
+      radio.seekUp(true);
+    } else {
+      radioMute = !radioMute;
+      radio.setMute(radioMute);
+    }
   }
 
   drawRadioUI();
