@@ -503,7 +503,7 @@ static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 
 // [PORTED v6.2] Radio globals
 #define PIN_RADIO_SDA 43
-#define PIN_RADIO_SCL 42
+#define PIN_RADIO_SCL 44
 TwoWire WireRadio = TwoWire(1);
 static RDA5807M radio;
 static uint16_t radioFreq = 10070; // 100.7 MHz default
