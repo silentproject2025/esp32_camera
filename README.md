@@ -12,7 +12,7 @@
 ## 🚀 Fitur Unggulan
 
 ### 🧠 Intelligence (Gemini AI Integration)
-Integrasi langsung dengan **Gemini 2.0 Flash API** untuk analisis gambar real-time:
+Integrasi langsung dengan **Gemini 2.5 Flash lite** untuk analisis gambar real-time:
 - **Describe**: Deskripsi visual dalam Bahasa Indonesia.
 - **Scavenger Hunt**: Game interaktif berbasis objek yang ditemukan kamera.
 - **Mood Reader**: Analisis ekspresi wajah dan suasana foto.
