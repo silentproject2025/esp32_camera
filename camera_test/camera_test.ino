@@ -99,6 +99,7 @@ extern "C" {
 #include "USB.h"
 #include "USBMSC.h"
 #include <RDA5807M.h>
+#include <RDSParser.h>
 
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
@@ -506,6 +507,7 @@ static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 #define PIN_RADIO_SCL 44
 static RDA5807M radio;
 static LGFX_Sprite radioSprite(&lcd);
+static RDSParser rds;
 static uint16_t radioFreq = 10070; // 100.7 MHz default
 static uint8_t  radioVol = 5;
 static bool     radioMute = false;
@@ -4537,26 +4539,30 @@ void handleModeMenuExp(ButtonEvent evt){
 
 // [PORTED v6.2] RADIO IMPLEMENTATION
 
-void RDS_PROCS(uint16_t block1, uint16_t block2, uint16_t block3, uint16_t block4) {
-  radio.processData(block1, block2, block3, block4);
+void DisplayServiceName(const char *name) {
+  if (name && strcmp(radioRDSStation, name) != 0) {
+    strncpy(radioRDSStation, name, sizeof(radioRDSStation)-1);
+  }
 }
 
-void updateRDS() {
-  char s[10];
-  radio.getServiceName(s);
-  if (s[0] != 0 && strcmp(s, radioRDSStation) != 0) {
-    strncpy(radioRDSStation, s, sizeof(radioRDSStation)-1);
-  }
-  char t[66];
-  radio.getRadioText(t);
-  if (t[0] != 0 && strcmp(t, radioRDSText) != 0) {
-    strncpy(radioRDSText, t, sizeof(radioRDSText)-1);
+void DisplayText(const char *text) {
+  if (text && strcmp(radioRDSText, text) != 0) {
+    strncpy(radioRDSText, text, sizeof(radioRDSText)-1);
   }
 }
+
+void RDS_PROCS(uint16_t block1, uint16_t block2, uint16_t block3, uint16_t block4) {
+  rds.processData(block1, block2, block3, block4);
+}
+
+void updateRDS() {}
 
 void radioInit() {
   radio.initWire(Wire);
+radio.init();
   radio.attachReceiveRDS(RDS_PROCS);
+  rds.attachServiceNameCallback(DisplayServiceName);
+  rds.attachTextCallback(DisplayText);
 
   radio.setBand(RADIO_BAND_FM);
   radio.setFrequency(radioFreq);
