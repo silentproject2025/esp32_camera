@@ -505,6 +505,7 @@ static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 #define PIN_RADIO_SDA 43
 #define PIN_RADIO_SCL 44
 static RDA5807M radio;
+static LGFX_Sprite radioSprite(&lcd);
 static uint16_t radioFreq = 10070; // 100.7 MHz default
 static uint8_t  radioVol = 5;
 static bool     radioMute = false;
@@ -1284,7 +1285,6 @@ void openAIFeatureMenu(bool fromViewfinder) {
   neoBurst(0, 200, 200, 2);
 }
 
-
 bool captureForAI(char* outPath, int outPathLen) {
   snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
   if (ledFlashEnabled) {
@@ -1825,7 +1825,6 @@ int           recFrameCount = 0;
 int           recVideoCount = 0;
 unsigned long recStartMs    = 0;
 
-
 const char* expPresetNames[6] = { "AUTO", "GRAY", "MOON", "NIGHT", "NIGHT-BW", "MANUAL" };
 
 struct ExpPresetCfg {
@@ -2077,7 +2076,6 @@ void scanGalleryFiles(){
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI UPDATE v6.0
-
 
 void thumbCacheEnsureDir() {
   struct stat st;
@@ -2865,8 +2863,6 @@ void mjpegDrawHUD(){
   lcd.setTextColor(COL_GRAY_A);lcd.drawString(buf,9,6);
 }
 
-
-
 void loopMjpegPlayer(){
   if(!mjpegPlaying) return;
   if(!mjpegPaused){
@@ -2916,7 +2912,6 @@ void drawRecIndicator(){
   char fBuf[10]; snprintf(fBuf,sizeof(fBuf),"%df",recFrameCount);
   lcd.setTextColor(COL_GRAY_5); lcd.drawString(fBuf,18,14);
 }
-
 
 void startRecording() {
   if (!sdReady || recActive) return;
@@ -3022,7 +3017,6 @@ void updateFPS(){
     fpsFrameCount=0;fpsLastTime=millis();
   }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Exposure
@@ -3168,7 +3162,6 @@ void mpuDrawIndicator() {
   } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; neoSolid(0, 40, 0); } // COL_GRAY_7
   drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
 }
-
 
 // Write one register to GC2145 via SCCB
 static void gc2145WriteReg(uint8_t reg, uint8_t val) {
@@ -3515,7 +3508,6 @@ bool doAICall(int idx, const char* customPrompt, const String* prebuiltBody = nu
   if(!text){ drawAIStatus("AI Kosong","tidak ada jawaban"); delay(2000); return false; }
   strncpy(aiResult,text,AI_RESULT_MAX); aiResult[AI_RESULT_MAX]='\0'; return true;
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Entry point utama
@@ -3994,7 +3986,6 @@ void glitchChromatic(const char* text,int cx,int cy,int offsetX,uint16_t colR,ui
   lcd.setTextColor(colB);lcd.drawString(text,cx-tw/2+offsetX,cy-7);
 }
 
-
 void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
                      bool xclkOK,uint32_t xclkHz){
   lcd.fillScreen(COL_BLACK);
@@ -4117,7 +4108,6 @@ void exitUSBMode(){
 // ─────────────────────────────────────────────────────────────────────────────
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
-
 
 void neoSetup() {
   strip.begin();
@@ -4399,13 +4389,6 @@ void handleModeDialogMultiDelete(ButtonEvent evt) {
   else { neoOff(); multiDeleteMode = false; resetAllButtons(); appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery(); }
 }
 
-
-
-
-
-
-
-
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
   if(cHeld&&galleryHoldDir!=-1){ galleryHoldDir=-1;galleryHoldStart=millis(); galleryLastStep=millis();galleryStep(-1);return; }
@@ -4553,8 +4536,27 @@ void handleModeMenuExp(ButtonEvent evt){
 }
 
 // [PORTED v6.2] RADIO IMPLEMENTATION
+
+void RDS_PROCS(uint16_t block1, uint16_t block2, uint16_t block3, uint16_t block4) {
+  radio.processData(block1, block2, block3, block4);
+}
+
+void updateRDS() {
+  char s[10];
+  radio.getServiceName(s);
+  if (s[0] != 0 && strcmp(s, radioRDSStation) != 0) {
+    strncpy(radioRDSStation, s, sizeof(radioRDSStation)-1);
+  }
+  char t[66];
+  radio.getRadioText(t);
+  if (t[0] != 0 && strcmp(t, radioRDSText) != 0) {
+    strncpy(radioRDSText, t, sizeof(radioRDSText)-1);
+  }
+}
+
 void radioInit() {
   radio.initWire(Wire);
+  radio.attachReceiveRDS(RDS_PROCS);
 
   radio.setBand(RADIO_BAND_FM);
   radio.setFrequency(radioFreq);
@@ -4566,6 +4568,10 @@ void radioInit() {
 
 void openRadio() {
   radioInit();
+  if (!radioSprite.getBuffer()) {
+    radioSprite.setPsram(true);
+    radioSprite.createSprite(DISP_W, DISP_H);
+  }
   lcd.fillScreen(COL_BLACK);
   resetAllButtons();
   appMode = MODE_RADIO;
@@ -4573,66 +4579,70 @@ void openRadio() {
 }
 
 void drawRadioUI() {
+  radioSprite.fillScreen(COL_BLACK);
   int mx = 20, my = 20, mw = DISP_W - 40, mh = DISP_H - 40;
 
   // Background box
-  lcd.fillRoundRect(mx, my, mw, mh, 8, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 8, COL_GRAY_5);
+  radioSprite.fillRoundRect(mx, my, mw, mh, 8, COL_GRAY_D);
+  radioSprite.drawRoundRect(mx, my, mw, mh, 8, COL_GRAY_5);
 
   // Header
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("--- FM RADIO RECEIVER ---", mx + (mw - lcd.textWidth("--- FM RADIO RECEIVER ---")) / 2, my + 8);
-  lcd.drawFastHLine(mx + 10, my + 22, mw - 20, COL_GRAY_3);
+  radioSprite.setFont(&fonts::Font0); radioSprite.setTextSize(1);
+  radioSprite.setTextColor(COL_AI_ACCENT);
+  radioSprite.drawString("--- FM RADIO RECEIVER ---", mx + (mw - radioSprite.textWidth("--- FM RADIO RECEIVER ---")) / 2, my + 8);
+  radioSprite.drawFastHLine(mx + 10, my + 22, mw - 20, COL_GRAY_3);
 
   // Frequency Display
-  lcd.setFont(&fonts::FreeSansBold18pt7b);
-  lcd.setTextColor(COL_WHITE);
+  radioSprite.setFont(&fonts::FreeSansBold18pt7b);
+  radioSprite.setTextColor(COL_WHITE);
   char freqBuf[16];
   snprintf(freqBuf, sizeof(freqBuf), "%d.%02d", radioFreq / 100, radioFreq % 100);
-  int fw = lcd.textWidth(freqBuf);
-  lcd.drawString(freqBuf, mx + (mw - fw) / 2, my + 45);
+  int fw = radioSprite.textWidth(freqBuf);
+  radioSprite.drawString(freqBuf, mx + (mw - fw) / 2, my + 45);
 
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_7);
-  lcd.drawString("MHz", mx + (mw + fw) / 2 + 5, my + 60);
+  radioSprite.setFont(&fonts::Font0); radioSprite.setTextColor(COL_GRAY_7);
+  radioSprite.drawString("MHz", mx + (mw + fw) / 2 + 5, my + 60);
 
   // RDS Info (Station & Text)
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("STATION:", mx + 15, my + 95);
-  lcd.setTextColor(COL_WHITE);
-  lcd.drawString(radioRDSStation, mx + 75, my + 95);
+  radioSprite.setFont(&fonts::Font0);
+  radioSprite.setTextColor(COL_GRAY_A);
+  radioSprite.drawString("STATION:", mx + 15, my + 95);
+  radioSprite.setTextColor(COL_WHITE);
+  radioSprite.drawString(radioRDSStation, mx + 75, my + 95);
 
-  lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("RDS:", mx + 15, my + 115);
-  lcd.setTextColor(COL_GRAY_7);
-  lcd.setClipRect(mx + 45, my + 115, mw - 60, 20);
-  lcd.drawString(radioRDSText, mx + 45, my + 115);
-  lcd.clearClipRect();
+  radioSprite.setTextColor(COL_GRAY_A);
+  radioSprite.drawString("RDS:", mx + 15, my + 115);
+  radioSprite.setTextColor(COL_GRAY_7);
+  radioSprite.setClipRect(mx + 45, my + 115, mw - 60, 20);
+  radioSprite.drawString(radioRDSText, mx + 45, my + 115);
+  radioSprite.clearClipRect();
 
   // Volume Bar
   int vx = mx + 20, vy = my + 145, vw = mw - 40, vh = 10;
-  lcd.drawRect(vx, vy, vw, vh, COL_GRAY_3);
+  radioSprite.drawRect(vx, vy, vw, vh, COL_GRAY_3);
   int fillW = map(radioVol, 0, 15, 0, vw);
-  lcd.fillRect(vx + 2, vy + 2, fillW - 4, vh - 4, 0x07E0);
-  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("VOL", vx - 15, vy + 1);
+  radioSprite.fillRect(vx + 2, vy + 2, fillW - 4, vh - 4, 0x07E0);
+  radioSprite.setFont(&fonts::Font0); radioSprite.setTextColor(COL_GRAY_A);
+  radioSprite.drawString("VOL", vx - 15, vy + 1);
 
   // Status Indicators (Mute, Bass, Stereo)
   int sy = my + 165;
-  lcd.setTextColor(radioMute ? 0xF800 : COL_GRAY_3);
-  lcd.drawString("MUTE", mx + 30, sy);
-  lcd.setTextColor(radioBass ? 0x07E0 : COL_GRAY_3);
-  lcd.drawString("BASS", mx + 80, sy);
-  lcd.setTextColor(radioStereo ? 0x07E0 : COL_GRAY_3);
-  lcd.drawString("STEREO", mx + 130, sy);
+  radioSprite.setTextColor(radioMute ? 0xF800 : COL_GRAY_3);
+  radioSprite.drawString("MUTE", mx + 30, sy);
+  radioSprite.setTextColor(radioBass ? 0x07E0 : COL_GRAY_3);
+  radioSprite.drawString("BASS", mx + 80, sy);
+  radioSprite.setTextColor(radioStereo ? 0x07E0 : COL_GRAY_3);
+  radioSprite.drawString("STEREO", mx + 130, sy);
 
   // Footer Hint
-  lcd.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_8);
-  lcd.setFont(&fonts::Font0);
+  radioSprite.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
+  radioSprite.setTextColor(COL_GRAY_8);
+  radioSprite.setFont(&fonts::Font0);
   const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit)";
-  lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 16);
+  radioSprite.drawString(hint, mx + (mw - radioSprite.textWidth(hint)) / 2, my + mh - 16);
+
+  radioSprite.pushSprite(0, 0);
+
 }
 
 void handleModeRadio(ButtonEvent evt) {
@@ -4640,7 +4650,7 @@ void handleModeRadio(ButtonEvent evt) {
   if (millis() - lastUpdate > 500) {
     radioFreq = radio.getFrequency();
     RADIO_INFO info;
-    radio.checkRDS(); radio.getRadioInfo(&info);
+    radio.checkRDS(); updateRDS(); radio.getRadioInfo(&info);
     radioStereo = info.stereo;
     lastUpdate = millis();
     drawRadioUI();
