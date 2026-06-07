@@ -1,4 +1,4 @@
-# 📸 SANZXCAM v6.0
+# 📸 SANZXCAM v6.1
 
 Firmware kamera kustom berbasis **ESP32-S3** dengan fokus pada estetika retro-terminal, fitur eksperimental (MPU6050), dan integrasi AI.
 
@@ -33,6 +33,17 @@ Firmware kamera kustom berbasis **ESP32-S3** dengan fokus pada estetika retro-te
 
 ---
 
+### 📻 Mode: FM RADIO
+
+| Tombol | Tekan Singkat (Short) | Tekan Lama (Long) |
+|---|---|---|
+| **BOOT** | 🔇 Mute / Unmute | - |
+| **B** | 🔊 Volume (+) | ⬅️ Keluar (Back to Menu) |
+| **C** | 🔍 Seek Down | - |
+| **D** | 🔍 Seek Up | - |
+
+---
+
 ### 🛠️ Menu: EXPERIMENTAL FEATURES (D-Short)
 
 Menu untuk mengatur fitur tingkat lanjut dan sensor MPU6050:
@@ -43,14 +54,18 @@ Menu untuk mengatur fitur tingkat lanjut dan sensor MPU6050:
 - **HUD**: Toggle overlay UI pada viewfinder.
 - **CALIBRATE MPU**: Kalibrasi gyroscope (simpan ke `mpu_cal.ini`).
 - **HD CAPTURE**: Kualitas JPEG tinggi (menggunakan PSRAM lebih besar).
-- **KALMAN/DLPF**: Pengaturan filter sensor untuk stabilitas tilt.
+- **HD QUALITY**: Pengaturan tingkat kompresi (4=maksimal, 6=seimbang).
+- **KALMAN-R**: Tuning noise filter untuk stabilitas tilt.
+- **TILT-DZ**: Pengaturan deadzone kemiringan (derajat).
+- **DLPF**: Digital Low Pass Filter bandwidth (5Hz - 260Hz).
 - **CLEAR THUMB**: Hapus cache thumbnail di SD card.
+- **FM RADIO**: Membuka antarmuka Radio RDA5807M.
 
 ---
 
 ### ⚡ Menu: EXPOSURE (D-Long)
 
-UI baru berbasis **Arc Meter** dengan 6 preset:
+UI berbasis **Arc Meter** dengan 6 preset:
 1. **AUTO**: Kendali otomatis penuh.
 2. **GRAY**: Efek hitam putih real-time.
 3. **MOON**: Exposure rendah untuk objek sangat terang.
@@ -60,12 +75,25 @@ UI baru berbasis **Arc Meter** dengan 6 preset:
 
 ---
 
+## 🤖 Fitur AI (Gemini Vision)
+
+Integrasi AI untuk analisis gambar secara real-time:
+1. **Describe**: Deskripsi detail isi gambar dalam Bahasa Indonesia.
+2. **Scavenger Hunt**: Tantangan interaktif menebak objek.
+3. **Mood Reader**: Analisis emosi wajah atau suasana gambar.
+4. **ANPR**: Pembacaan plat nomor kendaraan otomatis.
+5. **Sky Watch**: Analisis kondisi awan dan fenomena langit.
+6. **Pest Count**: Identifikasi dan perhitungan hama/serangga.
+7. **Produce ID**: Identifikasi produk pertanian dan nilai gizi.
+
+---
+
 ## 🔐 Steganografi & Metadata
 
 Setiap foto yang diambil menyertakan data tersembunyi:
 - **JPEG**: Payload di COM marker (`0xFE`) + EXIF tags (Make, Model, Software).
 - **BMP**: Payload disisipkan di **LSB Blue channel** (24-bit).
-- **Payload**: `SANZXCAM|XXXX|v6.0` (XXXX = index foto).
+- **Payload**: `SANZXCAM|XXXX|v6.1` (XXXX = index foto).
 
 ---
 
@@ -82,14 +110,15 @@ Setiap foto yang diambil menyertakan data tersembunyi:
 
 - `LovyanGFX`: Driver display & akselerasi grafis.
 - `TJpg_Decoder` & `JPEGDEC`: Engine rendering gambar/video.
-- `FastLED`: Kontrol status LED NeoPixel (GPIO 48).
+- `Adafruit NeoPixel`: Kontrol status LED NeoPixel (GPIO 48).
 - `Adafruit MPU6050`: Integrasi sensor gerak.
+- `Radio`: Library untuk modul RDA5807M.
 
 ---
 
 <div align="center">
 
-**SANZXCAM v6.0** — Terminal Aesthetic ESP32-S3 Camera
+**SANZXCAM v6.1** — Terminal Aesthetic ESP32-S3 Camera
 
 *Stability. Control. Stealth.*
 
