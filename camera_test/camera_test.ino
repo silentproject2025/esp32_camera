@@ -99,6 +99,7 @@ extern "C" {
 #include "USB.h"
 #include "USBMSC.h"
 #include <RDA5807M.h>
+#include <RDSParser.h>
 
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
@@ -506,15 +507,32 @@ static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 #define PIN_RADIO_SCL 42
 TwoWire WireRadio = TwoWire(1);
 static RDA5807M radio;
-static uint16_t radioFreq = 10070; // 100.7 MHz default
+static uint16_t radioFreq = 10070;
 static uint8_t  radioVol = 5;
 static bool     radioMute = false;
+static bool     radioSoftMute = false;
 static bool     radioBass = true;
 static bool     radioStereo = true;
+static uint8_t  radioRssi = 0;
+static uint8_t  radioSnr = 0;
 static char     radioRDSStation[10] = "         ";
 static char     radioRDSText[66] = "Waiting for RDS...";
 static uint32_t radioLastRdsMs = 0;
+static RDSParser rds;
 
+void DisplayServiceName(const char *name) {
+  strncpy(radioRDSStation, name, sizeof(radioRDSStation)-1);
+  radioRDSStation[sizeof(radioRDSStation)-1] = 0;
+}
+
+void DisplayText(const char *text) {
+  strncpy(radioRDSText, text, sizeof(radioRDSText)-1);
+  radioRDSText[sizeof(radioRDSText)-1] = 0;
+}
+
+void RDS_process(uint16_t block1, uint16_t block2, uint16_t block3, uint16_t block4) {
+  rds.processData(block1, block2, block3, block4);
+}
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -821,6 +839,11 @@ void saveSettings() {
   fprintf(f, "dlpf=%d\n", (int)mpuDlpfIndex);
   fprintf(f, "kalman_r=%.3f\n", mpuKalmanRmeas);
   fprintf(f, "tilt_dz=%.1f\n",  mpuTiltDeadzone);
+  fprintf(f, "radio_freq=%d\n",   (int)radioFreq);
+  fprintf(f, "radio_vol=%d\n",    (int)radioVol);
+  fprintf(f, "radio_bass=%d\n",   (int)radioBass);
+  fprintf(f, "radio_stereo=%d\n", (int)radioStereo);
+  fprintf(f, "radio_smute=%d\n",  (int)radioSoftMute);
   fclose(f);
 }
 
@@ -831,7 +854,12 @@ void loadSettings() {
   while (fgets(line, sizeof(line), f)) {
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     int v = 0;
-    if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
+    if      (sscanf(line, "radio_freq=%d",   &v) == 1) { radioFreq   = (uint16_t)v; }
+    else if (sscanf(line, "radio_vol=%d",    &v) == 1) { radioVol    = (uint8_t)v; }
+    else if (sscanf(line, "radio_bass=%d",   &v) == 1) { radioBass   = (bool)v; }
+    else if (sscanf(line, "radio_stereo=%d", &v) == 1) { radioStereo = (bool)v; }
+    else if (sscanf(line, "radio_smute=%d",  &v) == 1) { radioSoftMute = (bool)v; }
+    else if (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
     else if (sscanf(line, "neoflash=%d",   &v) == 1) { neoFlashEnabled    = (bool)v; }
     else if (sscanf(line, "exp_preset=%d", &v) == 1) { expPreset          = (uint8_t)constrain(v,0,5); }
     else if (sscanf(line, "exp_val=%d",    &v) == 1) { expManualVal       = constrain(v,0,1200); }
@@ -4559,9 +4587,15 @@ void radioInit() {
   radio.setBand(RADIO_BAND_FM);
   radio.setFrequency(radioFreq);
   radio.setVolume(radioVol);
-  radio.setMono(false);
+  radio.setMono(!radioStereo);
   radio.setBassBoost(radioBass);
   radio.setMute(radioMute);
+  radio.setSoftMute(radioSoftMute);
+
+  // Attach RDS callbacks
+  radio.attachReceiveRDS(RDS_process);
+  rds.attachServiceNameCallback(DisplayServiceName);
+  rds.attachTextCallback(DisplayText);
 }
 
 void openRadio() {
@@ -4572,7 +4606,7 @@ void openRadio() {
 }
 
 void drawRadioUI() {
-  int mx = 20, my = 20, mw = DISP_W - 40, mh = DISP_H - 40;
+  int mx = 20, my = 15, mw = DISP_W - 40, mh = DISP_H - 30;
 
   // Background box
   lcd.fillRoundRect(mx, my, mw, mh, 8, COL_GRAY_D);
@@ -4594,6 +4628,19 @@ void drawRadioUI() {
 
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_7);
   lcd.drawString("MHz", mx + (mw + fw) / 2 + 5, my + 60);
+
+  // Signal Strength (RSSI) & SNR
+  int rx = mx + 20, ry = my + 75;
+  lcd.setTextColor(COL_GRAY_A);
+  lcd.drawString("RSSI:", rx, ry);
+  lcd.fillRect(rx + 35, ry + 2, 60, 6, COL_GRAY_2);
+  int rssiW = map(constrain(radioRssi, 0, 100), 0, 100, 0, 60);
+  lcd.fillRect(rx + 35, ry + 2, rssiW, 6, (radioRssi > 30) ? 0x07E0 : 0xF800);
+
+  lcd.drawString("SNR:", rx + 110, ry);
+  char snrBuf[8]; snprintf(snrBuf, sizeof(snrBuf), "%d dB", radioSnr);
+  lcd.setTextColor(COL_WHITE);
+  lcd.drawString(snrBuf, rx + 140, ry);
 
   // RDS Info (Station & Text)
   lcd.setFont(&fonts::Font0);
@@ -4617,30 +4664,37 @@ void drawRadioUI() {
   lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
   lcd.drawString("VOL", vx - 15, vy + 1);
 
-  // Status Indicators (Mute, Bass, Stereo)
+  // Status Indicators (Mute, S-Mute, Bass, Stereo)
   int sy = my + 165;
   lcd.setTextColor(radioMute ? 0xF800 : COL_GRAY_3);
-  lcd.drawString("MUTE", mx + 30, sy);
+  lcd.drawString("MUTE", mx + 15, sy);
+  lcd.setTextColor(radioSoftMute ? 0xFBC0 : COL_GRAY_3);
+  lcd.drawString("S-MUTE", mx + 55, sy);
   lcd.setTextColor(radioBass ? 0x07E0 : COL_GRAY_3);
-  lcd.drawString("BASS", mx + 80, sy);
+  lcd.drawString("BASS", mx + 110, sy);
   lcd.setTextColor(radioStereo ? 0x07E0 : COL_GRAY_3);
-  lcd.drawString("STEREO", mx + 130, sy);
+  lcd.drawString(radioStereo ? "STEREO" : "MONO", mx + 155, sy);
 
   // Footer Hint
-  lcd.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
+  lcd.drawFastHLine(mx + 10, my + mh - 35, mw - 20, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_8);
   lcd.setFont(&fonts::Font0);
-  const char* hint = "C/D: Seek  B: Vol  BOOT: Mute  B-long: Exit";
-  lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 16);
+  const char* hint1 = "C/D: Seek   B: Vol   BOOT: Mute";
+  const char* hint2 = "C-lng: Bass  D-lng: Mono  BOOT-lng: S-Mute";
+  lcd.drawString(hint1, mx + (mw - lcd.textWidth(hint1)) / 2, my + mh - 28);
+  lcd.drawString(hint2, mx + (mw - lcd.textWidth(hint2)) / 2, my + mh - 16);
 }
 
 void handleModeRadio(ButtonEvent evt) {
+  radio.checkRDS();
   static uint32_t lastUpdate = 0;
   if (millis() - lastUpdate > 500) {
     radioFreq = radio.getFrequency();
     RADIO_INFO info;
     radio.getRadioInfo(&info);
     radioStereo = info.stereo;
+    radioRssi = info.rssi;
+    radioSnr = info.snr;
     lastUpdate = millis();
     drawRadioUI();
   }
@@ -4659,12 +4713,30 @@ void handleModeRadio(ButtonEvent evt) {
       radio.setVolume(radioVol);
     }
   } else if (evt.pin == BTN_C) {
-    radio.seekDown(true); // Seek Down
+    if (evt.isLong) {
+      radioBass = !radioBass;
+      radio.setBassBoost(radioBass);
+      islandPush(NOTIF_INFO, radioBass ? "BASS: ON" : "BASS: OFF");
+    } else {
+      radio.seekDown(true);
+    }
   } else if (evt.pin == BTN_D) {
-    radio.seekUp(true); // Seek Up
+    if (evt.isLong) {
+      radioStereo = !radioStereo;
+      radio.setMono(!radioStereo);
+      islandPush(NOTIF_INFO, radioStereo ? "MODE: STEREO" : "MODE: MONO");
+    } else {
+      radio.seekUp(true);
+    }
   } else if (evt.pin == BTN_BOOT) {
-    radioMute = !radioMute;
-    radio.setMute(radioMute);
+    if (evt.isLong) {
+      radioSoftMute = !radioSoftMute;
+      radio.setSoftMute(radioSoftMute);
+      islandPush(NOTIF_INFO, radioSoftMute ? "S-MUTE: ON" : "S-MUTE: OFF");
+    } else {
+      radioMute = !radioMute;
+      radio.setMute(radioMute);
+    }
   }
 
   drawRadioUI();
