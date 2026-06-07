@@ -98,6 +98,7 @@ extern "C" {
 
 #include "USB.h"
 #include "USBMSC.h"
+#include <RDA5807M.h>
 
 #include <JPEGDEC.h>
 #include "MjpegClass.h"
@@ -286,6 +287,7 @@ enum AppMode {
   MODE_KEY_MANAGER,
   MODE_FEATURES,
   MODE_DIALOG_MULTI_DELETE,
+  MODE_RADIO,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
@@ -498,6 +500,20 @@ static bool galleryGridActive = false;
 static int menuFeatSel = 0;
 static bool hdCaptureEnabled = false;
 static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
+
+// [PORTED v6.2] Radio globals
+#define PIN_RADIO_SDA 43
+#define PIN_RADIO_SCL 42
+TwoWire WireRadio = TwoWire(1);
+static RDA5807M radio;
+static uint16_t radioFreq = 10070; // 100.7 MHz default
+static uint8_t  radioVol = 5;
+static bool     radioMute = false;
+static bool     radioBass = true;
+static bool     radioStereo = true;
+static char     radioRDSStation[10] = "         ";
+static char     radioRDSText[66] = "Waiting for RDS...";
+static uint32_t radioLastRdsMs = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE
@@ -1051,16 +1067,17 @@ void drawFeaturesMenu(int sel) {
   const char* title = "--- EXPERIMENTAL FEATURES ---";
   lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
   lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[12] = {
+  static const char* const rowLabels[13] = {
     "EIS  Electronic Stab", "HDR  Triple Exposure",
     "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
     "CALIBRATE MPU  recalibrate",
     "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
     "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
-    "DLPF  filter bandwidth", "CLEAR THUMB CACHE"
+    "DLPF  filter bandwidth", "CLEAR THUMB CACHE",
+    "FM RADIO  RDA5807M"
   };
   bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 12; i++) {
+  for (int i = 0; i < 13; i++) {
     int iy = my + 24 + i * 22; bool hl = (i == sel);
     lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
     if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
@@ -1094,6 +1111,9 @@ void drawFeaturesMenu(int sel) {
     } else if (i == 11) {
       lcd.setTextColor(COL_GRAY_7);
       lcd.drawString("RUN", mx + mw - 30, iy + 5);
+    } else if (i == 12) {
+      lcd.setTextColor(COL_AI_ACCENT);
+      lcd.drawString("OPEN", mx + mw - 30, iy + 5);
     }
   }
   lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
@@ -1116,8 +1136,8 @@ void handleModeFeatures(ButtonEvent evt) {
     return;
   }
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 12; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 11) % 12; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 13; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 12) % 13; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1177,6 +1197,8 @@ void handleModeFeatures(ButtonEvent evt) {
         islandPush(NOTIF_WARN, "Cache dir tidak ada");
       }
       drawFeaturesMenu(menuFeatSel);
+    } else if (menuFeatSel == 12) {
+      openRadio();
     }
   }
 }
@@ -4530,6 +4552,124 @@ void handleModeMenuExp(ButtonEvent evt){
   }
 }
 
+// [PORTED v6.2] RADIO IMPLEMENTATION
+void radioInit() {
+  WireRadio.begin(PIN_RADIO_SDA, PIN_RADIO_SCL);
+  radio.initWire(WireRadio);
+  radio.setBand(RADIO_BAND_FM);
+  radio.setFrequency(radioFreq);
+  radio.setVolume(radioVol);
+  radio.setMono(false);
+  radio.setBassBoost(radioBass);
+  radio.setMute(radioMute);
+}
+
+void openRadio() {
+  radioInit();
+  lcd.fillScreen(COL_BLACK);
+  resetAllButtons();
+  appMode = MODE_RADIO;
+}
+
+void drawRadioUI() {
+  int mx = 20, my = 20, mw = DISP_W - 40, mh = DISP_H - 40;
+
+  // Background box
+  lcd.fillRoundRect(mx, my, mw, mh, 8, COL_GRAY_D);
+  lcd.drawRoundRect(mx, my, mw, mh, 8, COL_GRAY_5);
+
+  // Header
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_AI_ACCENT);
+  lcd.drawString("--- FM RADIO RECEIVER ---", mx + (mw - lcd.textWidth("--- FM RADIO RECEIVER ---")) / 2, my + 8);
+  lcd.drawFastHLine(mx + 10, my + 22, mw - 20, COL_GRAY_3);
+
+  // Frequency Display
+  lcd.setFont(&fonts::FreeSansBold18pt7b);
+  lcd.setTextColor(COL_WHITE);
+  char freqBuf[16];
+  snprintf(freqBuf, sizeof(freqBuf), "%d.%02d", radioFreq / 100, radioFreq % 100);
+  int fw = lcd.textWidth(freqBuf);
+  lcd.drawString(freqBuf, mx + (mw - fw) / 2, my + 45);
+
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_7);
+  lcd.drawString("MHz", mx + (mw + fw) / 2 + 5, my + 60);
+
+  // RDS Info (Station & Text)
+  lcd.setFont(&fonts::Font0);
+  lcd.setTextColor(COL_GRAY_A);
+  lcd.drawString("STATION:", mx + 15, my + 95);
+  lcd.setTextColor(COL_WHITE);
+  lcd.drawString(radioRDSStation, mx + 75, my + 95);
+
+  lcd.setTextColor(COL_GRAY_A);
+  lcd.drawString("RDS:", mx + 15, my + 115);
+  lcd.setTextColor(COL_GRAY_7);
+  lcd.setClipRect(mx + 45, my + 115, mw - 60, 20);
+  lcd.drawString(radioRDSText, mx + 45, my + 115);
+  lcd.clearClipRect();
+
+  // Volume Bar
+  int vx = mx + 20, vy = my + 145, vw = mw - 40, vh = 10;
+  lcd.drawRect(vx, vy, vw, vh, COL_GRAY_3);
+  int fillW = map(radioVol, 0, 15, 0, vw);
+  lcd.fillRect(vx + 2, vy + 2, fillW - 4, vh - 4, 0x07E0);
+  lcd.setFont(&fonts::Font0); lcd.setTextColor(COL_GRAY_A);
+  lcd.drawString("VOL", vx - 15, vy + 1);
+
+  // Status Indicators (Mute, Bass, Stereo)
+  int sy = my + 165;
+  lcd.setTextColor(radioMute ? 0xF800 : COL_GRAY_3);
+  lcd.drawString("MUTE", mx + 30, sy);
+  lcd.setTextColor(radioBass ? 0x07E0 : COL_GRAY_3);
+  lcd.drawString("BASS", mx + 80, sy);
+  lcd.setTextColor(radioStereo ? 0x07E0 : COL_GRAY_3);
+  lcd.drawString("STEREO", mx + 130, sy);
+
+  // Footer Hint
+  lcd.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
+  lcd.setTextColor(COL_GRAY_8);
+  lcd.setFont(&fonts::Font0);
+  const char* hint = "C/D: Seek  B: Vol  BOOT: Mute  B-long: Exit";
+  lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 16);
+}
+
+void handleModeRadio(ButtonEvent evt) {
+  static uint32_t lastUpdate = 0;
+  if (millis() - lastUpdate > 500) {
+    radioFreq = radio.getFrequency();
+    RADIO_INFO info;
+    radio.getRadioInfo(&info);
+    radioStereo = info.stereo;
+    lastUpdate = millis();
+    drawRadioUI();
+  }
+
+  if (!evt.valid) return;
+
+  if (evt.pin == BTN_B) {
+    if (evt.isLong) {
+      radio.setMute(true);
+      appMode = MODE_FEATURES;
+      drawFeaturesMenu(menuFeatSel);
+      resetAllButtons();
+      return;
+    } else {
+      radioVol = (radioVol + 1) % 16;
+      radio.setVolume(radioVol);
+    }
+  } else if (evt.pin == BTN_C) {
+    radio.seekDown(true); // Seek Down
+  } else if (evt.pin == BTN_D) {
+    radio.seekUp(true); // Seek Up
+  } else if (evt.pin == BTN_BOOT) {
+    radioMute = !radioMute;
+    radio.setMute(radioMute);
+  }
+
+  drawRadioUI();
+}
+
 void handleModeMenuExpAdj(ButtonEvent evt){
   camera_fb_t *fb=esp_camera_fb_get();
   if(fb){
@@ -4625,9 +4765,10 @@ void loop(){
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
+    case MODE_RADIO:           handleModeRadio(singleEvt);                     break;
   }
   if (appMode != MODE_VIEWFINDER) {
-    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE);
+    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE || appMode == MODE_RADIO);
     if (!isMenu) islandNoClear = false;
     islandTick();
   }
