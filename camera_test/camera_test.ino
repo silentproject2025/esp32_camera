@@ -1,9 +1,9 @@
 /*
  * ESP32-S3-CAM (Freenove ESP32-S3-WROOM)
- * Version: v6.1
+ * Version: v6.0
  *
  * ═══════════════════════════════════════════════════════════════
- *  CHANGELOG v6.1 (di atas v6.0-fix4):
+ *  CHANGELOG v6.0 (di atas v6.0-fix4):
  *
  *  [AI-MENU] Sub-menu pilih fitur AI (6 fitur)
  *    - Trigger dari VIEWFINDER: longpress C
@@ -30,7 +30,6 @@
  *  [JUMP]        Jump-to-number di Gallery (BOOT long-press)
  *  [STEGO]       Steganografi JPEG & BMP
  *  [EXIF]        Inject EXIF ke JPEG
- *  [BT-MP3]      Bluetooth MP3 Player integration
  * ═══════════════════════════════════════════════════════════════
  *
  * TOMBOL LAYOUT (final v6.0):
@@ -98,9 +97,6 @@ extern "C" {
 #include <dirent.h>
 
 #include "USB.h"
-#include "BluetoothA2DPSource.h"
-#include "AudioGeneratorMP3.h"
-#include "AudioFileSourceSD.h"
 #include "USBMSC.h"
 
 #include <JPEGDEC.h>
@@ -270,367 +266,6 @@ static const NotifStyle NOTIF_STYLES[6] = {
   { 0x2104, 0xCE59, "i" }
 };
 
-// Bluetooth MP3 globals
-BluetoothA2DPSource a2dp_source;
-AudioGeneratorMP3 *mp3;
-AudioFileSourceSD *source;
-
-static bool btStarted = false;
-static bool btConnected = false;
-static bool btPlaying = false;
-static String btDeviceName = "";
-static char btSelectedFile[64] = "";
-static int btScanCount = 0;
-static String btScanNames[10];
-static uint8_t btScanAddr[10][6];
-static int btScanSel = 0;
-static int btFileSel = 0;
-static int btFileCount = 0;
-static String btFiles[50];
-static int btFileScroll = 0;
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  AUDIO BRIDGE (ESP8266Audio -> ESP32-A2DP)
-// ─────────────────────────────────────────────────────────────────────────────
-
-#define BT_BUFFER_SIZE 4096
-int16_t btBuffer[BT_BUFFER_SIZE * 2]; // Stereo
-volatile int btWritePtr = 0;
-volatile int btReadPtr = 0;
-
-int32_t btMp3DataCallback(uint8_t *data, int32_t len) {
-  if (len <= 0) return 0;
-  int16_t *samples = (int16_t*)data;
-  int count = len / 4; // 2 channels * 2 bytes
-  int available = (btWritePtr - btReadPtr + (BT_BUFFER_SIZE * 2)) % (BT_BUFFER_SIZE * 2);
-  int toRead = min(count, available / 2);
-
-  for (int i = 0; i < toRead; i++) {
-    samples[i*2]   = btBuffer[btReadPtr];
-    btReadPtr = (btReadPtr + 1) % (BT_BUFFER_SIZE * 2);
-    samples[i*2+1] = btBuffer[btReadPtr];
-    btReadPtr = (btReadPtr + 1) % (BT_BUFFER_SIZE * 2);
-  }
-  return toRead * 4;
-}
-
-class AudioOutputBT : public AudioOutput {
-  public:
-    AudioOutputBT() { mono = false; }
-    virtual bool begin() override { return true; }
-    virtual bool ConsumeSample(int16_t sample[2]) override {
-      int nextWrite = (btWritePtr + 2) % (BT_BUFFER_SIZE * 2);
-      if (nextWrite == btReadPtr) return false; // Buffer full
-      btBuffer[btWritePtr] = sample[0];
-      btWritePtr = (btWritePtr + 1) % (BT_BUFFER_SIZE * 2);
-      btBuffer[btWritePtr] = sample[1];
-      btWritePtr = (btWritePtr + 1) % (BT_BUFFER_SIZE * 2);
-      return true;
-    }
-    virtual bool stop() override { return true; }
-};
-
-AudioOutputBT *outBT = nullptr;
-
-
-void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 230, mx = (DISP_W - mw) / 2, my = 5;
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_E);
-  const char* title = "--- EXPERIMENTAL FEATURES ---";
-  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
-  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[13] = {
-    "EIS  Electronic Stab", "HDR  Triple Exposure",
-    "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
-    "CALIBRATE MPU  recalibrate",
-    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
-    "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
-    "DLPF  filter bandwidth", "CLEAR THUMB CACHE", "BT MP3 PLAYER  A2DP Source"
-  };
-  bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 13; i++) {
-    int iy = my + 20 + i * 15; bool hl = (i == sel);
-    lcd.fillRect(mx + 8, iy, mw - 16, 14, hl ? COL_GRAY_5 : COL_GRAY_D);
-    if (hl) lcd.fillRect(mx + 2, iy, 4, 14, COL_WHITE);
-    lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
-    lcd.drawString(rowLabels[i], mx + 12, iy + 5);
-
-    if (i < 5) {
-      lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
-      lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
-    } else if (i == 5) {
-      lcd.setTextColor(g_mpuCalLoaded ? COL_AI_ACCENT : COL_GRAY_3);
-      lcd.drawString(g_mpuCalLoaded ? "CAL" : "---", mx + mw - 30, iy + 5);
-    } else if (i == 6) {
-      lcd.setTextColor(hdCaptureEnabled ? 0x07E0 : COL_GRAY_3);
-      lcd.drawString(hdCaptureEnabled ? "ON" : "OFF", mx + mw - 30, iy + 5);
-    } else if (i == 7) {
-      lcd.setTextColor(COL_WHITE);
-      char qBuf[8]; snprintf(qBuf, sizeof(qBuf), "%d", hdCaptureQuality);
-      lcd.drawString(qBuf, mx + mw - 30, iy + 5);
-    } else if (i == 8) {
-      lcd.setTextColor(COL_WHITE);
-      char rBuf[8]; snprintf(rBuf, sizeof(rBuf), "%.2f", mpuKalmanRmeas);
-      lcd.drawString(rBuf, mx + mw - 45, iy + 5);
-    } else if (i == 9) {
-      lcd.setTextColor(COL_WHITE);
-      char dBuf[8]; snprintf(dBuf, sizeof(dBuf), "%.1f", mpuTiltDeadzone);
-      lcd.drawString(dBuf, mx + mw - 45, iy + 5);
-    } else if (i == 10) {
-      lcd.setTextColor(COL_WHITE);
-      lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
-    } else if (i == 11) {
-      lcd.setTextColor(COL_GRAY_7);
-      lcd.drawString("RUN", mx + mw - 30, iy + 5);
-    }
-    else if (i == 12) {
-      lcd.setTextColor(btConnected ? 0x07E0 : COL_GRAY_7);
-      lcd.drawString(btConnected ? "CON" : "RUN", mx + mw - 30, iy + 5);
-    }
-  }
-  lcd.drawFastHLine(mx + 10, my + mh - 18, mw - 20, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 10);
-}
-
-// UI UPDATE v6.0
-void btStartScan() {
-  if (WiFi.status() == WL_CONNECTED || WiFi.getMode() != WIFI_OFF) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    delay(100);
-  }
-
-  btScanCount = 0;
-  btScanSel = 0;
-  appMode = MODE_BT_SCAN;
-  lcd.fillScreen(COL_BLACK);
-  lcd.setTextColor(COL_WHITE);
-  lcd.drawString("SCANNING BT DEVICES...", 10, 10);
-
-  // Real library scan logic
-  a2dp_source.start_raw(btMp3DataCallback);
-
-  // Simulated scan results for UI purposes
-  btScanCount = 2;
-  btScanNames[0] = "Sony WH-1000XM4";
-  btScanNames[1] = "JBL Flip 5";
-  delay(1000);
-  drawBTScan();
-}
-
-void drawBTScan() {
-  lcd.fillScreen(COL_BLACK);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("--- SELECT BT SINK ---", 20, 10);
-  for (int i = 0; i < btScanCount; i++) {
-    int y = 40 + i * 20;
-    if (i == btScanSel) {
-      lcd.fillRect(10, y-2, 300, 18, COL_GRAY_D);
-      lcd.setTextColor(COL_WHITE);
-    } else {
-      lcd.setTextColor(COL_GRAY_A);
-    }
-    lcd.drawString(btScanNames[i].c_str(), 20, y);
-  }
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("BOOT=Connect  B=Back", 20, 210);
-}
-
-void handleModeBTScan(ButtonEvent evt) {
-  if (!evt.valid) return;
-  if (evt.pin == BTN_B) {
-    appMode = MODE_FEATURES;
-    drawFeaturesMenu(menuFeatSel);
-    return;
-  }
-  if (evt.pin == BTN_C) { btScanSel = (btScanSel + btScanCount - 1) % max(1, btScanCount); drawBTScan(); }
-  if (evt.pin == BTN_D) { btScanSel = (btScanSel + 1) % max(1, btScanCount); drawBTScan(); }
-  if (evt.pin == BTN_BOOT && btScanCount > 0) {
-    btDeviceName = btScanNames[btScanSel];
-    btConnected = true;
-    btStartFileBrowser();
-  }
-}
-
-void btStartFileBrowser() {
-  btFileCount = 0;
-  btFileSel = 0;
-  btFileScroll = 0;
-  appMode = MODE_BT_MP3_LIST;
-
-  DIR* d = opendir("/sdcard");
-  if (d) {
-    struct dirent* e;
-    while ((e = readdir(d)) != nullptr && btFileCount < 50) {
-      String n = e->d_name;
-      if (n.endsWith(".mp3") || n.endsWith(".MP3")) {
-        btFiles[btFileCount++] = n;
-      }
-    }
-    closedir(d);
-  }
-
-  if (btFileCount == 0) {
-    islandPush(NOTIF_WARN, "TIDAK ADA MP3");
-    appMode = MODE_FEATURES;
-    drawFeaturesMenu(menuFeatSel);
-  } else {
-    drawBTFileList();
-  }
-}
-
-void drawBTFileList() {
-  lcd.fillScreen(COL_BLACK);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("--- SELECT MP3 ---", 20, 10);
-
-  int start = btFileScroll;
-  int end = min(btFileCount, start + 10);
-  for (int i = start; i < end; i++) {
-    int y = 40 + (i - start) * 18;
-    if (i == btFileSel) {
-      lcd.fillRect(10, y-2, 300, 16, COL_GRAY_D);
-      lcd.setTextColor(COL_WHITE);
-    } else {
-      lcd.setTextColor(COL_GRAY_A);
-    }
-    lcd.drawString(btFiles[i].c_str(), 20, y);
-  }
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("C/D=Nav  BOOT=Play  B=Back", 20, 220);
-}
-
-void handleModeBTMP3List(ButtonEvent evt) {
-  if (!evt.valid) return;
-  if (evt.pin == BTN_B) {
-    btStartScan();
-    return;
-  }
-  if (evt.pin == BTN_C) {
-    btFileSel = (btFileSel + btFileCount - 1) % btFileCount;
-    if (btFileSel < btFileScroll) btFileScroll = btFileSel;
-    if (btFileSel == btFileCount - 1) btFileScroll = max(0, btFileCount - 10);
-    drawBTFileList();
-  }
-  if (evt.pin == BTN_D) {
-    btFileSel = (btFileSel + 1) % btFileCount;
-    if (btFileSel >= btFileScroll + 10) btFileScroll = btFileSel - 9;
-    if (btFileSel == 0) btFileScroll = 0;
-    drawBTFileList();
-  }
-  if (evt.pin == BTN_BOOT) {
-    strncpy(btSelectedFile, btFiles[btFileSel].c_str(), sizeof(btSelectedFile)-1);
-    btStartPlayback();
-  }
-}
-
-void btStartPlayback() {
-  if (mp3) { mp3->stop(); delete mp3; mp3 = nullptr; }
-  if (source) { source->close(); delete source; source = nullptr; }
-
-  char path[80]; snprintf(path, sizeof(path), "/sdcard/%s", btSelectedFile);
-  source = new AudioFileSourceSD(path);
-  if (!outBT) outBT = new AudioOutputBT();
-  mp3 = new AudioGeneratorMP3();
-
-  btWritePtr = 0; btReadPtr = 0;
-  if (mp3->begin(source, outBT)) {
-    btPlaying = true;
-    appMode = MODE_BT_MP3_PLAYER;
-    drawBTPlayer();
-  } else {
-    islandPush(NOTIF_WARN, "GAGAL PLAY MP3");
-  }
-}
-
-void btStopPlayback() {
-  if (mp3) { mp3->stop(); delete mp3; mp3 = nullptr; }
-  if (source) { source->close(); delete source; source = nullptr; }
-  btPlaying = false;
-  neoOff();
-}
-
-void btTogglePause() {
-  btPlaying = !btPlaying;
-  if (!btPlaying) neoOff();
-}
-
-void btPlayerTick() {
-  if (btPlaying && mp3 && mp3->isRunning()) {
-    if (!mp3->loop()) {
-      btPlaying = false;
-      neoOff();
-      islandPush(NOTIF_INFO, "SELESAI");
-      drawBTPlayer();
-    } else {
-      neoPulse(0, 180, 50);
-    }
-  }
-}
-
-void drawBTPlayer() {
-  lcd.fillScreen(COL_BLACK);
-  lcd.setTextColor(COL_AI_ACCENT);
-  lcd.drawString("--- BT MP3 PLAYER ---", 20, 10);
-
-  lcd.setTextColor(COL_WHITE);
-  lcd.setFont(&fonts::Font0);
-  lcd.setTextSize(2);
-  lcd.drawString("NOW PLAYING:", 20, 50);
-
-  lcd.setTextSize(1);
-  lcd.setTextColor(COL_GRAY_E);
-  lcd.drawString(btSelectedFile, 20, 80);
-
-  lcd.setTextColor(btConnected ? 0x07E0 : 0xF800);
-  lcd.drawString(btConnected ? "CON: " : "DISC: ", 20, 120);
-  lcd.setTextColor(COL_WHITE);
-  lcd.drawString(btDeviceName.c_str(), 60, 120);
-
-  lcd.fillRect(20, 160, 280, 2, COL_GRAY_2);
-  if (btPlaying) {
-    lcd.setTextColor(0x07E0);
-    lcd.drawString("PLAYING", 20, 145);
-  } else {
-    lcd.setTextColor(COL_GRAY_8);
-    lcd.drawString("PAUSED", 20, 145);
-  }
-
-  lcd.setTextColor(COL_GRAY_5);
-  lcd.drawString("BOOT=Play/Pause  B=Stop  C/D=Next", 20, 220);
-}
-
-void handleModeBTMP3Player(ButtonEvent evt) {
-  if (!evt.valid) return;
-  if (evt.pin == BTN_B) {
-    btStopPlayback();
-    appMode = MODE_BT_MP3_LIST;
-    drawBTFileList();
-    return;
-  }
-  if (evt.pin == BTN_BOOT) {
-    btTogglePause();
-    drawBTPlayer();
-  }
-  if (evt.pin == BTN_C) {
-    btFileSel = (btFileSel + btFileCount - 1) % btFileCount;
-    strncpy(btSelectedFile, btFiles[btFileSel].c_str(), sizeof(btSelectedFile)-1);
-    btStartPlayback();
-  }
-  if (evt.pin == BTN_D) {
-    btFileSel = (btFileSel + 1) % btFileCount;
-    strncpy(btSelectedFile, btFiles[btFileSel].c_str(), sizeof(btSelectedFile)-1);
-    btStartPlayback();
-  }
-}
-
-
-void handleModeFeatures(ButtonEvent evt) {
-
 // ─────────────────────────────────────────────────────────────────────────────
 //  App Mode
 // ─────────────────────────────────────────────────────────────────────────────
@@ -651,9 +286,6 @@ enum AppMode {
   MODE_KEY_MANAGER,
   MODE_FEATURES,
   MODE_DIALOG_MULTI_DELETE,
-  MODE_BT_SCAN,
-  MODE_BT_MP3_LIST,
-  MODE_BT_MP3_PLAYER,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
@@ -990,6 +622,7 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
   int maxW = w - ISLAND_ICON_SZ - 8;
   while (strlen(buf) > 4 && lcd.textWidth(buf) > maxW) {
     esp_task_wdt_reset();
+    esp_task_wdt_reset();
     int l = strlen(buf);
     buf[l-1] = '\0';
     if (strlen(buf) > 3) { buf[strlen(buf)-1] = '.'; buf[strlen(buf)-2] = '.'; }
@@ -1004,6 +637,7 @@ static void islandDrawRow(int idx, int x, int y, int w, bool isFresh) {
 }
 
 static void islandErase() {
+  esp_task_wdt_reset();
   esp_task_wdt_reset();
   if (islandNoClear)    return;
   if (!islandDrawnOnce) return;
@@ -1020,6 +654,7 @@ static void islandErase() {
 }
 
 static void islandDraw(int offsetY = 0) {
+  esp_task_wdt_reset();
   esp_task_wdt_reset();
   int n = min(islandCount, ISLAND_MAX_STACK);
   if (n == 0) return;
@@ -1066,6 +701,7 @@ void islandPush(NotifType type, const char* text) {
 }
 
 void islandTick() {
+  esp_task_wdt_reset();
   esp_task_wdt_reset();
   unsigned long now = millis();
   switch (islandState) {
@@ -1152,40 +788,23 @@ void saveSettings() {
   if (!sdReady) return;
   FILE* f = fopen(SETTINGS_PATH, "w");
   if (!f) return;
-  fprintf(f, "# Sanzxcam v6.0 settings
-");
-  fprintf(f, "flash=%d
-",      (int)ledFlashEnabled);
-  fprintf(f, "neoflash=%d
-",   (int)neoFlashEnabled);
-  fprintf(f, "exp_preset=%d
-", (int)expPreset);
-  fprintf(f, "exp_val=%d
-",    expManualVal);
-  fprintf(f, "exp_gain=%d
-",   expManualGain);
-  fprintf(f, "gc2145_fmt=%d
-", (int)gc2145CaptureFormat);
-  fprintf(f, "eis=%d
-", (int)eisEnabled);
-  fprintf(f, "hdr=%d
-", (int)hdrEnabled);
-  fprintf(f, "autorotate=%d
-", (int)autoRotateEnabled);
-  fprintf(f, "mpulog=%d
-", (int)mpuLogEnabled);
-  fprintf(f, "hud=%d
-", (int)hudEnabled);
-  fprintf(f, "hd_capture=%d
-", (int)hdCaptureEnabled);
-  fprintf(f, "hd_quality=%d
-", (int)hdCaptureQuality);
-  fprintf(f, "dlpf=%d
-", (int)mpuDlpfIndex);
-  fprintf(f, "kalman_r=%.3f
-", mpuKalmanRmeas);
-  fprintf(f, "tilt_dz=%.1f
-",  mpuTiltDeadzone);
+  fprintf(f, "# Sanzxcam v6.0 settings\n");
+  fprintf(f, "flash=%d\n",      (int)ledFlashEnabled);
+  fprintf(f, "neoflash=%d\n",   (int)neoFlashEnabled);
+  fprintf(f, "exp_preset=%d\n", (int)expPreset);
+  fprintf(f, "exp_val=%d\n",    expManualVal);
+  fprintf(f, "exp_gain=%d\n",   expManualGain);
+  fprintf(f, "gc2145_fmt=%d\n", (int)gc2145CaptureFormat);
+  fprintf(f, "eis=%d\n", (int)eisEnabled);
+  fprintf(f, "hdr=%d\n", (int)hdrEnabled);
+  fprintf(f, "autorotate=%d\n", (int)autoRotateEnabled);
+  fprintf(f, "mpulog=%d\n", (int)mpuLogEnabled);
+  fprintf(f, "hud=%d\n", (int)hudEnabled);
+  fprintf(f, "hd_capture=%d\n", (int)hdCaptureEnabled);
+  fprintf(f, "hd_quality=%d\n", (int)hdCaptureQuality);
+  fprintf(f, "dlpf=%d\n", (int)mpuDlpfIndex);
+  fprintf(f, "kalman_r=%.3f\n", mpuKalmanRmeas);
+  fprintf(f, "tilt_dz=%.1f\n",  mpuTiltDeadzone);
   fclose(f);
 }
 
@@ -1194,8 +813,7 @@ void loadSettings() {
   if (!f) return;
   char line[64];
   while (fgets(line, sizeof(line), f)) {
-    if (line[0] == '#' || line[0] == '
-' || line[0] == '\r') continue;
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     int v = 0;
     if      (sscanf(line, "flash=%d",      &v) == 1) { ledFlashEnabled    = (bool)v; }
     else if (sscanf(line, "neoflash=%d",   &v) == 1) { neoFlashEnabled    = (bool)v; }
@@ -1227,8 +845,7 @@ void loadMPUCalibration() {
   }
   char line[64];
   while (fgets(line, sizeof(line), f)) {
-    if (line[0] == '#' || line[0] == '
-' || line[0] == '\r') continue;
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
     float v = 0;
     if (sscanf(line, "calX=%f", &v) == 1)      { g_gyroCalX = v; }
     else if (sscanf(line, "calY=%f", &v) == 1) { g_gyroCalY = v; }
@@ -1236,8 +853,7 @@ void loadMPUCalibration() {
   }
   fclose(f);
   g_mpuCalLoaded = true;
-  Serial.printf("[MPU] Cal loaded: X=%.5f Y=%.5f Z=%.5f
-", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+  Serial.printf("[MPU] Cal loaded: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
 }
 
 void runMPUCalibration() {
@@ -1278,12 +894,8 @@ void runMPUCalibration() {
   if (sdReady) {
     FILE* f = fopen("/sdcard/mpu_cal.ini", "w");
     if (f) {
-      fprintf(f, "# MPU6050 Calibration - Sanzxcam
-");
-      fprintf(f, "calX=%.5f
-calY=%.5f
-calZ=%.5f
-", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+      fprintf(f, "# MPU6050 Calibration - Sanzxcam\n");
+      fprintf(f, "calX=%.5f\ncalY=%.5f\ncalZ=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
       fclose(f);
       g_mpuCalLoaded = true;
       islandPush(NOTIF_OK, "Kalibrasi tersimpan");
@@ -1301,38 +913,29 @@ static void createFileTemplate(const char* path, const char* content) {
   if (!f) return;
   fputs(content, f);
   fclose(f);
-  Serial.printf("[CFG] template dibuat: %s
-", path);
+  Serial.printf("[CFG] template dibuat: %s\n", path);
 }
 
 bool loadWifiConfig() {
   FILE* f = fopen(WIFI_INI_PATH, "r");
   if (!f) {
     createFileTemplate(WIFI_INI_PATH,
-      "# Konfigurasi WiFi Sanzxcam
-"
-      "# Isi ssid dan pass lalu restart kamera
-"
-      "ssid=NamaWiFiKamu
-"
-      "pass=PasswordWiFiKamu
-");
+      "# Konfigurasi WiFi Sanzxcam\n"
+      "# Isi ssid dan pass lalu restart kamera\n"
+      "ssid=NamaWiFiKamu\n"
+      "pass=PasswordWiFiKamu\n");
     return false;
   }
   char line[128]; bool gotSSID=false, gotPass=false;
   while (fgets(line, sizeof(line), f)) {
-    if (line[0]=='#'||line[0]=='
-'||line[0]=='\r') continue;
+    if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
     char val[64]="";
-    if      (sscanf(line,"ssid=%63[^\r
-]",val)==1) { strncpy(wifiSSID,val,63); gotSSID=true; }
-    else if (sscanf(line,"pass=%63[^\r
-]",val)==1) { strncpy(wifiPass,val,63); gotPass=true; }
+    if      (sscanf(line,"ssid=%63[^\r\n]",val)==1) { strncpy(wifiSSID,val,63); gotSSID=true; }
+    else if (sscanf(line,"pass=%63[^\r\n]",val)==1) { strncpy(wifiPass,val,63); gotPass=true; }
   }
   fclose(f);
   if (strcmp(wifiSSID,"NamaWiFiKamu")==0) return false;
-  Serial.printf("[WIFI] ssid=%s
-", wifiSSID);
+  Serial.printf("[WIFI] ssid=%s\n", wifiSSID);
   return gotSSID && gotPass;
 }
 
@@ -1340,19 +943,11 @@ bool loadGeminiConfig() {
   FILE* f = fopen(GEMINI_INI_PATH, "r");
   if (!f) {
     createFileTemplate(GEMINI_INI_PATH,
-      "# Gemini API Keys untuk Sanzxcam AI
-"
-      "# Bisa isi hingga 5 key, auto-fallback jika 403/429
-"
-      "# Dapatkan key GRATIS di: aistudio.google.com
-"
-      "key1=AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-"
-      "key2=
-key3=
-key4=
-key5=
-");
+      "# Gemini API Keys untuk Sanzxcam AI\n"
+      "# Bisa isi hingga 5 key, auto-fallback jika 403/429\n"
+      "# Dapatkan key GRATIS di: aistudio.google.com\n"
+      "key1=AIzaXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\n"
+      "key2=\nkey3=\nkey4=\nkey5=\n");
     return false;
   }
   geminiKeyCount  = 0;
@@ -1360,14 +955,12 @@ key5=
   memset(geminiApiKeys, 0, sizeof(geminiApiKeys));
   char line[128];
   while (fgets(line, sizeof(line), f)) {
-    if (line[0]=='#'||line[0]=='
-'||line[0]=='\r') continue;
+    if (line[0]=='#'||line[0]=='\n'||line[0]=='\r') continue;
     if (geminiKeyCount >= GEMINI_KEY_MAX) break;
     char val[80] = "";
     for (int ki = 1; ki <= GEMINI_KEY_MAX; ki++) {
       char pattern[16];
-      snprintf(pattern, sizeof(pattern), "key%d=%%79[^\r
-]", ki);
+      snprintf(pattern, sizeof(pattern), "key%d=%%79[^\r\n]", ki);
       if (sscanf(line, pattern, val) == 1) {
         int vlen = strlen(val);
         while (vlen > 0 && (val[vlen-1]==' '||val[vlen-1]=='\t')) { val[--vlen]='\0'; }
@@ -1375,8 +968,7 @@ key5=
           strncpy(geminiApiKeys[geminiKeyCount], val, 79);
           geminiApiKeys[geminiKeyCount][79] = '\0';
           geminiKeyCount++;
-          Serial.printf("[GEMINI] key%d loaded
-", geminiKeyCount);
+          Serial.printf("[GEMINI] key%d loaded\n", geminiKeyCount);
         }
         break;
       }
@@ -1390,19 +982,14 @@ bool saveGeminiConfig() {
   if (!sdReady) return false;
   FILE* f = fopen(GEMINI_INI_PATH, "w");
   if (!f) return false;
-  fprintf(f, "# Gemini API Keys untuk Sanzxcam AI
-");
-  fprintf(f, "# Bisa isi hingga 5 key, auto-fallback jika 403/429
-");
-  fprintf(f, "# Dapatkan key GRATIS di: aistudio.google.com
-");
+  fprintf(f, "# Gemini API Keys untuk Sanzxcam AI\n");
+  fprintf(f, "# Bisa isi hingga 5 key, auto-fallback jika 403/429\n");
+  fprintf(f, "# Dapatkan key GRATIS di: aistudio.google.com\n");
   for (int i = 0; i < GEMINI_KEY_MAX; i++) {
     if (i < geminiKeyCount && strlen(geminiApiKeys[i]) > 0)
-      fprintf(f, "key%d=%s
-", i+1, geminiApiKeys[i]);
+      fprintf(f, "key%d=%s\n", i+1, geminiApiKeys[i]);
     else
-      fprintf(f, "key%d=
-", i+1);
+      fprintf(f, "key%d=\n", i+1);
   }
   fclose(f);
   return true;
@@ -1455,10 +1042,67 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // [PORTED v6.1] Features Menu
-// ─────────────────────────────────────────────────────────────────────────────
-//  BLUETOOTH MP3 LOGIC
-// ─────────────────────────────────────────────────────────────────────────────
+void drawFeaturesMenu(int sel) {
+  int mw = 220, mh = 314, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
+  lcd.fillScreen(COL_BLACK);
+  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
+  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_E);
+  const char* title = "--- EXPERIMENTAL FEATURES ---";
+  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
+  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
+  static const char* const rowLabels[12] = {
+    "EIS  Electronic Stab", "HDR  Triple Exposure",
+    "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
+    "CALIBRATE MPU  recalibrate",
+    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
+    "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
+    "DLPF  filter bandwidth", "CLEAR THUMB CACHE"
+  };
+  bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
+  for (int i = 0; i < 12; i++) {
+    int iy = my + 24 + i * 22; bool hl = (i == sel);
+    lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
+    if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
+    lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
+    lcd.drawString(rowLabels[i], mx + 12, iy + 5);
 
+    if (i < 5) {
+      lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
+      lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
+    } else if (i == 5) {
+      lcd.setTextColor(g_mpuCalLoaded ? COL_AI_ACCENT : COL_GRAY_3);
+      lcd.drawString(g_mpuCalLoaded ? "CAL" : "---", mx + mw - 30, iy + 5);
+    } else if (i == 6) {
+      lcd.setTextColor(hdCaptureEnabled ? 0x07E0 : COL_GRAY_3);
+      lcd.drawString(hdCaptureEnabled ? "ON" : "OFF", mx + mw - 30, iy + 5);
+    } else if (i == 7) {
+      lcd.setTextColor(COL_WHITE);
+      char qBuf[8]; snprintf(qBuf, sizeof(qBuf), "%d", hdCaptureQuality);
+      lcd.drawString(qBuf, mx + mw - 30, iy + 5);
+    } else if (i == 8) {
+      lcd.setTextColor(COL_WHITE);
+      char rBuf[8]; snprintf(rBuf, sizeof(rBuf), "%.2f", mpuKalmanRmeas);
+      lcd.drawString(rBuf, mx + mw - 45, iy + 5);
+    } else if (i == 9) {
+      lcd.setTextColor(COL_WHITE);
+      char dBuf[8]; snprintf(dBuf, sizeof(dBuf), "%.1f", mpuTiltDeadzone);
+      lcd.drawString(dBuf, mx + mw - 45, iy + 5);
+    } else if (i == 10) {
+      lcd.setTextColor(COL_WHITE);
+      lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
+    } else if (i == 11) {
+      lcd.setTextColor(COL_GRAY_7);
+      lcd.drawString("RUN", mx + mw - 30, iy + 5);
+    }
+  }
+  lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
+  lcd.setTextColor(COL_GRAY_A);
+  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 14);
+}
+
+// UI UPDATE v6.0
+void handleModeFeatures(ButtonEvent evt) {
   if (!evt.valid) return;
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
   static const char* const labs[5] = {"EIS", "HDR", "AUTO-ROTATE", "MPU LOG", "HUD"};
@@ -1472,8 +1116,8 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
     return;
   }
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 13; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 12) % 13; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 12; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 11) % 12; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1533,9 +1177,6 @@ void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
         islandPush(NOTIF_WARN, "Cache dir tidak ada");
       }
       drawFeaturesMenu(menuFeatSel);
-    }
-    else if (menuFeatSel == 12) {
-      btStartScan();
     }
   }
 }
@@ -1621,6 +1262,7 @@ void openAIFeatureMenu(bool fromViewfinder) {
   appMode = MODE_AI_FEATURE_MENU;
   neoBurst(0, 200, 200, 2);
 }
+
 
 bool captureForAI(char* outPath, int outPathLen) {
   snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
@@ -2162,6 +1804,7 @@ int           recFrameCount = 0;
 int           recVideoCount = 0;
 unsigned long recStartMs    = 0;
 
+
 const char* expPresetNames[6] = { "AUTO", "GRAY", "MOON", "NIGHT", "NIGHT-BW", "MANUAL" };
 
 struct ExpPresetCfg {
@@ -2413,6 +2056,7 @@ void scanGalleryFiles(){
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI UPDATE v6.0
+
 
 void thumbCacheEnsureDir() {
   struct stat st;
@@ -2991,6 +2635,7 @@ void drawLedMenu(int sel){
 
 void openLedMenu(){
   lcd.setRotation(3);
+  lcd.setRotation(3);
   if (neoFlashEnabled) menuLedSel = 2;
   else if (ledFlashEnabled) menuLedSel = 1;
   else menuLedSel = 0;
@@ -3130,6 +2775,7 @@ void drawExpAdjOverlay(){
 
 void openExpMenu(){
   lcd.setRotation(3);
+  lcd.setRotation(3);
   menuExpSel=(int)expPreset;
   drawExpMenu(menuExpSel);
   resetAllButtons();prevMode=appMode;appMode=MODE_MENU_EXP;
@@ -3198,6 +2844,8 @@ void mjpegDrawHUD(){
   lcd.setTextColor(COL_GRAY_A);lcd.drawString(buf,9,6);
 }
 
+
+
 void loopMjpegPlayer(){
   if(!mjpegPlaying) return;
   if(!mjpegPaused){
@@ -3248,6 +2896,7 @@ void drawRecIndicator(){
   lcd.setTextColor(COL_GRAY_5); lcd.drawString(fBuf,18,14);
 }
 
+
 void startRecording() {
   if (!sdReady || recActive) return;
   neoSolid(180, 0, 0);
@@ -3270,10 +2919,8 @@ void stopRecording(){
   char iniPath[48]; snprintf(iniPath, sizeof(iniPath), "/sdcard/video_%04d.ini", recVideoCount);
   FILE* fIni = fopen(iniPath, "w");
   if(fIni){
-    fprintf(fIni, "fps=%.2f
-", actualFps);
-    fprintf(fIni, "frames=%d
-", recFrameCount);
+    fprintf(fIni, "fps=%.2f\n", actualFps);
+    fprintf(fIni, "frames=%d\n", recFrameCount);
     fclose(fIni);
   }
   unsigned long dur=(millis()-recStartMs)/1000;
@@ -3354,6 +3001,7 @@ void updateFPS(){
     fpsFrameCount=0;fpsLastTime=millis();
   }
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Exposure
@@ -3473,10 +3121,8 @@ void mpuTick() {
     g_mpuLogMs = now;
     FILE* lf = fopen("/sdcard/mpu_log.csv", "a");
     if (lf) {
-      if (ftell(lf) == 0) fprintf(lf, "millis,tiltX,tiltY,gyroX,gyroY,gyroZ,orient
-");
-      fprintf(lf, "%lu,%.2f,%.2f,%.3f,%.3f,%.3f,%d
-",
+      if (ftell(lf) == 0) fprintf(lf, "millis,tiltX,tiltY,gyroX,gyroY,gyroZ,orient\n");
+      fprintf(lf, "%lu,%.2f,%.2f,%.3f,%.3f,%.3f,%d\n",
               (unsigned long)now, g_tiltX, g_tiltY, g_gyroX, g_gyroY, g_gyroZ, (int)g_orientation);
       fclose(lf);
     }
@@ -3500,6 +3146,7 @@ void mpuDrawIndicator() {
   } else { strncpy(buf, "LEVEL", sizeof(buf)); col=0x7BCF; neoSolid(0, 40, 0); } // COL_GRAY_7
   drawPill(DISP_W - 36, DISP_H - 22, buf, 0x18C3, col); // COL_PILL_BG = 0x18C3
 }
+
 
 // Write one register to GC2145 via SCCB
 static void gc2145WriteReg(uint8_t reg, uint8_t val) {
@@ -3625,8 +3272,7 @@ void aiWrapText(const char* text){
 
   const char* p=text;
   while(*p){
-    if(*p=='
-'){
+    if(*p=='\n'){
       if(wi>0){word[wi]='\0';wi=0;
         char test[AI_LINE_W];
         snprintf(test,sizeof(test),"%s%s%s",lineBuf,lineBuf[0]?" ":"",word);
@@ -3824,9 +3470,7 @@ bool doAICall(int idx, const char* customPrompt, const String* prebuiltBody = nu
     String b64; base64Encode(jb,jl,b64); free(jb);
     body = "{\"contents\":[{\"parts\":[{\"inline_data\":{\"mime_type\":\"image/jpeg\",\"data\":\"" + b64 + "\"}},{\"text\":\"";
     for(const char* p=customPrompt;*p;p++){
-      if(*p=='\"') body+="\\\""; else if(*p=='
-') body+="\
-"; else body+=*p;
+      if(*p=='\"') body+="\\\""; else if(*p=='\n') body+="\\n"; else body+=*p;
     }
     body += "\"}]}]}";
   }
@@ -3849,6 +3493,7 @@ bool doAICall(int idx, const char* customPrompt, const String* prebuiltBody = nu
   if(!text){ drawAIStatus("AI Kosong","tidak ada jawaban"); delay(2000); return false; }
   strncpy(aiResult,text,AI_RESULT_MAX); aiResult[AI_RESULT_MAX]='\0'; return true;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI — Entry point utama
@@ -4327,6 +3972,7 @@ void glitchChromatic(const char* text,int cx,int cy,int offsetX,uint16_t colR,ui
   lcd.setTextColor(colB);lcd.drawString(text,cx-tw/2+offsetX,cy-7);
 }
 
+
 void runBootSequence(bool sdOK,uint64_t sdMB,bool pidOK,uint16_t pid,
                      bool xclkOK,uint32_t xclkHz){
   lcd.fillScreen(COL_BLACK);
@@ -4450,6 +4096,7 @@ void exitUSBMode(){
 //  Setup
 // ─────────────────────────────────────────────────────────────────────────────
 
+
 void neoSetup() {
   strip.begin();
   strip.setBrightness(80);
@@ -4531,8 +4178,7 @@ void neoTick() {
 
 void setup(){
   Serial.begin(115200);
-  Serial.println("
-=== Sanzxcam v6.0 ===");
+  Serial.println("\n=== Sanzxcam v6.0 ===");
   Serial.println("[AI-MENU] 7 fitur: Describe/Scavenger/Mood/ANPR/Sky/Pest/Produce");
   Serial.println("[TRIGGER] Clong=viewfinder  Dlong=gallery  Dlong=photo view");
 
@@ -4588,15 +4234,13 @@ void setup(){
     g_accOffZ = 0.0f;
 
     if (g_mpuCalLoaded) {
-      Serial.printf("[MPU] Skip gyro calibration, using SD: X=%.5f Y=%.5f Z=%.5f
-", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
+      Serial.printf("[MPU] Skip gyro calibration, using SD: X=%.5f Y=%.5f Z=%.5f\n", g_gyroCalX, g_gyroCalY, g_gyroCalZ);
     } else {
       g_gyroCalX = 0.0f; g_gyroCalY = 0.0f; g_gyroCalZ = 0.0f;
       Serial.println("[MPU] No cal file found. Gyro bias set to 0. Use CALIBRATE menu.");
     }
   } esp_task_wdt_reset();
-  Serial.printf("[MPU] %s
-", g_mpuOk ? "OK" : "FAIL");
+  Serial.printf("[MPU] %s\n", g_mpuOk ? "OK" : "FAIL");
   g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
   bool pidOK=(detectedSensor==PID_GC2145||detectedSensor==PID_OV3660);
   uint32_t xclkHz=(detectedSensor==PID_OV3660)?24000000:20000000;
@@ -4732,6 +4376,13 @@ void handleModeDialogMultiDelete(ButtonEvent evt) {
   if (evt.pin == BTN_BOOT) { neoOff(); executeMultiDelete(); }
   else { neoOff(); multiDeleteMode = false; resetAllButtons(); appMode = MODE_GALLERY; if (galleryGridMode) drawGalleryGrid(); else drawGallery(); }
 }
+
+
+
+
+
+
+
 
 void handleModeGallery(ButtonEvent evt){
   bool cHeld=btnC.isHeld(),dHeld=btnD.isHeld();
@@ -4935,7 +4586,6 @@ void loop(){
     if (appMode == MODE_VIEWFINDER) runHDRFlow();
   }
 
-  btPlayerTick();
   tickAllButtons();
 
   ButtonEvent evtBoot={},evtB={},evtC={},evtD={};
@@ -4975,12 +4625,9 @@ void loop(){
     case MODE_AI_DESCRIBE:     handleModeAIDescribe(evtB,evtC,evtD);           break;
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
-    case MODE_BT_SCAN:         handleModeBTScan(singleEvt);                    break;
-    case MODE_BT_MP3_LIST:     handleModeBTMP3List(singleEvt);                break;
-    case MODE_BT_MP3_PLAYER:   handleModeBTMP3Player(singleEvt);              break;
   }
   if (appMode != MODE_VIEWFINDER) {
-    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE || appMode == MODE_BT_SCAN || appMode == MODE_BT_MP3_LIST || appMode == MODE_BT_MP3_PLAYER);
+    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE);
     if (!isMenu) islandNoClear = false;
     islandTick();
   }
