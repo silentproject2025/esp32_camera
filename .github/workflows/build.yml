@@ -46,6 +46,7 @@ jobs:
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
           arduino-cli lib install "Adafruit NeoPixel"
+          arduino-cli lib install "Radio"
 
       - name: Install esptool
         run: pip install esptool pyserial
