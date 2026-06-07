@@ -4631,7 +4631,7 @@ void drawRadioUI() {
   lcd.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
   lcd.setTextColor(COL_GRAY_8);
   lcd.setFont(&fonts::Font0);
-  const char* hint = "C/D: Seek  B: Vol  BOOT: Mute  B-long: Exit";
+  const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit)";
   lcd.drawString(hint, mx + (mw - lcd.textWidth(hint)) / 2, my + mh - 16);
 }
 
@@ -4660,9 +4660,21 @@ void handleModeRadio(ButtonEvent evt) {
       radio.setVolume(radioVol);
     }
   } else if (evt.pin == BTN_C) {
-    radio.seekDown(true); // Seek Down
+    if (evt.isLong) {
+      radio.seekDown(true);
+    } else {
+      radioFreq -= 10;
+      if (radioFreq < 8750) radioFreq = 10800;
+      radio.setFrequency(radioFreq);
+    }
   } else if (evt.pin == BTN_D) {
-    radio.seekUp(true); // Seek Up
+    if (evt.isLong) {
+      radio.seekUp(true);
+    } else {
+      radioFreq += 10;
+      if (radioFreq > 10800) radioFreq = 8750;
+      radio.setFrequency(radioFreq);
+    }
   } else if (evt.pin == BTN_BOOT) {
     radioMute = !radioMute;
     radio.setMute(radioMute);
