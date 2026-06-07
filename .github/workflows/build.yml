@@ -46,9 +46,6 @@ jobs:
           arduino-cli lib install "Adafruit Unified Sensor"
           arduino-cli lib install "Adafruit MPU6050"
           arduino-cli lib install "Adafruit NeoPixel"
-          arduino-cli lib install "ESP8266Audio"
-          mkdir -p ~/Arduino/libraries
-          git clone https://github.com/pschatzmann/ESP32-A2DP.git ~/Arduino/libraries/ESP32-A2DP
 
       - name: Install esptool
         run: pip install esptool pyserial
