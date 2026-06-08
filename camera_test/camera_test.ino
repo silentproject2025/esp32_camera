@@ -823,6 +823,10 @@ void saveSettings() {
   fprintf(f, "dlpf=%d\n", (int)mpuDlpfIndex);
   fprintf(f, "kalman_r=%.3f\n", mpuKalmanRmeas);
   fprintf(f, "tilt_dz=%.1f\n",  mpuTiltDeadzone);
+  fprintf(f, "radio_freq=%d\n", radioFreq);
+  fprintf(f, "radio_vol=%d\n",  (int)radioVol);
+  fprintf(f, "radio_mute=%d\n", (int)radioMute);
+  fprintf(f, "radio_bass=%d\n", (int)radioBass);
   fclose(f);
 }
 
@@ -847,6 +851,10 @@ void loadSettings() {
     else if (sscanf(line, "hd_capture=%d", &v) == 1) { hdCaptureEnabled = (bool)v; }
     else if (sscanf(line, "hd_quality=%d", &v) == 1) { hdCaptureQuality = (uint8_t)constrain(v, 1, 10); }
     else if (sscanf(line, "dlpf=%d", &v) == 1) { mpuDlpfIndex = (uint8_t)constrain(v, 0, 6); }
+    else if (sscanf(line, "radio_freq=%d", &v) == 1) { radioFreq = (uint16_t)constrain(v, 5000, 11500); }
+    else if (sscanf(line, "radio_vol=%d",  &v) == 1) { radioVol  = (uint8_t)constrain(v, 0, 15); }
+    else if (sscanf(line, "radio_mute=%d", &v) == 1) { radioMute = (bool)v; }
+    else if (sscanf(line, "radio_bass=%d", &v) == 1) { radioBass = (bool)v; }
     float fv = 0;
     if      (sscanf(line, "kalman_r=%f", &fv) == 1) { mpuKalmanRmeas = constrain(fv, 0.01f, 1.0f); }
     else if (sscanf(line, "tilt_dz=%f", &fv) == 1) { mpuTiltDeadzone = constrain(fv, 0.0f, 10.0f); }
@@ -4666,14 +4674,14 @@ void handleModeRadio(ButtonEvent evt) {
 
   if (evt.pin == BTN_B) {
     if (evt.isLong) {
-      radio.setMute(true);
+      radio.setMute(true); saveSettings();
       appMode = MODE_FEATURES;
       drawFeaturesMenu(menuFeatSel);
       resetAllButtons();
       return;
     } else {
       radioVol = (radioVol + 1) % 16;
-      radio.setVolume(radioVol);
+      radio.setVolume(radioVol); saveSettings();
     }
   } else if (evt.pin == BTN_C) {
     if (evt.isLong) {
@@ -4681,7 +4689,7 @@ void handleModeRadio(ButtonEvent evt) {
     } else {
       radioFreq -= 10;
       if (radioFreq < 5000) radioFreq = 11500;
-      radio.setFrequency(radioFreq);
+      radio.setFrequency(radioFreq); saveSettings();
     }
   } else if (evt.pin == BTN_D) {
     if (evt.isLong) {
@@ -4689,14 +4697,14 @@ void handleModeRadio(ButtonEvent evt) {
     } else {
       radioFreq += 10;
       if (radioFreq > 11500) radioFreq = 5000;
-      radio.setFrequency(radioFreq);
+      radio.setFrequency(radioFreq); saveSettings();
     }
   } else if (evt.pin == BTN_BOOT) {
     if (evt.isLong) {
       radio.seekUp(true);
     } else {
       radioMute = !radioMute;
-      radio.setMute(radioMute);
+      radio.setMute(radioMute); saveSettings();
     }
   }
 
