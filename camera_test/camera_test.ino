@@ -289,6 +289,7 @@ enum AppMode {
   MODE_FEATURES,
   MODE_DIALOG_MULTI_DELETE,
   MODE_RADIO,
+  MODE_RADIO_FREQ_INPUT,
 };
 AppMode appMode  = MODE_VIEWFINDER;
 Adafruit_NeoPixel strip(NEO_NUM, NEO_PIN, NEO_GRB + NEO_KHZ800);
@@ -516,6 +517,9 @@ static bool     radioStereo = true;
 static char     radioRDSStation[10] = "         ";
 static char     radioRDSText[66] = "Waiting for RDS...";
 static uint32_t radioLastRdsMs = 0;
+static int      radioFreqDigits[5] = {1, 0, 0, 7, 0};
+static int      radioFreqCursorPos = 0;
+static uint32_t radioFreqOpenMs = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  KEY MANAGER STATE
@@ -4565,6 +4569,118 @@ void RDS_PROCS(uint16_t block1, uint16_t block2, uint16_t block3, uint16_t block
 
 void updateRDS() {}
 
+void drawRadioFreqInputDialog() {
+  int dw = 240, dh = 110;
+  int dx = (DISP_W - dw) / 2, dy = (DISP_H - dh) / 2;
+
+  lcd.fillRoundRect(dx, dy, dw, dh, 8, COL_GRAY_D);
+  lcd.drawRoundRect(dx, dy, dw, dh, 8, COL_AI_ACCENT);
+
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_AI_ACCENT);
+  const char* title = "SET FREQUENCY (MHz)";
+  lcd.drawString(title, dx + (dw - lcd.textWidth(title)) / 2, dy + 8);
+  lcd.drawFastHLine(dx+10, dy+22, dw-20, COL_GRAY_3);
+
+  int boxW = 28, boxH = 38, boxGap = 4;
+  int dotW = 8;
+  int totalW = 5 * boxW + 4 * boxGap + dotW;
+  int startX = dx + (dw - totalW) / 2;
+  int boxY = dy + 32;
+
+  for (int i = 0; i < 5; i++) {
+    int curX = startX + i * (boxW + boxGap) + (i >= 3 ? dotW : 0);
+    bool isCursor = (i == radioFreqCursorPos);
+
+    lcd.fillRoundRect(curX, boxY, boxW, boxH, 4, isCursor ? COL_GRAY_5 : COL_GRAY_2);
+    lcd.drawRoundRect(curX, boxY, boxW, boxH, 4, isCursor ? COL_WHITE : COL_GRAY_3);
+
+    char dBuf[2]; snprintf(dBuf, sizeof(dBuf), "%d", radioFreqDigits[i]);
+    lcd.setFont(&fonts::FreeSansBold12pt7b);
+    int tw = lcd.textWidth(dBuf);
+    lcd.setTextColor(isCursor ? COL_WHITE : COL_GRAY_A);
+    lcd.drawString(dBuf, curX + (boxW - tw) / 2, boxY + 6);
+
+    if (isCursor) {
+      int tx = curX + boxW / 2, ty = boxY + boxH + 3;
+      lcd.fillTriangle(tx - 4, ty, tx + 4, ty, tx, ty + 5, COL_AI_ACCENT);
+    }
+  }
+
+  lcd.setFont(&fonts::FreeSansBold12pt7b);
+  lcd.setTextColor(COL_WHITE);
+  lcd.drawString(".", startX + 3 * boxW + 2 * boxGap + 1, boxY + 12);
+
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_8);
+  const char* hint = "C/D: Adj  B: Cursor  BOOT: OK";
+  lcd.drawString(hint, dx + (dw - lcd.textWidth(hint)) / 2, dy + dh - 20);
+
+  unsigned long elapsed = millis() - radioFreqOpenMs;
+  int barW = dw - 20;
+  int prog = barW - (int)((long)barW * elapsed / 15000);
+  prog = constrain(prog, 0, barW);
+  lcd.fillRect(dx + 10, dy + dh - 6, barW, 2, COL_GRAY_3);
+  lcd.fillRect(dx + 10, dy + dh - 6, prog, 2, COL_AI_ACCENT);
+}
+
+void openRadioFreqInput() {
+  radioFreqOpenMs = millis();
+  radioFreqCursorPos = 0;
+
+  // Fill digits from radioFreq (e.g., 10070 -> 1, 0, 0, 7, 0)
+  int temp = radioFreq;
+  radioFreqDigits[4] = temp % 10; temp /= 10;
+  radioFreqDigits[3] = temp % 10; temp /= 10;
+  radioFreqDigits[2] = temp % 10; temp /= 10;
+  radioFreqDigits[1] = temp % 10; temp /= 10;
+  radioFreqDigits[0] = temp % 10;
+
+  appMode = MODE_RADIO_FREQ_INPUT;
+  resetAllButtons();
+  drawRadioFreqInputDialog();
+}
+
+void handleModeRadioFreqInput(ButtonEvent evt) {
+  if (millis() - radioFreqOpenMs > 15000) {
+    appMode = MODE_RADIO; drawRadioUI(); return;
+  }
+
+  if (!evt.valid) {
+    drawRadioFreqInputDialog(); // Keep timer bar updated
+    return;
+  }
+
+  if (evt.pin == BTN_B) {
+    radioFreqCursorPos = (radioFreqCursorPos + 1) % 5;
+  } else if (evt.pin == BTN_C) {
+    radioFreqDigits[radioFreqCursorPos] = (radioFreqDigits[radioFreqCursorPos] + 9) % 10;
+  } else if (evt.pin == BTN_D) {
+    radioFreqDigits[radioFreqCursorPos] = (radioFreqDigits[radioFreqCursorPos] + 1) % 10;
+  } else if (evt.pin == BTN_BOOT) {
+    if (evt.isLong) {
+       appMode = MODE_RADIO; drawRadioUI(); return;
+    } else {
+       // Calculate new frequency
+       uint16_t newFreq = radioFreqDigits[0] * 10000 +
+                          radioFreqDigits[1] * 1000 +
+                          radioFreqDigits[2] * 100 +
+                          radioFreqDigits[3] * 10 +
+                          radioFreqDigits[4];
+       if (newFreq >= 5000 && newFreq <= 11500) {
+         radioFreq = newFreq;
+         radio.setFrequency(radioFreq);
+         saveSettings();
+         islandPush(NOTIF_INFO, "Freq Updated");
+       } else {
+         islandPush(NOTIF_WARN, "Out of Range!");
+       }
+       appMode = MODE_RADIO; drawRadioUI(); return;
+    }
+  }
+
+  drawRadioFreqInputDialog();
+}
 void radioInit() {
   radio.initWire(Wire);
 radio.init();
@@ -4572,7 +4688,7 @@ radio.init();
   rds.attachServiceNameCallback(DisplayServiceName);
   rds.attachTextCallback(DisplayText);
 
-  radio.setBand(RADIO_BAND_FM);
+  radio.setBand((RADIO_BAND)3);
   radio.setFrequency(radioFreq);
   radio.setVolume(radioVol);
   radio.setMono(false);
@@ -4652,7 +4768,7 @@ void drawRadioUI() {
   radioSprite.drawFastHLine(mx + 10, my + mh - 25, mw - 20, COL_GRAY_3);
   radioSprite.setTextColor(COL_GRAY_8);
   radioSprite.setFont(&fonts::Font0);
-  const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit) BOOT:Mute (Hold:Scan)";
+  const char* hint = "C/D: Tune (Hold:Seek) B:Vol (Hold:Exit) BOOT:Mute (Hold:Freq)";
   radioSprite.drawString(hint, mx + (mw - radioSprite.textWidth(hint)) / 2, my + mh - 16);
 
   radioSprite.pushSprite(0, 0);
@@ -4701,7 +4817,7 @@ void handleModeRadio(ButtonEvent evt) {
     }
   } else if (evt.pin == BTN_BOOT) {
     if (evt.isLong) {
-      radio.seekUp(true);
+      openRadioFreqInput();
     } else {
       radioMute = !radioMute;
       radio.setMute(radioMute); saveSettings();
@@ -4807,9 +4923,10 @@ void loop(){
     case MODE_AI_NO_CONFIG:    handleModeAINoConfig(evtB,evtD);                break;
     case MODE_KEY_MANAGER:     handleModeKeyManager(evtBoot,evtB,evtC,evtD);  break;
     case MODE_RADIO:           handleModeRadio(singleEvt);                     break;
+    case MODE_RADIO_FREQ_INPUT: handleModeRadioFreqInput(singleEvt);                break;
   }
   if (appMode != MODE_VIEWFINDER) {
-    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE || appMode == MODE_RADIO);
+    bool isMenu = (appMode == MODE_JUMP_INPUT || appMode == MODE_AI_DESCRIBE || appMode == MODE_AI_NO_CONFIG || appMode == MODE_AI_FEATURE_MENU || appMode == MODE_KEY_MANAGER || appMode == MODE_FEATURES || appMode == MODE_MENU_EXP || appMode == MODE_MENU_LED || appMode == MODE_MENU_FORMAT || appMode == MODE_MENU_EXP_ADJ || appMode == MODE_DIALOG_MULTI_DELETE || appMode == MODE_RADIO || appMode == MODE_RADIO_FREQ_INPUT);
     if (!isMenu) islandNoClear = false;
     islandTick();
   }
