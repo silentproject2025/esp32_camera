@@ -1,8 +1,0 @@
-Review of changes in camera_test.ino:
-1. Added MODE_RADIO_FREQ_INPUT to AppMode enum.
-2. Defined radioFreqDigits[5], radioFreqCursorPos, and radioFreqOpenMs globals.
-3. Implemented drawRadioFreqInputDialog(), openRadioFreqInput(), and handleModeRadioFreqInput().
-4. Updated radioInit() to use band 3 (50-115 MHz for RDA5807M).
-5. Updated drawRadioUI() hint to "BOOT:Mute (Hold:Freq)".
-6. Replaced radio.seekUp(true) with openRadioFreqInput() on long BOOT press in handleModeRadio().
-7. Integrated the new mode into the loop switch and isMenu check.
