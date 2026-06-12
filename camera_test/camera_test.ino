@@ -504,6 +504,8 @@ static bool galleryGridMode = true;
 static bool galleryGridActive = false;
 static int menuFeatSel = 0;
 static bool hdCaptureEnabled = false;
+String storageRoot = "/sdcard";
+bool usbReady = false;
 static uint8_t hdCaptureQuality = 4; // 4 = best, 6 = good
 
 // [PORTED v6.2] Radio globals
@@ -942,6 +944,7 @@ void runMPUCalibration() {
 //  WIFI & GEMINI CONFIG LOADER
 // ─────────────────────────────────────────────────────────────────────────────
 static void createFileTemplate(const char* path, const char* content) {
+  if (!sdReady && !usbReady) return;
   FILE* f = fopen(path, "w");
   if (!f) return;
   fputs(content, f);
@@ -1063,82 +1066,76 @@ inline bool gIsJpg  (int i) { return galleryFileType[i] == GFILE_JPG;   }
 inline bool gIsPhoto(int i) { return galleryFileType[i] != GFILE_VIDEO;  }
 
 // Forward declarations for functions used in AI feature menu
-void scanGalleryFiles();
-void scanPhotoCount();
-void photoViewRender();
-void photoViewDrawCaption(int idx);
-void openAIDescribeWithFeature(int idx, AIFeature feature);
-void drawAINoConfigScreen(bool missingWifi, bool missingGemini);
+void scanGalleryFiles(){
+  multiDeleteMode = false; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
+  galleryCount=0;galleryScroll=0;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  AI FEATURE MENU — DRAW
-// ─────────────────────────────────────────────────────────────────────────────
-
-// [PORTED v6.1] Features Menu
-void drawFeaturesMenu(int sel) {
-  int mw = 220, mh = 314, mx = (DISP_W - mw) / 2, my = (DISP_H - mh) / 2;
-  lcd.fillScreen(COL_BLACK);
-  lcd.fillRoundRect(mx, my, mw, mh, 10, COL_GRAY_D);
-  lcd.drawRoundRect(mx, my, mw, mh, 10, COL_GRAY_5);
-  lcd.setFont(&fonts::Font0); lcd.setTextSize(1); lcd.setTextColor(COL_GRAY_E);
-  const char* title = "--- EXPERIMENTAL FEATURES ---";
-  lcd.drawString(title, mx + (mw - lcd.textWidth(title)) / 2, my + 7);
-  lcd.drawFastHLine(mx + 10, my + 19, mw - 20, COL_GRAY_3);
-  static const char* const rowLabels[13] = {
-    "EIS  Electronic Stab", "HDR  Triple Exposure",
-    "AUTO-ROTATE  MPU tilt", "MPU LOG  CSV to SD", "HUD  Overlay",
-    "CALIBRATE MPU  recalibrate",
-    "HD CAPTURE  quality saat foto", "HD QUALITY  4=max / 6=bagus",
-    "KALMAN-R  noise filter", "TILT-DZ  deadzone deg",
-    "DLPF  filter bandwidth", "CLEAR THUMB CACHE",
-    "FM RADIO  RDA5807M"
-  };
-  bool* const rowVals[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
-  for (int i = 0; i < 13; i++) {
-    int iy = my + 24 + i * 22; bool hl = (i == sel);
-    lcd.fillRect(mx + 8, iy, mw - 16, 18, hl ? COL_GRAY_5 : COL_GRAY_D);
-    if (hl) lcd.fillRect(mx + 2, iy, 4, 18, COL_WHITE);
-    lcd.setTextColor(hl ? COL_WHITE : COL_GRAY_A);
-    lcd.drawString(rowLabels[i], mx + 12, iy + 5);
-
-    if (i < 5) {
-      lcd.setTextColor(*rowVals[i] ? 0x07E0 : COL_GRAY_3);
-      lcd.drawString(*rowVals[i] ? "ON" : "OFF", mx + mw - 30, iy + 5);
-    } else if (i == 5) {
-      lcd.setTextColor(g_mpuCalLoaded ? COL_AI_ACCENT : COL_GRAY_3);
-      lcd.drawString(g_mpuCalLoaded ? "CAL" : "---", mx + mw - 30, iy + 5);
-    } else if (i == 6) {
-      lcd.setTextColor(hdCaptureEnabled ? 0x07E0 : COL_GRAY_3);
-      lcd.drawString(hdCaptureEnabled ? "ON" : "OFF", mx + mw - 30, iy + 5);
-    } else if (i == 7) {
-      lcd.setTextColor(COL_WHITE);
-      char qBuf[8]; snprintf(qBuf, sizeof(qBuf), "%d", hdCaptureQuality);
-      lcd.drawString(qBuf, mx + mw - 30, iy + 5);
-    } else if (i == 8) {
-      lcd.setTextColor(COL_WHITE);
-      char rBuf[8]; snprintf(rBuf, sizeof(rBuf), "%.2f", mpuKalmanRmeas);
-      lcd.drawString(rBuf, mx + mw - 45, iy + 5);
-    } else if (i == 9) {
-      lcd.setTextColor(COL_WHITE);
-      char dBuf[8]; snprintf(dBuf, sizeof(dBuf), "%.1f", mpuTiltDeadzone);
-      lcd.drawString(dBuf, mx + mw - 45, iy + 5);
-    } else if (i == 10) {
-      lcd.setTextColor(COL_WHITE);
-      lcd.drawString(DLPF_LABELS[mpuDlpfIndex], mx + mw - 45, iy + 5);
-    } else if (i == 11) {
-      lcd.setTextColor(COL_GRAY_7);
-      lcd.drawString("RUN", mx + mw - 30, iy + 5);
-    } else if (i == 12) {
-      lcd.setTextColor(COL_AI_ACCENT);
-      lcd.drawString("OPEN", mx + mw - 30, iy + 5);
+  auto scanDir = [&](const char* root) {
+    DIR* dir=opendir(root); if(!dir) return;
+    struct dirent* entry;
+    while((entry=readdir(dir))!=nullptr&&galleryCount<GALLERY_MAX_FILES){
+      if (strncmp(entry->d_name, ".", 1) == 0) continue;
+      String name=entry->d_name;
+      bool isJpg=name.endsWith(".jpg")||name.endsWith(".JPG");
+      bool isBmp=name.endsWith(".bmp")||name.endsWith(".BMP");
+      bool isMjpeg=name.endsWith(".mjpeg")||name.endsWith(".MJPEG");
+      if(isJpg||isBmp||isMjpeg){
+        strncpy(galleryFiles[galleryCount],entry->d_name,31);
+        galleryFiles[galleryCount][31]='\0';
+        if(isMjpeg)    galleryFileType[galleryCount]=GFILE_VIDEO;
+        else if(isBmp) galleryFileType[galleryCount]=GFILE_BMP;
+        else           galleryFileType[galleryCount]=GFILE_JPG;
+        galleryCount++;
+      }
     }
+    closedir(dir);
+  };
+
+  scanDir("/sdcard");
+  scanDir("/usb");
+
+  if (sdReady || usbReady) thumbCacheEnsureDir();
+
+  for(int i=1;i<galleryCount;i++){
+    char tmpN[32]; strncpy(tmpN,galleryFiles[i],31); tmpN[31]='\0';
+    GalleryFileType tmpT=galleryFileType[i];
+    int j=i-1;
+    while(j>=0&&strcmp(galleryFiles[j],tmpN)>0){
+      strncpy(galleryFiles[j+1],galleryFiles[j],31);
+      galleryFileType[j+1]=galleryFileType[j]; j--;
+      if(j%20==0) esp_task_wdt_reset();
+    }
+    strncpy(galleryFiles[j+1],tmpN,31); galleryFileType[j+1]=tmpT;
   }
-  lcd.drawFastHLine(mx + 10, my + mh - 24, mw - 20, COL_GRAY_3);
-  lcd.setTextColor(COL_GRAY_A);
-  lcd.drawString("C/D=nav  BOOT=toggle/run  B=back", mx + (mw - lcd.textWidth("C/D=nav  BOOT=toggle/run  B=back")) / 2, my + mh - 14);
 }
 
 // UI UPDATE v6.0
+void drawFeaturesMenu(int sel) {
+  lcd.fillScreen(COL_BLACK);
+  lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
+  lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
+  lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
+  lcd.setTextColor(COL_GRAY_E);
+  const char* title = "FEATURES";
+  lcd.drawString(title, (DISP_W - lcd.textWidth(title)) / 2, 6);
+
+  const int itemH = 22;
+  const int startY = 25;
+  for (int i = 0; i < 13; i++) {
+    int y = startY + i * itemH;
+    if (y > DISP_H - 10) break;
+    if (i == sel) {
+       lcd.fillRect(0, y-2, DISP_W, itemH, COL_GRAY_D);
+       lcd.setTextColor(COL_WHITE);
+    } else {
+       lcd.setTextColor(COL_GRAY_7);
+    }
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Item %d", i);
+    lcd.drawString(buf, 10, y);
+  }
+}
+
 void handleModeFeatures(ButtonEvent evt) {
   if (!evt.valid) return;
   bool* const feats[5] = {&eisEnabled, &hdrEnabled, &autoRotateEnabled, &mpuLogEnabled, &hudEnabled};
@@ -1220,6 +1217,14 @@ void handleModeFeatures(ButtonEvent evt) {
   }
 }
 // UI UPDATE v6.0
+void openAIFeatureMenu(bool fromViewfinder) {
+  aiFromViewfinder = fromViewfinder;
+  aiSelectedFeature = AI_FEAT_DESCRIBE;
+  appMode = MODE_AI_FEATURE_MENU;
+  drawAIFeatureMenu(aiSelectedFeature, aiFromViewfinder);
+  resetAllButtons();
+}
+
 void drawAIFeatureMenu(int sel, bool fromViewfinder) {
   lcd.fillScreen(COL_BLACK);
   lcd.fillRect(0, 0, DISP_W, 20, COL_GRAY_D);
@@ -1293,17 +1298,21 @@ void drawAIFeatureMenu(int sel, bool fromViewfinder) {
 // ─────────────────────────────────────────────────────────────────────────────
 //  AI FEATURE MENU — OPEN & HANDLE
 // ─────────────────────────────────────────────────────────────────────────────
-void openAIFeatureMenu(bool fromViewfinder) {
-  aiFromViewfinder = fromViewfinder;
-  aiSelectedFeature = AI_FEAT_DESCRIBE;
-  drawAIFeatureMenu((int)aiSelectedFeature, fromViewfinder);
-  resetAllButtons();
-  appMode = MODE_AI_FEATURE_MENU;
-  neoBurst(0, 200, 200, 2);
-}
-
 bool captureForAI(char* outPath, int outPathLen) {
-  snprintf(outPath, outPathLen, "/sdcard/ai_temp.jpg");
+  snprintf(outPath, outPathLen, "%s/ai_temp.jpg", storageRoot.c_str());
+
+  sensor_t *s = esp_camera_sensor_get();
+  framesize_t oldFs = s->status.framesize;
+  if (hdCaptureEnabled) {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    delay(300);
+    for (int i = 0; i < 4; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if (tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
+    }
+  }
+
   if (ledFlashEnabled) {
     digitalWrite(LED_FLASH, HIGH); if (neoFlashEnabled) neoWhiteFlash(); delay(150);
     for (int i = 0; i < 2; i++) {
@@ -1320,18 +1329,13 @@ bool captureForAI(char* outPath, int outPathLen) {
   if (fb->format == PIXFORMAT_RGB565) {
     if (eisEnabled) {
       uint16_t* src = (uint16_t*)fb->buf;
-      uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-      if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
+      uint16_t* tmp = (uint16_t*)ps_malloc(fb->width * fb->height * 2);
+      if (!tmp) tmp = (uint16_t*)malloc(fb->width * fb->height * 2);
       if (tmp) {
-        int sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W); int sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
-        for (int y = 0; y < DISP_H; y++) {
-          int srY = sy + (y * EIS_VP_H / DISP_H);
-          for (int x = 0; x < DISP_W; x++) {
-            int srX = sx + (x * EIS_VP_W / DISP_W);
-            tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
-          }
-        }
-        camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
+        float scaleX = (float)fb->width / DISP_W;
+        float scaleY = (float)fb->height / DISP_H;
+        applyEIS((uint16_t*)fb->buf, tmp, fb->width, fb->height, g_eisOffX * scaleX, g_eisOffY * scaleY);
+        camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = fb->width; fk.height = fb->height;
         int captureQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
         ok = frame2jpg(&fk, captureQ, &jpg_buf, &jpg_len); free(tmp);
       }
@@ -1346,7 +1350,17 @@ bool captureForAI(char* outPath, int outPathLen) {
     if (f) { size_t w = fwrite(jpg_buf, 1, jpg_len, f); fclose(f); saved = (w == jpg_len); }
     if (fb->format != PIXFORMAT_JPEG) free(jpg_buf);
   }
-  esp_camera_fb_return(fb); esp_task_wdt_reset();
+  esp_camera_fb_return(fb);
+
+  if (hdCaptureEnabled) {
+    s->set_framesize(s, oldFs);
+    delay(100);
+    for (int i = 0; i < 2; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if (tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
+    }
+  }
   return saved;
 }
 
@@ -2029,68 +2043,41 @@ void unmountVFSOnly(){
 // ─────────────────────────────────────────────────────────────────────────────
 void scanPhotoCount(){
   photoCount=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
-  struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr){
-    String name=entry->d_name;
-    bool isJpg=name.startsWith("photo_")&&name.endsWith(".jpg");
-    bool isBmp=name.startsWith("photo_")&&name.endsWith(".bmp");
-    if(isJpg||isBmp){
-      int num=name.substring(6,name.length()-4).toInt();
-      if(num>photoCount) photoCount=num;
+  auto scanRoot = [&](const char* root) {
+    DIR* dir=opendir(root); if(!dir) return;
+    struct dirent* entry;
+    while((entry=readdir(dir))!=nullptr){
+      String name=entry->d_name;
+      if(name.startsWith("photo_")&&(name.endsWith(".jpg")||name.endsWith(".bmp"))){
+        int num=name.substring(6,name.length()-4).toInt();
+        if(num>photoCount) photoCount=num;
+      }
     }
-  }
-  closedir(dir);
+    closedir(dir);
+  };
+  scanRoot("/sdcard");
+  scanRoot("/usb");
 }
 
 void scanVideoCount(){
   recVideoCount=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
-  struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr){
-    String name=entry->d_name;
-    if(name.startsWith("video_")&&name.endsWith(".mjpeg")){
-      int num=name.substring(6,name.length()-6).toInt();
-      if(num>recVideoCount) recVideoCount=num;
+  auto scanRoot = [&](const char* root) {
+    DIR* dir=opendir(root); if(!dir) return;
+    struct dirent* entry;
+    while((entry=readdir(dir))!=nullptr){
+      String name=entry->d_name;
+      if(name.startsWith("video_")&&name.endsWith(".mjpeg")){
+        int num=name.substring(6,name.length()-6).toInt();
+        if(num>recVideoCount) recVideoCount=num;
+      }
     }
-  }
-  closedir(dir);
+    closedir(dir);
+  };
+  scanRoot("/sdcard");
+  scanRoot("/usb");
 }
 
-void scanGalleryFiles(){
-  multiDeleteMode = false; memset(multiDeleteSelected, 0, sizeof(multiDeleteSelected)); multiDeleteCount = 0;
-  galleryCount=0;galleryScroll=0;
-  DIR* dir=opendir("/sdcard"); if(!dir) return;
-  struct dirent* entry;
-  while((entry=readdir(dir))!=nullptr&&galleryCount<GALLERY_MAX_FILES){
-    if (strncmp(entry->d_name, ".", 1) == 0) continue;
-    String name=entry->d_name;
-    bool isJpg=name.endsWith(".jpg")||name.endsWith(".JPG");
-    bool isBmp=name.endsWith(".bmp")||name.endsWith(".BMP");
-    bool isMjpeg=name.endsWith(".mjpeg")||name.endsWith(".MJPEG");
-    if(isJpg||isBmp||isMjpeg){
-      strncpy(galleryFiles[galleryCount],entry->d_name,31);
-      galleryFiles[galleryCount][31]='\0';
-      if(isMjpeg)    galleryFileType[galleryCount]=GFILE_VIDEO;
-      else if(isBmp) galleryFileType[galleryCount]=GFILE_BMP;
-      else           galleryFileType[galleryCount]=GFILE_JPG;
-      galleryCount++;
-    }
-  }
-  if (sdReady) thumbCacheEnsureDir();
-  closedir(dir);
-  for(int i=1;i<galleryCount;i++){
-    char tmpN[32]; strncpy(tmpN,galleryFiles[i],31); tmpN[31]='\0';
-    GalleryFileType tmpT=galleryFileType[i];
-    int j=i-1;
-    while(j>=0&&strcmp(galleryFiles[j],tmpN)>0){
-      strncpy(galleryFiles[j+1],galleryFiles[j],31);
-      galleryFileType[j+1]=galleryFileType[j]; j--;
-      if(j%20==0) esp_task_wdt_reset();
-    }
-    strncpy(galleryFiles[j+1],tmpN,31); galleryFileType[j+1]=tmpT;
-  }
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UI UPDATE v6.0
@@ -2132,7 +2119,7 @@ void thumbCacheSave(const char* galleryFilename, const uint16_t* buf) {
 
 bool thumbDecodeJpeg(const char* galleryFilename, uint16_t* outBuf) {
   char path[64];
-  snprintf(path, sizeof(path), "/sdcard/%s", galleryFilename);
+  snprintf(path, sizeof(path), "%s/%s", storageRoot.c_str(), galleryFilename);
   FILE* f = fopen(path, "rb");
   if (!f) return false;
   fseek(f, 0, SEEK_END);
@@ -2933,13 +2920,19 @@ void drawRecIndicator(){
 }
 
 void startRecording() {
-  if (!sdReady || recActive) return;
+  if (!(sdReady || usbReady) || recActive) return;
   neoSolid(180, 0, 0);
-  if (!sdReady || recActive) return;
   recVideoCount++;
-  char path[48]; snprintf(path, sizeof(path), "/sdcard/video_%04d.mjpeg", recVideoCount);
+  char path[64]; snprintf(path, sizeof(path), "%s/video_%04d.mjpeg", storageRoot.c_str(), recVideoCount);
   recFile = fopen(path, "wb");
   if (!recFile) { recVideoCount--; return; }
+
+  if (hdCaptureEnabled) {
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_framesize(s, FRAMESIZE_VGA);
+    delay(300);
+  }
+
   g_eisOffX = EIS_CROP_X; g_eisOffY = EIS_CROP_Y;
   g_eisBiasX = 0; g_eisBiasY = 0;
   recFrameCount = 0; recStartMs = millis(); recActive = true;
@@ -2950,8 +2943,15 @@ void startRecording() {
 void stopRecording(){
   if(!recActive||!recFile) return;
   fclose(recFile);recFile=nullptr;recActive=false;
+
+  if (hdCaptureEnabled) {
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_framesize(s, FRAMESIZE_QVGA);
+    delay(100);
+  }
+
   float actualFps = (float)recFrameCount / ((millis() - recStartMs) / 1000.0f);
-  char iniPath[48]; snprintf(iniPath, sizeof(iniPath), "/sdcard/video_%04d.ini", recVideoCount);
+  char iniPath[64]; snprintf(iniPath, sizeof(iniPath), "%s/video_%04d.ini", storageRoot.c_str(), recVideoCount);
   FILE* fIni = fopen(iniPath, "w");
   if(fIni){
     fprintf(fIni, "fps=%.2f\n", actualFps);
@@ -2968,44 +2968,74 @@ void recordFrame() {
   if (!recActive || !recFile) return;
   camera_fb_t* fb = esp_camera_fb_get();
   if (!fb) { esp_task_wdt_reset(); return; }
+  int fw = fb->width;
+  int fh = fb->height;
+
   if (eisEnabled && fb->format == PIXFORMAT_RGB565) {
     uint16_t* src = (uint16_t*)fb->buf;
-    uint16_t* tmp = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
-    if (!tmp) tmp = (uint16_t*)malloc(DISP_W * DISP_H * 2);
+    uint16_t* tmp = (uint16_t*)ps_malloc(fw * fh * 2);
+    if (!tmp) tmp = (uint16_t*)malloc(fw * fh * 2);
     if (tmp) {
-      int sx = constrain((int)g_eisOffX, 0, DISP_W - EIS_VP_W); int sy = constrain((int)g_eisOffY, 0, DISP_H - EIS_VP_H);
-      for (int y = 0; y < DISP_H; y++) {
-        int srY = sy + (y * EIS_VP_H / DISP_H);
-        for (int x = 0; x < DISP_W; x++) {
-          int srX = sx + (x * EIS_VP_W / DISP_W);
-          tmp[y * DISP_W + x] = src[srY * DISP_W + srX];
+      float scaleX = (float)fw / DISP_W;
+      float scaleY = (float)fh / DISP_H;
+      int cropW = (int)(fw * EIS_CROP_PCT);
+      int cropH = (int)(fh * EIS_CROP_PCT);
+      int vpW = fw - cropW;
+      int vpH = fh - cropH;
+      int sx = constrain((int)(g_eisOffX * scaleX), 0, fw - vpW);
+      int sy = constrain((int)(g_eisOffY * scaleY), 0, fh - vpH);
+
+      for (int y = 0; y < fh; y++) {
+        int srY = sy + (y * vpH / fh);
+        int rowOff = y * fw;
+        for (int x = 0; x < fw; x++) {
+          int srX = sx + (x * vpW / fw);
+          tmp[rowOff + x] = src[srY * fw + srX];
         }
       }
+
       uint8_t* out = nullptr; size_t oLen = 0;
-      camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = DISP_W; fk.height = DISP_H;
+      camera_fb_t fk = *fb; fk.buf = (uint8_t*)tmp; fk.width = fw; fk.height = fh;
       int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
-      if (frame2jpg(&fk, recQ, &out, &oLen)) { fwrite(out, 1, oLen, recFile); recFrameCount++; free(out); }
+      if (frame2jpg(&fk, recQ, &out, &oLen)) {
+        fwrite(out, 1, oLen, recFile);
+        recFrameCount++;
+        free(out);
+      }
+
       if (recFrameCount % 3 == 0) {
-        int dw = min((int)DISP_W, (int)lcd.width());
-        int dh = min((int)DISP_H, (int)lcd.height());
-        lcd.pushImage(0, 0, dw, dh, tmp);
+        float zx = (float)DISP_W / fw;
+        float zy = (float)DISP_H / fh;
+        lcd.setPivot(0, 0);
+        lcd.pushImageRotateZoom(0, 0, 0, 0, 0, zx, zy, fw, fh, tmp);
       }
       free(tmp);
     }
     esp_camera_fb_return(fb); return;
   }
+
   uint8_t* jpg = nullptr; size_t jLen = 0; bool ok = false;
-  if (fb->format == PIXFORMAT_JPEG) { jpg = fb->buf; jLen = fb->len; ok = true; }
-  else { int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
-  ok = frame2jpg(fb, recQ, &jpg, &jLen); }
-  if (ok && jpg) {
-    fwrite(jpg, 1, jLen, recFile); recFrameCount++;
-    if (fb->format != PIXFORMAT_JPEG) free(jpg);
+  if (fb->format == PIXFORMAT_JPEG) {
+    jpg = fb->buf; jLen = fb->len; ok = true;
+  } else {
+    int recQ = hdCaptureEnabled ? map(hdCaptureQuality, 1, 10, 95, 50) : 85;
+    ok = frame2jpg(fb, recQ, &jpg, &jLen);
   }
-  if (recFrameCount % 3 == 0 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
-    int dw = min((int)fb->width, (int)lcd.width());
-    int dh = min((int)fb->height, (int)lcd.height());
-    lcd.pushImage(0, 0, dw, dh, (uint16_t*)fb->buf);
+
+  if (ok && jpg) {
+    fwrite(jpg, 1, jLen, recFile);
+    recFrameCount++;
+    if (recFrameCount % 3 == 0) {
+       if (fb->format == PIXFORMAT_JPEG) {
+         TJpgDec.drawJpg(0, 0, jpg, jLen);
+       } else {
+         float zx = (float)DISP_W / fw;
+         float zy = (float)DISP_H / fh;
+         lcd.setPivot(0, 0);
+         lcd.pushImageRotateZoom(0, 0, 0, 0, 0, zx, zy, fw, fh, (uint16_t*)fb->buf);
+       }
+    }
+    if (fb->format != PIXFORMAT_JPEG) free(jpg);
   }
   esp_camera_fb_return(fb); esp_task_wdt_reset();
 }
@@ -3680,6 +3710,19 @@ void renderViewfinder(){
   }
 }
 void captureAndPreview() {
+  sensor_t *s = esp_camera_sensor_get();
+  framesize_t oldFs = s->status.framesize;
+
+  if (hdCaptureEnabled) {
+    s->set_framesize(s, FRAMESIZE_VGA);
+    delay(300);
+    for (int i = 0; i < 4; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if (tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
+    }
+  }
+
   if (ledFlashEnabled) {
     digitalWrite(LED_FLASH, HIGH); if (neoFlashEnabled) neoWhiteFlash(); delay(150);
     for (int i = 0; i < 2; i++) {
@@ -3693,48 +3736,58 @@ void captureAndPreview() {
   neoBurst(0, 80, 255, 1);
   int curRot = lcd.getRotation();
   int targetRot = (curRot == 0) ? 3 : (curRot == 1) ? 2 : (curRot == 2) ? 1 : 0;
-  if (fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W) {
+
+  if (fb->format == PIXFORMAT_RGB565) {
+    int fw = fb->width, fh = fb->height;
     uint16_t* drawBuf = (uint16_t*)fb->buf;
     uint16_t* tmpRot = nullptr;
     if (curRot != 3) {
-      tmpRot = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
+      tmpRot = (uint16_t*)ps_malloc(fw * fh * 2);
       if (tmpRot) {
-        rotateBuffer((uint16_t*)fb->buf, tmpRot, DISP_W, DISP_H, targetRot);
+        rotateBuffer((uint16_t*)fb->buf, tmpRot, fw, fh, targetRot);
         drawBuf = tmpRot;
+        if (targetRot == 1 || targetRot == 3) { int t=fw; fw=fh; fh=t; }
       }
     }
-    if (curRot == 0 || curRot == 2) lcd.pushImage(0, 0, DISP_H, DISP_W, drawBuf);
-    else lcd.pushImage(0, 0, DISP_W, DISP_H, drawBuf);
+    float sx = (float)DISP_W / fw;
+    float sy = (float)DISP_H / fh;
+    lcd.setPivot(0, 0);
+    lcd.pushImageRotateZoom(0, 0, 0, 0, 0, sx, sy, fw, fh, drawBuf);
     if (tmpRot) free(tmpRot);
+  } else if (fb->format == PIXFORMAT_JPEG) {
+    TJpgDec.drawJpg(0, 0, fb->buf, fb->len);
   }
+
   drawCornerBrackets(COL_GRAY_E);
   bool saved = false;
-  if (sdReady) {
+  if (sdReady || usbReady) {
     photoCount++;
     uint16_t* finalBuf = (uint16_t*)fb->buf;
     uint16_t* eisBuf = nullptr;
     uint16_t* rotBuf = nullptr;
-    int finalW = DISP_W, finalH = DISP_H;
+    int finalW = fb->width, finalH = fb->height;
     if (fb->format == PIXFORMAT_RGB565) {
       if (eisEnabled) {
-        eisBuf = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
+        float scaleX = (float)fb->width / DISP_W;
+        float scaleY = (float)fb->height / DISP_H;
+        eisBuf = (uint16_t*)ps_malloc(fb->width * fb->height * 2);
         if (eisBuf) {
-          applyEIS((uint16_t*)fb->buf, eisBuf, DISP_W, DISP_H, g_eisOffX, g_eisOffY);
+          applyEIS((uint16_t*)fb->buf, eisBuf, fb->width, fb->height, g_eisOffX * scaleX, g_eisOffY * scaleY);
           finalBuf = eisBuf;
         }
       }
       if (curRot != 3) {
-        rotBuf = (uint16_t*)ps_malloc(DISP_W * DISP_H * 2);
+        rotBuf = (uint16_t*)ps_malloc(fb->width * fb->height * 2);
         if (rotBuf) {
-          rotateBuffer(finalBuf, rotBuf, DISP_W, DISP_H, targetRot);
+          rotateBuffer(finalBuf, rotBuf, fb->width, fb->height, targetRot);
           finalBuf = rotBuf;
-          if (targetRot == 1 || targetRot == 3) { finalW = DISP_H; finalH = DISP_W; }
+          if (targetRot == 1 || targetRot == 3) { int t=finalW; finalW=finalH; finalH=t; }
         }
       }
     }
     bool isGCrgb = (detectedSensor == PID_GC2145 && fb->format == PIXFORMAT_RGB565 && fb->width == DISP_W && fb->height == DISP_H);
     if (isGCrgb && gc2145CaptureFormat == GFMT_BMP) {
-      char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.bmp", photoCount);
+      char path[64]; snprintf(path, sizeof(path), "%s/photo_%04d.bmp", storageRoot.c_str(), photoCount);
       char payload[32]; stegoMakePayload(payload, sizeof(payload), photoCount);
       saved = saveBMP((uint8_t*)finalBuf, finalW, finalH, path, payload, (int)strlen(payload));
     } else {
@@ -3752,7 +3805,7 @@ void captureAndPreview() {
         size_t fLen = 0;
         uint8_t* fBuf = exifInjectToJpeg(sBuf, sLen, photoCount, sensorName, &fLen);
         if (!fBuf) { fBuf = sBuf; fLen = sLen; }
-        char path[48]; snprintf(path, sizeof(path), "/sdcard/photo_%04d.jpg", photoCount);
+        char path[64]; snprintf(path, sizeof(path), "%s/photo_%04d.jpg", storageRoot.c_str(), photoCount);
         FILE* f = fopen(path, "wb");
         if (f) { size_t w = fwrite(fBuf, 1, fLen, f); fclose(f); saved = (w == fLen); }
         if (fBuf != sBuf) free(fBuf);
@@ -3765,6 +3818,17 @@ void captureAndPreview() {
     if (!saved) photoCount--;
   }
   esp_camera_fb_return(fb);
+
+  if (hdCaptureEnabled) {
+    s->set_framesize(s, oldFs);
+    delay(100);
+    for (int i = 0; i < 2; i++) {
+      camera_fb_t *tfb = esp_camera_fb_get();
+      if (tfb) esp_camera_fb_return(tfb);
+      esp_task_wdt_reset();
+    }
+  }
+
   if (saved) {
     char msg[28];
     bool isBmp = (detectedSensor == PID_GC2145 && gc2145CaptureFormat == GFMT_BMP);
@@ -3772,7 +3836,7 @@ void captureAndPreview() {
     islandPush(NOTIF_OK, msg);
     neoBurst(200, 150, 0, 3); if (isBmp) neoBurst(0, 80, 200, 2); else neoBurst(0, 180, 0, 2);
   } else {
-    islandPush(NOTIF_WARN, sdReady ? "WRITE ERR" : "NO SD CARD"); neoBurst(180, 0, 0, 5);
+    islandPush(NOTIF_WARN, (sdReady || usbReady) ? "WRITE ERR" : "NO STORAGE"); neoBurst(180, 0, 0, 5);
   }
   fpsLastTime = millis(); fpsFrameCount = 0;
   resetAllButtons();

@@ -8,3 +8,9 @@
 - Manual frequency input dialog for FM Radio (MODE_RADIO_FREQ_INPUT) allows users to set specific frequencies (50.00 - 115.00 MHz) using a 5-digit interface.
 - Replaced auto-scan (long-press BOOT) with manual frequency input to give users precise control over the RDA5807M receiver.
 - Frequency range 50-115 MHz enabled by setting the RDA5807M band to 3 (`radio.setBand(3)`).
+
+## SANZXCAM v6.2 Learnings
+- **Dynamic Camera Resolution:** Temporarily switching `framesize_t` during capture allows high-quality photos/videos while maintaining a low-latency, low-resolution viewfinder. Always ensure a sufficient delay and frame flushing after a resolution change.
+- **USB Host Precedence:** When implementing multi-storage systems on microcontrollers, defining a `storageRoot` global and using it in all `fopen`/`opendir` calls simplifies redirection.
+- **LovyanGFX API:** The `pushImageRotateZoom` function signature is: `pushImageRotateZoom(dst_x, dst_y, src_x, src_y, angle, zoom_x, zoom_y, w, h, data)`.
+- **Merged Directory Scanning:** Use a lambda or helper function to scan multiple roots (`/sdcard`, `/usb`) and aggregate results into a single index to support unified galleries.
