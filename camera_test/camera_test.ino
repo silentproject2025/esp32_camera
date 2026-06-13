@@ -1116,23 +1116,43 @@ void drawFeaturesMenu(int sel) {
   lcd.drawFastHLine(0, 20, DISP_W, COL_GRAY_3);
   lcd.setFont(&fonts::Font0); lcd.setTextSize(1);
   lcd.setTextColor(COL_GRAY_E);
-  const char* title = "FEATURES";
+  const char* title = "EXPERIMENTAL FEATURES";
   lcd.drawString(title, (DISP_W - lcd.textWidth(title)) / 2, 6);
 
-  const int itemH = 22;
+  static const char* const menuLabs[13] = {
+    "EIS Stabilization", "HDR Mode", "Auto-Rotation", "MPU Data Logging", "HUD Overlay",
+    "Calibrate MPU6050", "HD Capture Mode", "HD Image Quality", "Kalman Filter R",
+    "Tilt Deadzone", "MPU DLPF Filter", "Clear Thumb Cache", "FM Radio Receiver"
+  };
+
+  const int itemH = 16;
   const int startY = 25;
   for (int i = 0; i < 13; i++) {
     int y = startY + i * itemH;
     if (y > DISP_H - 10) break;
     if (i == sel) {
-       lcd.fillRect(0, y-2, DISP_W, itemH, COL_GRAY_D);
+       lcd.fillRect(0, y-1, DISP_W, itemH, COL_GRAY_D);
        lcd.setTextColor(COL_WHITE);
     } else {
        lcd.setTextColor(COL_GRAY_7);
     }
-    char buf[32];
-    snprintf(buf, sizeof(buf), "Item %d", i);
-    lcd.drawString(buf, 10, y);
+    lcd.drawString(menuLabs[i], 10, y);
+
+    // Status values
+    lcd.setTextColor(i == sel ? COL_WHITE : COL_GRAY_5);
+    char val[16] = "";
+    if (i == 0) strcpy(val, eisEnabled ? "ON" : "OFF");
+    else if (i == 1) strcpy(val, hdrEnabled ? "ON" : "OFF");
+    else if (i == 2) strcpy(val, autoRotateEnabled ? "ON" : "OFF");
+    else if (i == 3) strcpy(val, mpuLogEnabled ? "ON" : "OFF");
+    else if (i == 4) strcpy(val, hudEnabled ? "ON" : "OFF");
+    else if (i == 6) strcpy(val, hdCaptureEnabled ? "ON" : "OFF");
+    else if (i == 7) snprintf(val, sizeof(val), "%d", hdCaptureQuality);
+    else if (i == 8) snprintf(val, sizeof(val), "%.2f", mpuKalmanRmeas);
+    else if (i == 9) snprintf(val, sizeof(val), "%.1f", mpuTiltDeadzone);
+    else if (i == 10) strcpy(val, DLPF_LABELS[mpuDlpfIndex]);
+
+    if (val[0]) lcd.drawString(val, DISP_W - 60, y);
   }
 }
 
