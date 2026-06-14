@@ -1120,15 +1120,16 @@ void drawFeaturesMenu(int sel) {
   const char* title = "EXPERIMENTAL FEATURES";
   lcd.drawString(title, (DISP_W - lcd.textWidth(title)) / 2, 6);
 
-  static const char* const menuLabs[13] = {
+  static const char* const menuLabs[14] = {
     "EIS Stabilization", "HDR Mode", "Auto-Rotation", "MPU Data Logging", "HUD Overlay",
     "Calibrate MPU6050", "HD Capture Mode", "HD Image Quality", "Kalman Filter R",
-    "Tilt Deadzone", "MPU DLPF Filter", "Clear Thumb Cache", "FM Radio Receiver"
+    "Tilt Deadzone", "MPU DLPF Filter", "Clear Thumb Cache", "FM Radio Receiver",
+    "Detect USB (Manual)"
   };
 
   const int itemH = 16;
   const int startY = 25;
-  for (int i = 0; i < 13; i++) {
+  for (int i = 0; i < 14; i++) {
     int y = startY + i * itemH;
     if (y > DISP_H - 10) break;
     if (i == sel) {
@@ -1151,6 +1152,7 @@ void drawFeaturesMenu(int sel) {
     else if (i == 7) snprintf(val, sizeof(val), "%d", hdCaptureQuality);
     else if (i == 8) snprintf(val, sizeof(val), "%.2f", mpuKalmanRmeas);
     else if (i == 9) snprintf(val, sizeof(val), "%.1f", mpuTiltDeadzone);
+    else if (i == 13) strcpy(val, usbReady ? "READY" : "NONE");
     else if (i == 10) strcpy(val, DLPF_LABELS[mpuDlpfIndex]);
 
     if (val[0]) lcd.drawString(val, DISP_W - 60, y);
@@ -1171,8 +1173,8 @@ void handleModeFeatures(ButtonEvent evt) {
     return;
   }
 
-  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 13; drawFeaturesMenu(menuFeatSel); }
-  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 12) % 13; drawFeaturesMenu(menuFeatSel); }
+  if (evt.pin == BTN_D && evt.isShort) { menuFeatSel = (menuFeatSel + 1) % 14; drawFeaturesMenu(menuFeatSel); }
+  else if (evt.pin == BTN_C && evt.isShort) { menuFeatSel = (menuFeatSel + 13) % 14; drawFeaturesMenu(menuFeatSel); }
   else if (evt.pin == BTN_BOOT && evt.isShort) {
     if (menuFeatSel < 5) {
       *feats[menuFeatSel] = !(*feats[menuFeatSel]);
@@ -1234,6 +1236,11 @@ void handleModeFeatures(ButtonEvent evt) {
       drawFeaturesMenu(menuFeatSel);
     } else if (menuFeatSel == 12) {
       openRadio();
+    } else if (menuFeatSel == 13) {
+      stopUsbHost();
+      initUsbHost();
+      islandPush(NOTIF_INFO, "USB Re-init");
+      drawFeaturesMenu(menuFeatSel);
     }
   }
 }
