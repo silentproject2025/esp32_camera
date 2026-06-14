@@ -12,4 +12,7 @@ void initUsbHost();
 void usbHostTick();
 void stopUsbHost();
 
+// Forward declaration for UI feedback
+void notifyUsbState(bool connected);
+
 #endif
