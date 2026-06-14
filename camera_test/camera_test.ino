@@ -98,6 +98,7 @@ extern "C" {
 
 #include "USB.h"
 #include "USBMSC.h"
+#include "UsbHostMsc.h"
 #include <RDA5807M.h>
 #include <RDSParser.h>
 
@@ -4136,6 +4137,7 @@ void enterUSBMode(){
   if(!sdReady) return;
   if(photoPixelBuf){free(photoPixelBuf);photoPixelBuf=nullptr;}
   islandForceHide();
+  stopUsbHost();
   unmountVFSOnly();sdReady=false;
   WiFi.disconnect(true);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
@@ -4145,6 +4147,7 @@ void enterUSBMode(){
 
 void exitUSBMode(){
   usbModeActive=false;msc.mediaPresent(false);esp_task_wdt_reset();
+  initUsbHost();
   lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
   lcd.drawString("reconnecting sd...",(DISP_W-lcd.textWidth("reconnecting sd..."))/2,DISP_H/2-6);
   sdReady=remountVFSOnly();
@@ -4289,6 +4292,7 @@ void setup(){
   msc.onRead(onRead);msc.onWrite(onWrite);
   msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
   msc.mediaPresent(false);USB.begin();
+  initUsbHost();
 
   bool camOK=initCamera();
   // [PORTED v6.1] MPU init
@@ -4921,6 +4925,7 @@ void handleModeDialogDelete(ButtonEvent evt){
 // ─────────────────────────────────────────────────────────────────────────────
 void loop(){
   neoTick();
+  usbHostTick();
   esp_task_wdt_reset();
 
   if (g_hdrWaiting && (millis() - g_hdrFirstMs >= HDR_DOUBLE_TAP_MS)) {
