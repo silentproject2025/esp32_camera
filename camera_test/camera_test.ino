@@ -4139,6 +4139,10 @@ void enterUSBMode(){
   islandForceHide();
   stopUsbHost();
   unmountVFSOnly();sdReady=false;
+  msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
+  msc.onRead(onRead);msc.onWrite(onWrite);
+  msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
+  msc.mediaPresent(false);USB.begin();
   WiFi.disconnect(true);
   esp_task_wdt_reset();msc.mediaPresent(true);esp_task_wdt_reset();
   drawUSBModeScreen();usbModeActive=true;
@@ -4288,10 +4292,7 @@ void setup(){
     loadGeminiConfig();
   }
 
-  msc.vendorID("ESP32S3");msc.productID("SD Card");msc.productRevision("1.0");
-  msc.onRead(onRead);msc.onWrite(onWrite);
-  msc.begin(sdTotalSectors>0?sdTotalSectors:0,512);
-  msc.mediaPresent(false);USB.begin();
+  // USB Device MSC will be initialized on demand in enterUSBMode()
   initUsbHost();
 
   bool camOK=initCamera();
@@ -5022,4 +5023,8 @@ void runHDRFlow() {
   neoBurst(0, 255, 180, 2);
   // Implementation stub to resolve compilation
   captureAndPreview();
+}
+
+void notifyUsbState(bool connected) {
+    islandPush(connected ? NOTIF_OK : NOTIF_WARN, connected ? "USB CONNECTED" : "USB REMOVED");
 }
