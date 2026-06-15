@@ -4159,6 +4159,7 @@ void enterUSBMode(){
 }
 
 void exitUSBMode(){
+  msc.end(); delay(100);
   usbModeActive=false;msc.mediaPresent(false);esp_task_wdt_reset();
   initUsbHost();
   lcd.fillScreen(COL_BLACK);lcd.setFont(&fonts::Font0);lcd.setTextColor(COL_GRAY_5);
