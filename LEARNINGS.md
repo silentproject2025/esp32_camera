@@ -14,3 +14,9 @@
 - **USB Host Precedence:** When implementing multi-storage systems on microcontrollers, defining a `storageRoot` global and using it in all `fopen`/`opendir` calls simplifies redirection.
 - **LovyanGFX API:** The `pushImageRotateZoom` function signature is: `pushImageRotateZoom(dst_x, dst_y, src_x, src_y, angle, zoom_x, zoom_y, w, h, data)`.
 - **Merged Directory Scanning:** Use a lambda or helper function to scan multiple roots (`/sdcard`, `/usb`) and aggregate results into a single index to support unified galleries.
+
+## USB Host Force Detection
+- Added "Force Detect USB" as the 14th item in the Experimental Features menu in `camera_test.ino`.
+- The feature resets the USB Host stack by calling `stopUsbHost()`, `delay(300)`, and `initUsbHost()`.
+- UI displays "READY" if `usbReady` is true, otherwise "WAIT".
+- Menu layout was adjusted by reducing `startY` from 25 to 22 to accommodate the additional item on the 240px vertical display.
